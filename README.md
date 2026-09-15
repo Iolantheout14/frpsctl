@@ -102,12 +102,60 @@ frps 0.71.0 → /home/u/.local/share/frpsctl/bin/frps-0.71.0
 - **拿不到校验和就拒绝安装**（fail-closed）。确有需要可 `--insecure` 跳过，风险自负。
 - 低于 0.70.0 的版本直接拒绝——装了也用不了。
 
-### 从源码安装
+### 从源码安装（一键脚本）
 
 ```bash
-git clone <repo> && cd frpsctl
+git clone https://github.com/ThzxxArt/frpsctl.git
+cd frpsctl
+./install.sh
+```
+
+脚本做的事：建一个独立 venv → 装依赖 → 把 `frpsctl` 注册到 `~/.local/bin` → 自检。
+**不需要 pipx、不需要 uv、不需要 sudo**（venv 是标准库自带的）。
+
+```console
+$ ./install.sh
+检查运行环境
+ ✓ 操作系统：Linux
+ ✓ Python：Python 3.13.5（/usr/bin/python3）
+ ✓ 源码目录：/mnt/d/CodeWorkspace/frpsctl
+ ✓ venv 模块可用
+
+创建虚拟环境
+ ✓ 已创建：/home/u/.local/share/frpsctl-src/venv
+安装 frpsctl 及其依赖
+ ✓ 依赖就绪（typer / pydantic / tomlkit / httpx）
+注册全局命令
+ ✓ 已注册：/home/u/.local/bin/frpsctl
+自检
+ ✓ 命令可用：frpsctl 0.1.0
+
+frpsctl 安装完成
+```
+
+| 选项 | 作用 |
+|------|------|
+| （无） | 装到 `~/.local`（命令 → `~/.local/bin/frpsctl`） |
+| `--system` | 装到 `/usr/local`（需要 `sudo`） |
+| `--prefix DIR` | 自定义前缀 |
+| `--uninstall` | 卸载（删 venv 与命令，**不动实例数据**） |
+| `--no-verify` | 跳过安装后自检 |
+
+**反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
+源码无需重装，命令立即生效。
+
+> 脚本**不下载 frps 二进制**——那是 `frpsctl install` 的职责（需要网络与校验和，
+> 且要写入用户数据目录）。安装器只负责让 `frpsctl` 这个命令可用。
+
+### 从源码安装（手动）
+
+```bash
+git clone https://github.com/ThzxxArt/frpsctl.git && cd frpsctl
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/frpsctl --version
+.venv/bin/frpsctl --version          # 直接用 venv 里的命令，不注册全局
+
+# 或让 pip 直接装到用户环境
+pip install --user -e .
 ```
 
 ---
