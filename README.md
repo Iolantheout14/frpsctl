@@ -56,6 +56,7 @@ frpsctl status
 生命周期   install / init / verify / start / stop / restart / status / log
 配置       config get|set|edit|diff|rollback
 运维       service install|uninstall|status / doctor / kick
+插件       plugin init|check|serve        # 多用户鉴权 + 端口白名单 + 审计
 ```
 
 ### 退出码（脚本化契约）
@@ -68,6 +69,46 @@ frpsctl status
 | 3 | 配置非法 | 9 | 变更已自动回滚 |
 | 4 | 二进制缺失 / 版本不受支持 | 10 | 启动即失败 |
 | 5 | 实例未运行 | 11 | 进程所有权冲突 |
+
+## 服务端插件（多用户鉴权 + 端口白名单）
+
+frp 的服务端插件是一个 HTTP 回调：frps 在 `Login` / `NewProxy` 时 POST 一段
+JSON，由插件决定放行还是拒绝。本工具用 Python 实现该回调。
+
+```bash
+frpsctl plugin init      # 生成策略模板（0600，fail-closed 默认）
+frpsctl plugin check     # 离线校验 + 试算典型裁决
+frpsctl plugin serve     # 启动（只允许绑回环）
+```
+
+frps 侧配置：
+
+```toml
+[[httpPlugins]]
+name = "frpsctl"
+addr = "http://127.0.0.1:8080"
+path = "/handler"
+ops  = ["Login", "NewProxy"]
+```
+
+frpc 侧声明身份（两个字段必须一致）：
+
+```toml
+user = "alice"
+metadatas = { client_id = "alice" }
+```
+
+> ⚠️ **两条硬约束**
+>
+> 1. **插件是全部客户端登录的单点，且 fail-closed**——它挂掉 = 所有人登录不了。
+>    生产环境必须用 systemd 守护并设 `Restart=always`。
+> 2. **frp 的插件协议没有任何认证**（配置项只有 `name/addr/path/ops/tlsVerify`），
+>    所以插件只允许绑回环。指向非回环地址会被 `frpsctl plugin serve` 拒绝，
+>    `doctor` 也会报 ERROR。
+
+策略文件是 JSON，支持按用户限制端口段、代理名通配、代理类型，以及是否允许
+随机端口（默认不允许——否则白名单形同虚设）。每次裁决写入
+`plugin-audit.jsonl`（异步落盘，不拖慢登录）。
 
 ## 设计要点
 

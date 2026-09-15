@@ -174,7 +174,7 @@ def expected_sha256(checksums_text: str, asset: str) -> str | None:
 
 
 def extract_frps(blob: bytes, *, member_name: str = "frps") -> bytes:
-    """从 tar.gz 里取出 frps 二进制。
+    """从 tar.gz 里取出某个二进制（默认 frps）。
 
     只接受**普通文件**且路径 basename 精确匹配：防止压缩包里的
     `../../bin/sh` 之类路径穿越（tarfile 的 filter 在 3.12 才有，
@@ -218,11 +218,17 @@ def install(
     insecure: bool = False,
     force: bool = False,
     switch: bool = True,
+    with_frpc: bool = False,
 ) -> InstallResult:
     """下载 → 强校验 → 落盘 → `-v` 复验 → （可选）换软链。
 
     `switch=False` 对应 `install --only-download`：先把二进制备到多台机器，
     再统一切换的运维节奏（§8.6.1）。
+
+    `with_frpc=True` 额外取出同一 tar 包里的 **frpc**（`bin/frpc-<version>` +
+    软链）。它不服务于 frps 的日常运维，而是为了让**契约测试**能跑起来——
+    插件（M5）的唯一真实调用方是 frpc，没有它就只能靠手工拼报文验证协议。
+    由于 frpc 与 frps 在同一个发布资产里，这一步不产生额外下载。
     """
     ensure_supported(parse_version(version))  # 门槛 >= 0.70.0（§3.6）
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -253,7 +259,22 @@ def install(
         raise ChecksumMismatch(asset, expected, actual)
 
     # 4) 解包 → 先落到临时文件，复验通过后才原子就位
-    payload = extract_frps(blob)
+    _place_binary(blob, member="frps", dest=dest)
+
+    # 4b) 可按需附带 frpc（供插件契约测试使用）
+    if with_frpc:
+        _place_binary(blob, member="frpc", dest=bin_dir / f"frpc-{version}")
+        switch_symlink(bin_dir / "frpc", bin_dir / f"frpc-{version}")
+
+    # 5) 切换（不影响运行中的进程）
+    if switch:
+        switch_symlink(bin_dir / "frps", dest)
+    return InstallResult(version=version, binary=dest, switched=switch, downloaded=True)
+
+
+def _place_binary(blob: bytes, *, member: str, dest: Path) -> None:
+    """把 tar 里的一个成员解出来、复验、原子就位。"""
+    payload = extract_frps(blob, member_name=member)
     tmp = dest.with_name(f".{dest.name}.dl-{os.getpid()}")
     try:
         tmp.write_bytes(payload)
@@ -262,11 +283,6 @@ def install(
         os.replace(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)
-
-    # 5) 切换（不影响运行中的进程）
-    if switch:
-        switch_symlink(bin_dir / "frps", dest)
-    return InstallResult(version=version, binary=dest, switched=switch, downloaded=True)
 
 
 def _verify_binary(path: Path) -> None:

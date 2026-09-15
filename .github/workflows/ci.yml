@@ -32,18 +32,26 @@ jobs:
           uv venv --python ${{ matrix.python-version }}
           uv pip install --python .venv/bin/python -e ".[dev]"
 
-      - name: 拉取真实 frps（契约层用）
+      - name: 拉取真实 frps + frpc（契约层用）
         run: |
-          # 用我们自己的 install 下载 + sha256 强校验 —— 顺带验证 §8.6 的信任模型
-          .venv/bin/frpsctl install --version "$FRPS_VERSION"
-          echo "FRPSCTL_TEST_BINARY=$HOME/.local/share/frpsctl/bin/frps-${FRPS_VERSION}" >> "$GITHUB_ENV"
-          "$HOME/.local/share/frpsctl/bin/frps-${FRPS_VERSION}" -v
+          # 用我们自己的 install 下载 + sha256 强校验 —— 顺带验证 §8.6 的信任模型。
+          # frpc 与 frps 在同一个 tar 包里，--with-frpc 不产生额外下载；
+          # 插件的唯一真实调用方是 frpc，没有它就只能靠手工拼报文验证协议。
+          .venv/bin/frpsctl install --version "$FRPS_VERSION" --with-frpc
+          BIN="$HOME/.local/share/frpsctl/bin"
+          echo "FRPSCTL_TEST_BINARY=$BIN/frps-${FRPS_VERSION}" >> "$GITHUB_ENV"
+          echo "FRPSCTL_TEST_FRPC=$BIN/frpc-${FRPS_VERSION}" >> "$GITHUB_ENV"
+          "$BIN/frps-${FRPS_VERSION}" -v
+          "$BIN/frpc-${FRPS_VERSION}" -v
 
       - name: 单元 + 集成 + CLI 层
         run: .venv/bin/pytest tests/ -q -m "not contract"
 
       - name: 契约层（设计文档事实基线的自动化守卫）
         run: .venv/bin/pytest tests/test_facts.py -q
+
+      - name: 插件契约层（真 frpc → 真 frps → 我们的插件）
+        run: .venv/bin/pytest tests/test_plugin.py -q -m contract
 
       - name: 端到端冒烟（真 frps 全链路）
         run: |

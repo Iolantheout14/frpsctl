@@ -419,22 +419,55 @@ def _check_lock(inst: Instance) -> list[Finding]:
 
 
 def _check_plugins(inst: Instance) -> list[Finding]:
-    """插件可达性（§3.7 L3）。
+    """插件可达性与**暴露面**（§3.7 L3、§11.2）。
 
-    **仅告警，不影响退出码**——插件故障不是这份配置的错，而且 frp 侧对插件
-    没有超时，插件挂掉意味着**所有客户端都无法登录**（fail-closed）。
+    **可达性仅告警，不影响退出码**——插件故障不是这份配置的错，而且 frp 侧对
+    插件没有超时，插件挂掉意味着**所有客户端都无法登录**（fail-closed）。
+
+    但"插件回调地址绑在非回环"是 **ERROR**：frp 的插件协议**没有任何认证**
+    （`HTTPPluginOptions` 只有 name/addr/path/ops/tlsVerify），把回调指到非回环
+    地址，等于让网络上任何人决定"谁能登录 frps"。
     """
+    out: list[Finding] = []
     targets = parse_plugin_targets(inst.config)
     if not targets:
-        return []
+        return out
+
+    for target in targets:
+        if not _is_loopback_host(target.host):
+            out.append(
+                Finding(
+                    "插件暴露面",
+                    Severity.ERROR,
+                    f"httpPlugins[{target.name}] 指向非回环地址 {target.host}:{target.port}",
+                    "frp 插件协议没有任何认证，任何能访问该端口的人都能伪造 "
+                    "Login/NewProxy 事件；请改为 127.0.0.1"
+                    "（frpsctl 自带的插件服务也会拒绝绑非回环地址）",
+                )
+            )
+
     layer, detail = probe_plugins(targets)
     if layer is HealthLayer.FAIL:
-        return [
+        out.append(
             Finding(
                 "插件可达性",
                 Severity.WARN,
                 f"插件不可达：{detail} —— 客户端将无法登录（fail-closed，§11.2）",
-                "插件必须绑回环并由 systemd 守护（Restart=always）",
+                "插件必须绑回环并由 systemd 守护（Restart=always）；"
+                "也可用 `frpsctl plugin check` 离线核对策略",
             )
-        ]
-    return [Finding("插件可达性", Severity.INFO, f"{len(targets)} 个目标可达")]
+        )
+    else:
+        out.append(Finding("插件可达性", Severity.INFO, f"{len(targets)} 个目标可达"))
+    return out
+
+
+def _is_loopback_host(host: str) -> bool:
+    import ipaddress
+
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

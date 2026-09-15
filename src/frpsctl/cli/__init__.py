@@ -27,6 +27,8 @@ from ..core.lifecycle import Lifecycle, Owner, State
 from ..core.systemd import Systemd
 from ..core.transaction import apply_change, rollback_to
 from ..core.version import parse_version, upgrade_hint
+from ..plugin.policy import PluginPolicy
+from ..plugin.server import PluginServer, ServerSettings
 from ..errors import (
     AlreadyRunning,
     ConfigError,
@@ -45,8 +47,10 @@ app = typer.Typer(
 )
 config_app = typer.Typer(no_args_is_help=True, help="配置读写与变更闭环。")
 service_app = typer.Typer(no_args_is_help=True, help="systemd 集成。")
+plugin_app = typer.Typer(no_args_is_help=True, help="服务端插件：多用户鉴权 + 端口白名单 + 审计。")
 app.add_typer(config_app, name="config")
 app.add_typer(service_app, name="service")
+app.add_typer(plugin_app, name="plugin")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +132,9 @@ def install(
     force: bool = typer.Option(False, "--force", help="已存在同版本时重新下载"),
     only_download: bool = typer.Option(False, "--only-download", help="只落盘，不切换软链（§8.6.1）"),
     insecure: bool = typer.Option(False, "--insecure", help="拿不到官方校验和时仍继续（风险自负）"),
+    with_frpc: bool = typer.Option(
+        False, "--with-frpc", help="同时取出 frpc（供插件契约测试使用，不额外下载）"
+    ),
 ) -> None:
     """下载官方 frps 二进制并强校验 sha256。
 
@@ -141,6 +148,7 @@ def install(
         insecure=insecure,
         force=force,
         switch=not only_download,
+        with_frpc=with_frpc,
     )
 
     if app_ctx.json:
@@ -934,6 +942,260 @@ def kick(
         ui.emit_json({"kicked": proxy_name})
     else:
         ui.emit(f"已下线代理 {proxy_name}")
+
+
+# ---------------------------------------------------------------------------
+# plugin 子命令（设计文档 §11）
+# ---------------------------------------------------------------------------
+
+
+def _policy_path(app_ctx: AppContext, override: Path | None) -> Path:
+    """策略文件位置：`--policy` > 环境变量 > 实例目录下的 plugin-policy.json。
+
+    默认放进实例目录，是为了让"这个实例的策略"跟它的配置、历史待在一起——
+    迁移实例时不会漏掉鉴权规则。
+    """
+    if override is not None:
+        return override.expanduser()
+    env = os.environ.get("FRPSCTL_PLUGIN_POLICY")
+    if env:
+        return Path(env).expanduser()
+    return app_ctx.instance.dir / "plugin-policy.json"
+
+
+def _load_policy(app_ctx: AppContext, override: Path | None) -> tuple[Path, PluginPolicy]:
+    path = _policy_path(app_ctx, override)
+    return path, PluginPolicy.load(path)
+
+
+@plugin_app.command("init")
+def plugin_init(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径（默认 <实例>/plugin-policy.json）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在的策略文件"),
+) -> None:
+    """生成一份策略模板。
+
+    默认是 **fail-closed**：模板里列出的用户才能登录，未列出的全部拒绝；
+    且不允许随机端口——白名单的意义就是"只能拿到我批准的端口"。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path = _policy_path(app_ctx, policy)
+    if path.exists() and not force:
+        raise ConfigError(
+            f"策略文件已存在：{path}",
+            hint="确认要覆盖请加 --force",
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_render_policy_template(), "utf-8")
+    try:
+        path.chmod(0o600)  # 它描述了谁能用哪些端口，属于安全配置
+    except OSError:
+        pass
+
+    if app_ctx.json:
+        ui.emit_json({"policy": str(path), "mode": "0600"})
+        return
+    ui.emit(f"已生成策略模板：{path}（权限 0600）")
+    ui.emit("")
+    ui.emit("编辑它来定义用户与端口白名单，然后：")
+    ui.emit("  frpsctl plugin check      # 校验策略并试算几条典型裁决")
+    ui.emit("  frpsctl plugin serve      # 启动插件服务")
+
+
+def _render_policy_template() -> str:
+    import json as _json
+
+    template = {
+        "_comment": "frpsctl 服务端插件策略。用户在 frpc 侧用 user + metadatas.client_id 声明身份。",
+        "allow_unknown_user": False,
+        "require_client_id": True,
+        "audit": {
+            "enabled": True,
+            "path": "./plugin-audit.jsonl",
+            "flush_every": 32,
+            "flush_interval": 2.0,
+        },
+        "users": {
+            "alice": {
+                "allowed_ports": ["6000-6010"],
+                "allow_random_port": False,
+                "allowed_proxy_types": ["tcp", "udp"],
+                "allowed_proxy_names": ["alice-*"],
+                "note": "示例用户：换成本地实际用户，并收窄端口范围",
+            }
+        },
+    }
+    return _json.dumps(template, indent=2, ensure_ascii=False) + "\n"
+
+
+@plugin_app.command("check")
+def plugin_check(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    bind: str = typer.Option("127.0.0.1:8080", "--bind", help="将要绑定的地址（用于校验）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """离线校验策略：能载入吗？绑回环吗？典型裁决是否符合预期？"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path, loaded = _load_policy(app_ctx, policy)
+    # bind 校验是核心：非回环必须在这里就报错，而不是等部署完才发现
+    loaded.validate(bind=bind)
+
+    samples = _sample_decisions(loaded)
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(path),
+                "bind": bind,
+                "users": sorted(loaded.users),
+                "allow_unknown_user": loaded.allow_unknown_user,
+                "require_client_id": loaded.require_client_id,
+                "samples": samples,
+            }
+        )
+    else:
+        ui.emit(f"策略文件：{path}")
+        for line in loaded.describe():
+            ui.emit(f"  {line}")
+        ui.emit("")
+        ui.emit("典型裁决试算：")
+        for item in samples:
+            mark = "允许" if item["allowed"] else "拒绝"
+            detail = item["reason"] or ""
+            ui.emit(f"  [{mark}] {item['case']}" + (f" — {detail}" if detail else ""))
+        ui.emit("")
+        ui.emit("策略校验通过")
+
+    if loaded.allow_unknown_user:
+        ui.warn("⚠ allow_unknown_user 已开启：未列出的用户会被放行，鉴权形同虚设")
+
+
+def _sample_decisions(policy: PluginPolicy) -> list[dict]:
+    """用几个典型场景试算，让"策略到底会怎么判"在部署前就可见。
+
+    ⚠️ 样本的**代理名必须满足该用户的 `allowed_proxy_names`**，否则试算会先被
+    名称规则挡掉，"许可范围内的端口被允许"这一条就永远显示为拒绝——诊断输出
+    反过来误导人（它看起来像"策略配错了"）。
+    """
+    from ..plugin.policy import decide_login, decide_new_proxy
+
+    samples: list[dict] = []
+    for name in sorted(policy.users):
+        decision = decide_login(policy, user=name, client_id=name)
+        samples.append(
+            {"case": f"Login {name}", "allowed": decision.allowed, "reason": decision.reason}
+        )
+
+        user = policy.user(name)
+        assert user is not None
+        probe_name = _probe_proxy_name(user)
+        probe_type = user.allowed_proxy_types[0] if user.allowed_proxy_types else "tcp"
+
+        if user.allowed_ports:
+            port = user.allowed_ports[0].start
+            decision = decide_new_proxy(
+                policy, user=name, proxy_name=probe_name, proxy_type=probe_type, remote_port=port
+            )
+            samples.append(
+                {
+                    "case": f"NewProxy {name} 申请 {port}（在许可范围内）",
+                    "allowed": decision.allowed,
+                    "reason": decision.reason,
+                }
+            )
+        # 端口 1 对任何有白名单的用户都必然越界（白名单最低是 1，但极少配到它）
+        decision = decide_new_proxy(
+            policy, user=name, proxy_name=probe_name, proxy_type=probe_type, remote_port=1
+        )
+        samples.append(
+            {
+                "case": f"NewProxy {name} 申请 1（预期越界）",
+                "allowed": decision.allowed,
+                "reason": decision.reason,
+            }
+        )
+    decision = decide_login(policy, user="__nobody__", client_id="__nobody__")
+    samples.append(
+        {
+            "case": "Login __nobody__（未列出）",
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+        }
+    )
+    return samples
+
+
+def _probe_proxy_name(user) -> str:
+    """造一个必定通过该用户名称规则的探测名。
+
+    没有名称规则时用固定名；有规则时取第一条并把 `*` 换成 `probe`，
+    这样试算检验的是**我们想检验的那条规则**（端口），而不是被名称规则短路。
+    """
+    if not user.allowed_proxy_names:
+        return "frpsctl-probe"
+    pattern = user.allowed_proxy_names[0]
+    return pattern.replace("*", "probe") if "*" in pattern else pattern
+
+
+@plugin_app.command("serve")
+def plugin_serve(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    bind: str = typer.Option("127.0.0.1:8080", "--bind", help="绑定地址（必须回环）"),
+    path: str = typer.Option("/handler", "--path", help="插件回调路径（需与 frps 的 httpPlugins.path 一致）"),
+    access_log: bool = typer.Option(False, "--access-log", help="把每个请求打进 stderr"),
+    json_output: bool = typer.Option(False, "--json", help="启动后以 JSON 输出一次状态"),
+) -> None:
+    """启动插件服务（前台）。
+
+    ⚠️ 插件是**全部客户端登录的单点**且 fail-closed：它挂掉 = 所有人登录不了。
+    生产环境请用 systemd 守护并设置 `Restart=always`。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    policy_file, loaded = _load_policy(app_ctx, policy)
+
+    settings = ServerSettings(bind=bind, path=path, access_log=access_log)
+    server = PluginServer(loaded, settings)  # 非回环会在这里被拒绝
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(policy_file),
+                "bind": f"{settings.host}:{settings.port}",
+                "path": settings.path,
+                "users": sorted(loaded.users),
+            }
+        )
+    else:
+        ui.emit(f"插件策略：{policy_file}")
+        for line in loaded.describe():
+            ui.emit(f"  {line}")
+        ui.emit("")
+        ui.emit(f"监听：http://{settings.host}:{settings.port}{settings.path}")
+        ui.emit("")
+        ui.emit("frps 侧需要配置：")
+        ui.emit("  [[httpPlugins]]")
+        ui.emit('  name = "frpsctl"')
+        ui.emit(f'  addr = "http://{settings.host}:{settings.port}"')
+        ui.emit(f'  path = "{settings.path}"')
+        ui.emit('  ops  = ["Login", "NewProxy"]')
+        ui.emit("")
+        ui.emit("⚠ fail-closed：本服务不可达时，所有客户端都无法登录。")
+        ui.emit("   生产环境请用 systemd 守护并设置 Restart=always。")
+        ui.emit("")
+        if loaded.audit.enabled and loaded.audit.path is None:
+            ui.warn("⚠ 审计已开启但没有配置 path：记录只留在内存里，进程退出即丢失")
+            ui.warn("  在策略里设置 audit.path，或把 audit.enabled 设为 false 明确关闭")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        ui.emit("")
+        ui.emit(f"已停止。{server.audit.describe()}")
+    finally:
+        server.close()
 
 
 def main() -> None:

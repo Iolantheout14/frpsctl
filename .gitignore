@@ -20,3 +20,8 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# 插件运行期产物：审计日志与策略属于本地数据，不进版本库
+plugin-audit.jsonl
+plugin-audit.jsonl.*
+plugin-policy.json
