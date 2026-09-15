@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -202,12 +203,19 @@ def extract_frps(blob: bytes, *, member_name: str = "frps") -> bytes:
 
 
 def switch_symlink(dest: Path, target: Path) -> None:
-    """原子替换软链：临时链 + `os.rename`（同目录内 rename 是原子的）。"""
+    """原子替换软链：临时链 + `os.rename`（同目录内 rename 是原子的）。
+
+    临时名带上线程 id：只用 pid 的话，同一进程内两个线程并发切换会互相
+    unlink 对方刚建的临时链。`finally` 保证 rename 失败时不留残留。
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(f".{dest.name}.new-{os.getpid()}")
+    tmp = dest.with_name(f".{dest.name}.new-{os.getpid()}-{threading.get_ident()}")
     tmp.unlink(missing_ok=True)
-    tmp.symlink_to(target.name)
-    os.rename(tmp, dest)
+    try:
+        tmp.symlink_to(target.name)
+        os.rename(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)  # 成功路径上 rename 已把它移走，这里是 no-op
 
 
 def install(

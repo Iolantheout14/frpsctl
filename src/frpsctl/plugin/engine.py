@@ -8,9 +8,9 @@
 
 | op | 我们做什么 | 依据 |
 |----|-----------|------|
-| `Login` | 鉴权：用户是否存在、`client_id` 是否与 `user` 一致 | `types.go:34-38`（user 是**字符串**） |
+| `Login` | 鉴权：用户存在、`client_id` 与 `user` 一致 | `types.go:34-38`（user 是**字符串**） |
 | `NewProxy` | 端口白名单 / 代理名 / 类型 / 随机端口 | `types.go:41-51`（user 是**对象**） |
-| `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn` | 放行（`unchange: true`） | 这些 op 不改变权限边界 |
+| `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn` | 放行（`unchange: true`） | 不涉及权限边界 |
 | 未知 op | **拒绝** | 我们只注册了上面这些；收到别的说明有人在说话 |
 
 > 未知 op 为什么拒绝而不是放行：frps 只会向插件发送 `ops` 里声明过的 op。
@@ -108,12 +108,7 @@ class DecisionEngine:
         # Login 时 content.user 是**字符串**（msg.Login.User）
         content = LoginContent.parse(request.content)
         client_id = content.metas.get("client_id", "")
-        decision = decide_login(
-            self.policy,
-            user=content.user,
-            client_id=client_id,
-            reqid=request.reqid,
-        )
+        decision = decide_login(self.policy, user=content.user, client_id=client_id)
         record = AuditRecord(
             user=decision.user or content.user,
             decision="allow" if decision.allowed else "deny",
@@ -125,15 +120,14 @@ class DecisionEngine:
             return PluginResponse.pass_through(), record
         return PluginResponse.reject_op(decision.reason), record
 
-    def _new_proxy(
-        self, request: PluginRequest, common: dict
-    ) -> tuple[PluginResponse, AuditRecord]:
+    def _new_proxy(self, request: PluginRequest, common: dict) -> tuple[PluginResponse, AuditRecord]:
         # NewProxy 时 content.user 是**对象**（UserInfo）——与 Login 不同型
         content = NewProxyContent.parse(request.content)
         owner = self.policy.user(content.user.user)
         quota = None
         if owner is not None and owner.max_proxies:
-            quota = self.quota.check(content.user.user, owner.max_proxies)
+            # reserve=True：检查与占名额在同一个临界区里完成，避免并发突破上限
+            quota = self.quota.check(content.user.user, owner.max_proxies, reserve=True)
         decision = decide_new_proxy(
             self.policy,
             user=content.user.user,
@@ -142,10 +136,9 @@ class DecisionEngine:
             remote_port=content.remote_port,
             quota=quota,
         )
-        if decision.allowed and owner is not None and owner.max_proxies:
-            # 主动记账：dashboard 的统计可能有秒级延迟，本地记账让"刚建完立刻再建"
-            # 也能被正确拦住。
-            self.quota.note_created(content.user.user)
+        if not decision.allowed and quota is not None and quota.allowed:
+            # 预占了名额但最终因端口/名称被拒 → 把名额还回去，别让它漏掉
+            self.quota.note_closed(content.user.user)
         record = AuditRecord(
             user=decision.user or content.user.user,
             decision="allow" if decision.allowed else "deny",

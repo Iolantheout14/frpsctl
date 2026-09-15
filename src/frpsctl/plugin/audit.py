@@ -102,6 +102,10 @@ class AuditLog:
         self._dropped = 0
         self._closed = False
         self._stop = threading.Event()
+        #: 缓冲攒够时用它唤醒后台线程立刻刷盘（而不是让请求线程自己写）
+        self._wake = threading.Event()
+        #: 串行化写盘，与 _lock 分开（见 flush 的说明）
+        self._io_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         # 磁盘可写性。为 False 时审计降级为"仅内存"，不影响服务可用性。
         self._file_writable = False
@@ -116,9 +120,7 @@ class AuditLog:
                 self._file_writable = False
             else:
                 self._file_writable = True
-            self._thread = threading.Thread(
-                target=self._run, name="frpsctl-audit", daemon=True
-            )
+            self._thread = threading.Thread(target=self._run, name="frpsctl-audit", daemon=True)
             self._thread.start()
         else:
             self._file_writable = False
@@ -126,17 +128,25 @@ class AuditLog:
     # --- 写入 ----------------------------------------------------------
 
     def record(self, item: AuditRecord) -> None:
-        """入队一条记录。**这个方法必须保持 O(1) 且无 I/O。**"""
-        if not self.enabled:
+        """入队一条记录。**这个方法必须保持 O(1) 且无 I/O。**
+
+        哪怕缓冲已满到 `flush_every`，也**只唤醒后台线程**，绝不在这里写盘：
+        frp 侧对插件 HTTP 客户端没有超时，一旦磁盘变慢，同步写就会把所有人
+        的登录链路一起拖住（§11.2）。"审计走异步队列"必须是真的异步。
+        """
+        if not self.enabled or self._closed:
+            if self._closed:
+                with self._lock:
+                    self._dropped += 1
             return
         with self._lock:
             if len(self._buffer) >= self.max_buffer:
                 self._buffer.popleft()
                 self._dropped += 1
             self._buffer.append(item)
-            should_flush = len(self._buffer) >= self.flush_every
-        if should_flush:
-            self.flush()
+            full = len(self._buffer) >= self.flush_every
+        if full:
+            self._wake.set()
 
     def flush(self) -> int:
         """把缓冲刷到磁盘。返回写入条数。"""
@@ -155,30 +165,49 @@ class AuditLog:
         if not pending:
             return 0
 
-        try:
-            with open(self.path, "a", encoding="utf-8") as handle:
-                for item in pending:
-                    handle.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
-                handle.flush()
-        except OSError:
-            # 写不进去也不能让登录链路失败：把记录放回缓冲区，等下次再试。
-            # 这是"审计可用性"与"服务可用性"之间的取舍——服务优先（fail-open
-            # 只影响审计，而 fail-closed 会让所有人登录不了）。
-            with self._lock:
-                self._buffer.extendleft(reversed(pending))
-            return 0
+        # 用**独立的 I/O 锁**串行化写盘：两个 flush 并发时各持一个 fd 交叉写，
+        # 会让 JSONL 的物理行序与裁决顺序不一致（实测小批插进大批中间），
+        # 取证时会误导。不能复用 _lock——那样 record() 会被写盘阻塞。
+        with self._io_lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    for item in pending:
+                        handle.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
+                    handle.flush()
+            except OSError:
+                # 写不进去也不能让登录链路失败：把记录放回缓冲区，等下次再试。
+                # 这是"审计可用性"与"服务可用性"之间的取舍——服务优先。
+                with self._lock:
+                    self._buffer.extendleft(reversed(pending))
+                    # 回灌也要尊重缓冲上限，否则磁盘长期不可用时会无界增长
+                    while len(self._buffer) > self.max_buffer:
+                        self._buffer.pop()
+                        self._dropped += 1
+                return 0
 
-        with self._lock:
-            self._written += len(pending)
+            with self._lock:
+                self._written += len(pending)
         return len(pending)
 
     def close(self, timeout: float = 2.0) -> None:
-        """停止后台线程并刷干净。"""
+        """停止后台线程并刷干净。
+
+        线程若在超时内没退出（例如卡在没有超时的写盘上），**保留引用**并留下
+        一条痕迹——把 `_thread` 置 None 只会让"它还活着"这件事再也无法被观察。
+        """
         self._closed = True
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            self._thread = None
+        self._wake.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                import sys
+
+                sys.stderr.write("[plugin] 审计线程未在超时内退出（可能卡在写盘），残留记录可能未落盘\n")
+                sys.stderr.flush()
+            else:
+                self._thread = None
         self.flush()
 
     # --- 观测 ----------------------------------------------------------
@@ -210,7 +239,12 @@ class AuditLog:
     # --- 后台线程 ------------------------------------------------------
 
     def _run(self) -> None:
-        while not self._stop.wait(0.2):
+        while not self._stop.is_set():
+            # 被 record() 唤醒（缓冲满）或每 0.2s 轮询一次到期时间
+            self._wake.wait(0.2)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             if self._clock() - self._last_flush >= self.flush_interval:
                 self.flush()
         self.flush()

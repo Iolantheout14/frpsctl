@@ -215,9 +215,7 @@ class AdminClient:
         用 `total` 而不是 items 长度：后者受 pageSize 限制（默认 50），
         会在大户身上把配额判断变成"永远没超"。
         """
-        payload = self._unwrap(
-            self._get("/api/v2/proxies", params={"user": user, "page_size": "1"})
-        )
+        payload = self._unwrap(self._get("/api/v2/proxies", params={"user": user, "page_size": "1"}))
         if isinstance(payload, dict) and isinstance(payload.get("total"), int):
             return int(payload["total"])
         return len(_page_items(payload))
@@ -239,10 +237,7 @@ class AdminClient:
         except httpx.HTTPError as exc:
             raise AdminUnreachable(
                 f"dashboard 不可达（{self._base_url}{path}）：{exc}",
-                hint=(
-                    "确认 webServer.port > 0 且实例在运行；"
-                    "若 dashboard 绑在非回环地址，检查网络与防火墙"
-                ),
+                hint=("确认 webServer.port > 0 且实例在运行；若 dashboard 绑在非回环地址，检查网络与防火墙"),
             ) from None
 
     def _unwrap(self, resp: httpx.Response) -> dict:

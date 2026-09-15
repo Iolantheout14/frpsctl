@@ -188,6 +188,56 @@ def _format_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
+def check_dangerous_combination(data: dict[str, Any]) -> str | None:
+    """返回"危险组合"的说明，或 None 表示安全。
+
+    这条检查来自一个**已确认的事实**（§3.3）：`webServer.user` 与
+    `webServer.password` **同时为空时 frp 完全不鉴权**——不是"要求登录"，而是
+    任何人都能读取全部状态、并下线任意代理。
+
+    单看 `webServer.user = ""` 或 `webServer.addr = "0.0.0.0"` 都无害，**只有
+    组合起来才是缺口**。因此校验必须针对**合并后的完整配置**，而不是被修改的
+    那一个键——`config set webServer.user '""'` 自身永远看不出问题。
+
+    设计文档 §10 硬约束 1 要求 `config set` 与 `doctor` 双重拦截，这个函数
+    就是那个共享的判据（此前只有 doctor 一侧，`config set` 能一路写成
+    `addr=0.0.0.0` + 双空口令并退出 0）。
+    """
+    web = data.get("webServer")
+    if not isinstance(web, dict):
+        return None
+    port = web.get("port") or 0
+    if not isinstance(port, int) or port <= 0:
+        return None  # 未启用 dashboard，不存在暴露面
+    addr = str(web.get("addr") or "127.0.0.1")
+    if _is_loopback(addr):
+        return None
+    user = web.get("user") or ""
+    password = web.get("password") or ""
+    if user or password:
+        return None
+    return (
+        f"webServer 绑定非回环地址 {addr}:{port}，且 user/password 均为空 = "
+        "**完全不鉴权**（任何人都能读取全部状态并下线任意代理）"
+    )
+
+
+def _is_loopback(addr: str) -> bool:
+    import ipaddress
+
+    host = addr.strip()
+    if host.startswith("["):  # [::1]:7500 形式
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def validate_mapping(data: dict[str, Any]) -> ServerConfig:
     """校验一个已解析的配置字典。"""
     try:

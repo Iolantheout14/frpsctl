@@ -18,7 +18,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import LockBusy
@@ -125,7 +125,13 @@ def is_locked(path: Path) -> bool:
 
     if not path.exists():
         return False
-    fd = os.open(path, os.O_RDWR)
+    try:
+        # 用 O_RDONLY：探测不该要求写权限（root 建的 0600 锁文件会让普通用户
+        # 跑 doctor 时因 PermissionError 整个体检崩掉）。flock 在只读 fd 上
+        # 同样可用。
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

@@ -81,6 +81,10 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
     class Handler(BaseHTTPRequestHandler):
         server_version = "frpsctl-plugin/0.1"
         protocol_version = "HTTP/1.1"
+        # 空闲 keep-alive 连接必须有超时：否则线程会永久停在 rfile.readline()，
+        # 而 daemon_threads=True 让 server_close() 既不 join 也不关这些 socket
+        # （socketserver 会跳过 daemon 线程），反复 start/stop 就会累积。
+        timeout = 30
 
         # --- 入口 ------------------------------------------------------
 
@@ -91,9 +95,7 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
             except Exception as exc:  # noqa: BLE001 - 任何内部异常都必须变成拒绝
                 # fail-closed：出错**绝不放行**。放行等于"插件坏了就没人管了"，
                 # 而 fail-closed 至少是安全的（§11.2）。
-                response = PluginResponse.reject_op(
-                    f"frpsctl-plugin: 内部错误（{type(exc).__name__}）"
-                )
+                response = PluginResponse.reject_op(f"frpsctl-plugin: 内部错误（{type(exc).__name__}）")
                 status = 200
                 self._note(f"内部异常 {type(exc).__name__}: {exc}")
 
@@ -145,6 +147,10 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
 
             payload = self._read_body()
             if payload is None:
+                # 读不出/超限时必须**断开连接**：HTTP/1.1 长连接下，没排空的
+                # 请求体残留会被当成下一个请求解析（跨请求串味）。这里直接
+                # 标记关闭，比尝试排空一个可能很大的 body 更安全。
+                self.close_connection = True
                 return PluginResponse.reject_op("frpsctl-plugin: 请求体不是合法 JSON"), 400
 
             try:
@@ -169,6 +175,7 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
             if length <= 0:
                 return {}
             if length > MAX_BODY_BYTES:
+                self.close_connection = True  # 不排空，直接断开（见调用方说明）
                 return None
             raw = self.rfile.read(length)
             try:
@@ -214,28 +221,29 @@ class PluginServer:
         self.policy = policy
         self.settings = settings or ServerSettings()
         self.policy.validate(bind=self.settings.bind)
-        self.audit = audit if audit is not None else AuditLog(
-            policy.audit.path,
-            enabled=policy.audit.enabled,
-            flush_every=policy.audit.flush_every,
-            flush_interval=policy.audit.flush_interval,
+        self.audit = (
+            audit
+            if audit is not None
+            else AuditLog(
+                policy.audit.path,
+                enabled=policy.audit.enabled,
+                flush_every=policy.audit.flush_every,
+                flush_interval=policy.audit.flush_interval,
+            )
         )
         self.engine = DecisionEngine(policy, self.audit)
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
 
     # --- 生命周期 ------------------------------------------------------
 
     def start(self) -> None:
         """绑定并开始服务。绑定失败（端口占用）会原样抛出 `OSError`。"""
         handler = _make_handler(self.engine, self.settings)
-        self._httpd = ThreadingHTTPServer(
-            (self.settings.host, self.settings.port), handler
-        )
+        self._httpd = ThreadingHTTPServer((self.settings.host, self.settings.port), handler)
         self._httpd.daemon_threads = True
-        self._thread = threading.Thread(
-            target=self._httpd.serve_forever, name="frpsctl-plugin", daemon=True
-        )
+        self._thread = threading.Thread(target=self._httpd.serve_forever, name="frpsctl-plugin", daemon=True)
         self._thread.start()
 
     def serve_forever(self) -> None:

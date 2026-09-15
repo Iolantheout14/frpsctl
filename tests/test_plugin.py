@@ -5,7 +5,7 @@
 | 组 | 驱动方式 | 验证什么 |
 |----|---------|---------|
 | **协议/策略**（本文件主体） | 直接向插件发 HTTP 请求 | 报文形状、裁决逻辑、审计、fail-closed |
-| **真机契约**（`TestRealFrpcContract`） | 真 frpc → 真 frps → 我们的插件 | 我们真的能接住 frp 的调用，且拒绝真的生效 |
+| **真机契约**（`TestRealFrpcContract`） | 真 frpc → 真 frps → 插件 | 接得住 frp 的调用，拒绝真的生效 |
 
 第二组是这一层唯一无法用假件替代的部分：`op` 在 query、`content.user` 在 Login 与
 NewProxy 上不同型、`unchange` 语义——这些都只有真 frp 能证明。
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import time
@@ -29,10 +28,10 @@ from frpsctl.plugin.audit import AuditLog, AuditRecord
 from frpsctl.plugin.engine import DecisionEngine
 from frpsctl.plugin.policy import PluginPolicy, decide_login, decide_new_proxy
 from frpsctl.plugin.server import PluginServer, ServerSettings
+from .conftest import free_port, free_ports
 from frpsctl.plugin.types import (
     LoginContent,
     NewProxyContent,
-    Op,
     PluginRequest,
     PluginResponse,
     UnknownOp,
@@ -40,9 +39,9 @@ from frpsctl.plugin.types import (
 
 pytestmark = pytest.mark.integration
 
-FRPS_BIN = os.environ.get("FRPSCTL_TEST_BINARY") or str(
-    Path.home() / ".local/share/frpsctl/bin/frps-0.71.0"
-)
+FRPS_BIN = os.environ.get("FRPSCTL_TEST_BINARY") or str(Path.home() / ".local/share/frpsctl/bin/frps-0.71.0")
+
+
 def _default_frpc() -> str:
     """frpc 的位置：环境变量 > 与 frps 同目录 > PATH。
 
@@ -68,12 +67,6 @@ FRPC_BIN = _default_frpc()
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture
 def policy(tmp_path: Path) -> PluginPolicy:
     return PluginPolicy.parse(
@@ -83,7 +76,7 @@ def policy(tmp_path: Path) -> PluginPolicy:
                 "alice": {"allowed_ports": ["6000-6010"], "note": "普通用户"},
                 "bob": {"allowed_ports": ["7000"], "allow_random_port": True},
                 "carol": {"allowed_proxy_types": ["http"]},
-            }
+            },
         }
     )
 
@@ -102,19 +95,21 @@ def plugin(policy: PluginPolicy, tmp_path: Path):
         server.close()
 
 
-def post(server: PluginServer, op: str, content: dict, *, path: str = "/handler",
-         reqid: str = "REQ-TEST") -> tuple[int, dict]:
+def post(
+    server: PluginServer, op: str, content: dict, *, path: str = "/handler", reqid: str = "REQ-TEST"
+) -> tuple[int, dict]:
     """按 frp 的真实报文格式发一次请求（op 在 query，content 嵌在 body 里）。"""
     url = f"http://127.0.0.1:{server.address[1]}{path}?version=0.1.0&op={op}"
     body = json.dumps({"version": "0.1.0", "op": op, "content": content}).encode()
-    request = urllib.request.Request(
+    request = urllib.request.Request(  # noqa: S310 - 目标固定为 127.0.0.1
         url,
         data=body,
         method="POST",
         headers={"Content-Type": "application/json", "X-Frp-Reqid": reqid},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as resp:
+        # noqa: S310 - 目标固定为测试自己起的 127.0.0.1 服务
+        with urllib.request.urlopen(request, timeout=5) as resp:  # noqa: S310
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
@@ -151,8 +146,12 @@ class TestProtocolFacts:
     def test_newproxy_user_is_object(self) -> None:
         """NewProxy 的 `content.user` 是**对象**（`types.go:41-51`）——不同型。"""
         content = NewProxyContent.parse(
-            {"user": {"user": "alice", "run_id": "r1", "metas": {}},
-             "proxy_name": "p", "proxy_type": "tcp", "remote_port": 6001}
+            {
+                "user": {"user": "alice", "run_id": "r1", "metas": {}},
+                "proxy_name": "p",
+                "proxy_type": "tcp",
+                "remote_port": 6001,
+            }
         )
         assert content.user.user == "alice"
         assert content.user.run_id == "r1"
@@ -217,21 +216,15 @@ class TestNewProxyDecisions:
 
     def test_port_outside_range_denied_with_actionable_reason(self, policy: PluginPolicy) -> None:
         """拒绝理由必须让客户端知道**怎么办**，而不是只说"不行"。"""
-        decision = decide_new_proxy(
-            policy, user="alice", proxy_name="p", proxy_type="tcp", remote_port=9999
-        )
+        decision = decide_new_proxy(policy, user="alice", proxy_name="p", proxy_type="tcp", remote_port=9999)
         assert decision.allowed is False
         assert "6000-6010" in decision.reason, "拒绝理由里应给出许可范围"
 
     def test_random_port_denied_unless_explicitly_allowed(self, policy: PluginPolicy) -> None:
         """`remote_port = 0` 默认拒绝：放行随机端口等于白名单形同虚设。"""
-        denied = decide_new_proxy(
-            policy, user="alice", proxy_name="p", proxy_type="tcp", remote_port=0
-        )
+        denied = decide_new_proxy(policy, user="alice", proxy_name="p", proxy_type="tcp", remote_port=0)
         assert denied.allowed is False
-        allowed = decide_new_proxy(
-            policy, user="bob", proxy_name="p", proxy_type="tcp", remote_port=0
-        )
+        allowed = decide_new_proxy(policy, user="bob", proxy_name="p", proxy_type="tcp", remote_port=0)
         assert allowed.allowed is True
 
     def test_domain_based_proxy_skips_port_check(self, policy: PluginPolicy) -> None:
@@ -241,20 +234,20 @@ class TestNewProxyDecisions:
         ).allowed
 
     def test_proxy_type_restriction(self, policy: PluginPolicy) -> None:
-        decision = decide_new_proxy(
-            policy, user="carol", proxy_name="p", proxy_type="tcp", remote_port=6001
-        )
+        decision = decide_new_proxy(policy, user="carol", proxy_name="p", proxy_type="tcp", remote_port=6001)
         assert decision.allowed is False
         assert "tcp" in decision.reason
 
     def test_user_with_no_ports_can_only_do_domain_proxies(self) -> None:
         p = PluginPolicy.parse({"users": {"dave": {}}})
-        assert decide_new_proxy(
-            p, user="dave", proxy_name="p", proxy_type="tcp", remote_port=6000
-        ).allowed is False
-        assert decide_new_proxy(
-            p, user="dave", proxy_name="p", proxy_type="https", remote_port=0
-        ).allowed is True
+        assert (
+            decide_new_proxy(p, user="dave", proxy_name="p", proxy_type="tcp", remote_port=6000).allowed
+            is False
+        )
+        assert (
+            decide_new_proxy(p, user="dave", proxy_name="p", proxy_type="https", remote_port=0).allowed
+            is True
+        )
 
 
 class TestProxyNamePolicy:
@@ -265,9 +258,7 @@ class TestProxyNamePolicy:
         assert decide_new_proxy(
             p, user="alice", proxy_name="alice-web", proxy_type="tcp", remote_port=6000
         ).allowed
-        denied = decide_new_proxy(
-            p, user="alice", proxy_name="bob-web", proxy_type="tcp", remote_port=6000
-        )
+        denied = decide_new_proxy(p, user="alice", proxy_name="bob-web", proxy_type="tcp", remote_port=6000)
         assert denied.allowed is False
         assert "代理名" in denied.reason
 
@@ -291,7 +282,7 @@ class TestHttpBehaviour:
         assert body["reject"] is True
 
     def test_healthz_is_available_and_unauthenticated(self, plugin: PluginServer) -> None:
-        with urllib.request.urlopen(
+        with urllib.request.urlopen(  # noqa: S310 - 固定回环地址
             f"http://127.0.0.1:{plugin.address[1]}/healthz", timeout=3
         ) as resp:
             assert resp.status == 200
@@ -312,11 +303,14 @@ class TestHttpBehaviour:
     def test_malformed_body_is_rejected_not_crashed(self, plugin: PluginServer) -> None:
         url = f"http://127.0.0.1:{plugin.address[1]}/handler?version=0.1.0&op=Login"
         request = urllib.request.Request(
-            url, data=b"{not json", method="POST",
+            url,
+            data=b"{not json",
+            method="POST",
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=3) as resp:
+            # noqa: S310 - 目标固定为测试自己起的回环服务
+            with urllib.request.urlopen(request, timeout=3) as resp:  # noqa: S310
                 status, body = resp.status, json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             status, body = exc.code, json.loads(exc.read())
@@ -342,16 +336,24 @@ class TestAudit:
 
         engine.handle(
             PluginRequest.from_payload(
-                op="Login", version="0.1.0",
+                op="Login",
+                version="0.1.0",
                 body={"content": {"user": "alice", "metas": {"client_id": "alice"}}},
             ),
             source="127.0.0.1",
         )
         engine.handle(
             PluginRequest.from_payload(
-                op="NewProxy", version="0.1.0",
-                body={"content": {"user": {"user": "alice"}, "proxy_name": "p",
-                                  "proxy_type": "tcp", "remote_port": 9999}},
+                op="NewProxy",
+                version="0.1.0",
+                body={
+                    "content": {
+                        "user": {"user": "alice"},
+                        "proxy_name": "p",
+                        "proxy_type": "tcp",
+                        "remote_port": 9999,
+                    }
+                },
             )
         )
         log.close()
@@ -367,8 +369,8 @@ class TestAudit:
     def test_record_is_non_blocking_by_construction(self, tmp_path: Path) -> None:
         """`record()` 必须只入队——§11.2 要求 handler 内不做慢速 I/O。"""
         log = AuditLog(tmp_path / "audit.jsonl", flush_every=1000, flush_interval=999)
-        for i in range(50):
-            log.record(AuditRecord(op="Login", user="u", decision="allow"))
+        for index in range(50):
+            log.record(AuditRecord(op=f"Login{index}", user="u", decision="allow"))
         assert log.pending == 50, "record() 不该触发写盘"
         assert log.written == 0
         log.flush()
@@ -377,8 +379,7 @@ class TestAudit:
 
     def test_buffer_overflow_drops_oldest(self, tmp_path: Path) -> None:
         """磁盘不可用时不能把内存吃光；丢**最旧**的，因为最近的最有用。"""
-        log = AuditLog(tmp_path / "audit.jsonl", flush_every=10_000,
-                       flush_interval=999, max_buffer=5)
+        log = AuditLog(tmp_path / "audit.jsonl", flush_every=10_000, flush_interval=999, max_buffer=5)
         for i in range(8):
             log.record(AuditRecord(op=f"op{i}", user="u", decision="allow"))
         assert log.pending == 5
@@ -420,13 +421,13 @@ class TestRealFrpcContract:
     @pytest.fixture
     def stack(self, tmp_path: Path, policy: PluginPolicy):
         """起 插件 + frps，返回连接参数。"""
-        bind_port, dash_port = _free_port(), _free_port()
+        bind_port, dash_port = free_ports(2)
         server = PluginServer(policy, ServerSettings(bind="127.0.0.1:0", path="/handler"))
         server.start()
 
         config = tmp_path / "frps.toml"
         config.write_text(
-            f'''bindAddr = "127.0.0.1"
+            f"""bindAddr = "127.0.0.1"
 bindPort = {bind_port}
 [webServer]
 addr = "127.0.0.1"
@@ -438,19 +439,23 @@ name = "frpsctl"
 addr = "http://127.0.0.1:{server.address[1]}"
 path = "/handler"
 ops = ["Login", "NewProxy"]
-''',
+""",
             "utf-8",
         )
         # 先确认这份配置本身合法（顺带验证 §11.1 的 httpPlugins 键名）
         check = subprocess.run(
             [FRPS_BIN, "--strict_config=true", "verify", "-c", str(config)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         assert check.returncode == 0, check.stdout + check.stderr
 
         proc = subprocess.Popen(
             [FRPS_BIN, "-c", str(config)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         try:
             deadline = time.monotonic() + 10
@@ -480,14 +485,16 @@ metadatas = {{ client_id = "{user}" }}
 name = "{user}-tcp"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = {_free_port()}
+localPort = {free_port()}
 remotePort = {proxy_port}
 ''',
             "utf-8",
         )
         proc = subprocess.Popen(
             [FRPC_BIN, "-c", str(cfg)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
         try:
             out, _ = proc.communicate(timeout=8)
@@ -546,8 +553,7 @@ class TestDoctorPluginExposure:
         from frpsctl.core.doctor import run_doctor
         from frpsctl.core.instance import Instance
 
-        inst = Instance(name="t", instances_root=tmp_path / "instances",
-                        data_home=tmp_path / "data")
+        inst = Instance(name="t", instances_root=tmp_path / "instances", data_home=tmp_path / "data")
         inst.ensure_dirs()
         inst.config.write_text(
             f'''bindPort = 17000
@@ -602,9 +608,16 @@ class TestQuota:
     def _new_proxy(self, engine: DecisionEngine, port: int, name: str = "p") -> dict:
         return engine.handle(
             PluginRequest.from_payload(
-                op="NewProxy", version="0.1.0",
-                body={"content": {"user": {"user": "alice"}, "proxy_name": name,
-                                  "proxy_type": "tcp", "remote_port": port}},
+                op="NewProxy",
+                version="0.1.0",
+                body={
+                    "content": {
+                        "user": {"user": "alice"},
+                        "proxy_name": name,
+                        "proxy_type": "tcp",
+                        "remote_port": port,
+                    }
+                },
             )
         ).to_payload()
 
@@ -625,9 +638,9 @@ class TestQuota:
 
         engine.handle(
             PluginRequest.from_payload(
-                op="CloseProxy", version="0.1.0",
-                body={"content": {"user": {"user": "alice"}, "proxy_name": "p1",
-                                  "proxy_type": "tcp"}},
+                op="CloseProxy",
+                version="0.1.0",
+                body={"content": {"user": {"user": "alice"}, "proxy_name": "p1", "proxy_type": "tcp"}},
             )
         )
         assert self._new_proxy(engine, 6001, "p2")["reject"] is False
@@ -635,8 +648,8 @@ class TestQuota:
 
     def test_zero_limit_means_unlimited(self, tmp_path: Path) -> None:
         engine, log = self._engine(tmp_path, limit=0)
-        for i in range(5):
-            assert self._new_proxy(engine, 6000 + i, f"p{i}")["reject"] is False
+        for index in range(5):
+            assert self._new_proxy(engine, 6000 + index, f"p{index}")["reject"] is False
         log.close()
 
     def test_quota_source_is_recorded_in_audit(self, tmp_path: Path) -> None:

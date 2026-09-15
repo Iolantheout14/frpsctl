@@ -23,7 +23,6 @@ from enum import Enum
 from pathlib import Path
 
 from ..errors import FrpsctlError
-from .admin import AdminClient
 from .config import config_flags
 from .health import HealthLayer, probe_plugins
 from .healthcheck import parse_dashboard, parse_plugin_targets
@@ -76,7 +75,7 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
     findings: list[Finding] = []
     lc = Lifecycle(inst, binary=binary)
 
-    findings.extend(_check_binary(lc, inst, binary))
+    findings.extend(_check_binary(lc, inst))
     findings.extend(_check_config(lc, inst))
     findings.extend(_check_permissions(inst))
     findings.extend(_check_dashboard(inst))
@@ -94,7 +93,12 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
 # ---------------------------------------------------------------------------
 
 
-def _check_binary(lc: Lifecycle, inst: Instance, binary: Path | None) -> list[Finding]:
+def _check_binary(lc: Lifecycle, inst: Instance) -> list[Finding]:
+    """二进制存在性、可执行性、版本与"运行版本 vs 磁盘版本"。
+
+    刻意**不接收** `binary` 参数：那会诱导实现去读"用户传了什么"，而这里要检查的
+    是"实际会用哪个"——由 `lc.binary()` 统一解析（显式 --binary 优先，否则解软链）。
+    """
     out: list[Finding] = []
     try:
         path = lc.binary()
@@ -116,8 +120,7 @@ def _check_binary(lc: Lifecycle, inst: Instance, binary: Path | None) -> list[Fi
             Finding(
                 "二进制版本",
                 Severity.ERROR,
-                f"{version} 低于最低支持版本 "
-                f"{'.'.join(map(str, MINIMUM_VERSION))}（无 v2 Admin API）",
+                f"{version} 低于最低支持版本 {'.'.join(map(str, MINIMUM_VERSION))}（无 v2 Admin API）",
                 "运行 `frpsctl install` 安装达标版本",
             )
         )
@@ -154,7 +157,9 @@ def _check_config(lc: Lifecycle, inst: Instance) -> list[Finding]:
         return [Finding("配置", Severity.ERROR, f"无法读取：{exc}")]
 
     try:
-        version = lc.binary_version()
+        # binary_version() 在这里的作用不只是拿版本号：它会执行 §3.6 的版本门槛
+        # 校验（不达标即抛），因此不能因为"返回值用不上"就删掉。
+        lc.binary_version()
         binary = lc.binary()
     except FrpsctlError:
         return []  # 二进制问题已单独报过，此处无法做权威校验
@@ -166,14 +171,15 @@ def _check_config(lc: Lifecycle, inst: Instance) -> list[Finding]:
         uses_unsafe = str(source.get("type", "")).lower() == "exec"
 
     try:
-        validate_text(text, binary=binary, version=version, workdir=inst.dir, uses_unsafe=uses_unsafe)
+        validate_text(text, binary=binary, workdir=inst.dir, uses_unsafe=uses_unsafe)
     except FrpsctlError as exc:
         return [Finding("配置校验", Severity.ERROR, exc.message, exc.hint or "")]
     return [
         Finding(
             "配置校验",
             Severity.INFO,
-            f"semantic + frps verify 均通过（标志：{' '.join(config_flags(version, uses_exec_token_source=uses_unsafe))}）",
+            f"semantic + frps verify 均通过（标志："
+            f"{' '.join(config_flags(uses_exec_token_source=uses_unsafe))}）",
         )
     ]
 
@@ -197,8 +203,7 @@ def _check_permissions(inst: Instance) -> list[Finding]:
             Finding(
                 "配置文件权限",
                 severity,
-                f"{inst.config} 权限为 {shown}"
-                + ("，且内含 token 或 dashboard 口令" if has_secret else ""),
+                f"{inst.config} 权限为 {shown}" + ("，且内含 token 或 dashboard 口令" if has_secret else ""),
                 "chmod 600 该文件（frpsctl 写入时会自动设为 0600）",
             )
         ]
@@ -239,13 +244,11 @@ def _check_dashboard(inst: Instance) -> list[Finding]:
                 "frp 在两者同时为空时**完全不鉴权**，建议设置口令",
             )
         )
-    elif dash.user == "admin" and dash.password == "admin":
+    elif dash.user == "admin" and dash.password == "admin":  # noqa: S105 - 这是弱口令检测，不是凭据
         out.append(Finding("dashboard 弱口令", Severity.WARN, "使用了 admin/admin"))
 
     if not loopback:
-        out.append(
-            Finding("dashboard", Severity.INFO, f"监听非回环地址 {dash.addr}:{dash.port}")
-        )
+        out.append(Finding("dashboard", Severity.INFO, f"监听非回环地址 {dash.addr}:{dash.port}"))
     return out
 
 
@@ -289,9 +292,7 @@ def _check_hardening(inst: Instance) -> list[Finding]:
 
     auth = data.get("auth") or {}
     if auth.get("method", "token") == "oidc":
-        out.append(
-            Finding("auth.method", Severity.INFO, "使用 oidc（frpsctl 不管理其凭据）")
-        )
+        out.append(Finding("auth.method", Severity.INFO, "使用 oidc（frpsctl 不管理其凭据）"))
     return out
 
 
@@ -315,8 +316,11 @@ def _check_ports(inst: Instance, lc: Lifecycle) -> list[Finding]:
         value = _dig(data, dotted)
         if not isinstance(value, int) or value <= 0:
             continue
-        host = str(data.get("webServer", {}).get("addr") or "127.0.0.1") \
-            if dotted.startswith("webServer") else bind_addr
+        host = (
+            str(data.get("webServer", {}).get("addr") or "127.0.0.1")
+            if dotted.startswith("webServer")
+            else bind_addr
+        )
         if _port_bindable(host, value):
             continue
         if ours_running:
@@ -388,7 +392,12 @@ def _check_ownership(inst: Instance, lc: Lifecycle) -> list[Finding]:
         )
     if state is State.STALE:
         out.append(
-            Finding("进程所有权", Severity.INFO, "存在陈旧 state.json（进程已退出）", "下次 start 会自动清理")
+            Finding(
+                "进程所有权",
+                Severity.INFO,
+                "存在陈旧 state.json（进程已退出）",
+                "下次 start 会自动清理",
+            )
         )
 
     from .systemd import Systemd
@@ -413,7 +422,12 @@ def _check_ownership(inst: Instance, lc: Lifecycle) -> list[Finding]:
 def _check_lock(inst: Instance) -> list[Finding]:
     if is_locked(inst.lock):
         return [
-            Finding("实例锁", Severity.WARN, f"{inst.lock} 正被持有", "可能有另一个 frpsctl 正在操作该实例")
+            Finding(
+                "实例锁",
+                Severity.WARN,
+                f"{inst.lock} 正被持有",
+                "可能有另一个 frpsctl 正在操作该实例",
+            )
         ]
     return []
 

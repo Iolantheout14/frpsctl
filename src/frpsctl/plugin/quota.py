@@ -79,21 +79,27 @@ class QuotaChecker:
     # --- 查询 ----------------------------------------------------------
 
     def current(self, user: str) -> tuple[int, str]:
-        """返回 `(当前代理数, 来源)`。"""
+        """返回 `(当前代理数, 来源)`。
+
+        ⚠️ dashboard 模式下也要**叠加本地记账**：dashboard 的统计有秒级延迟，
+        刚建完的代理还没反映过去；只读 dashboard 会让"连续建两个"都拿到旧计数。
+        取两者较大值是保守做法——宁可早一点拦住，也不要让配额形同虚设。
+        """
+        local = self._local_count(user)
         if self.admin_url:
             cached = self._from_cache(user)
             if cached is not None:
-                return cached
+                return max(cached[0], local), cached[1]
             try:
                 count = self._query_dashboard(user)
             except Exception:  # noqa: BLE001 - 计数失败不能变成"建不了代理"
                 # 退化为本地计数，并如实标注来源。**不抛异常**：
                 # 配额是治理手段，dashboard 临时不可用不该让所有人无法建代理。
-                return self._local_count(user), "local"
+                return local, "local"
             with self._lock:
                 self._cache[user] = (self._clock(), count, "dashboard")
-            return count, "dashboard"
-        return self._local_count(user), "local"
+            return max(count, local), "dashboard"
+        return local, "local"
 
     def _query_dashboard(self, user: str) -> int:
         # 延迟导入：不配 admin_url 的用户不该为 httpx 付出任何代价
@@ -135,21 +141,54 @@ class QuotaChecker:
 
     # --- 判定 ----------------------------------------------------------
 
-    def check(self, user: str, limit: int) -> QuotaResult:
-        """还能再建吗？`limit <= 0` 表示不限。"""
+    def check(self, user: str, limit: int, *, reserve: bool = False) -> QuotaResult:
+        """还能再建吗？`limit <= 0` 表示不限。
+
+        `reserve=True` 时**检查与预占在同一次持锁中完成**。这不是优化，是正确性：
+        原先"读计数 → 决策 → 事后 +1"是典型的 check-then-act，两个并发的
+        NewProxy 会同时读到旧计数并双双通过（实测 limit=1 时两个都拿到 0）。
+        frp 的 NewProxy 回调确实可能并发（多客户端同时上线）。
+        """
         if limit <= 0:
             return QuotaResult(allowed=True, limit=0, source="unlimited")
 
-        count, source = self.current(user)
+        if not reserve:
+            count, source = self.current(user)
+            return self._verdict(user, count, source, limit)
+
+        # 预占路径：把计数查询也放进锁内，避免并发下两个请求都看到旧值。
+        # 查询本身可能走网络（dashboard），因此锁只保护"读-判-占"这段临界区，
+        # 网络调用放在锁内是因为它正是"读计数"这一步——无法拆开。
+        with self._lock:
+            local = self._local.get(user, 0)
+            count, source = local, "local"
+            if self.admin_url:
+                cached = self._cache.get(user)
+                if cached is not None and self._clock() - cached[0] <= self.cache_ttl:
+                    count, source = max(cached[1], local), cached[2]
+            if source == "local" and self.admin_url:
+                # 缓存未命中：锁内查一次（见上方说明）
+                try:
+                    fresh = self._query_dashboard(user)
+                except Exception:  # noqa: BLE001
+                    fresh = None
+                if fresh is not None:
+                    self._cache[user] = (self._clock(), fresh, "dashboard")
+                    count, source = max(fresh, local), "dashboard"
+            verdict = self._verdict(user, count, source, limit)
+            if verdict.allowed:
+                self._local[user] = local + 1  # 预占名额
+                self._cache.pop(user, None)
+            return verdict
+
+    def _verdict(self, user: str, count: int, source: str, limit: int) -> QuotaResult:
         if count >= limit:
+            origin = "dashboard" if source == "dashboard" else "插件本地"
             return QuotaResult(
                 allowed=False,
                 current=count,
                 limit=limit,
                 source=source,
-                reason=(
-                    f"用户 {user!r} 的代理数已达上限 {limit}"
-                    f"（当前 {count}，计数来源：{'dashboard' if source == 'dashboard' else '插件本地'}）"
-                ),
+                reason=(f"用户 {user!r} 的代理数已达上限 {limit}（当前 {count}，计数来源：{origin}）"),
             )
         return QuotaResult(allowed=True, current=count, limit=limit, source=source)

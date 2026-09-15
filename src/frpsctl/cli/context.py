@@ -71,6 +71,10 @@ def build_context(
     （state / 锁 / 快照仍按实例走，否则会与所有权判定脱节）。
     """
     name = instance or os.environ.get("FRPSCTL_INSTANCE") or _DEFAULT_INSTANCE
+    # 凭据优先级（§8.5）：--admin-password > FRPSCTL_ADMIN_PASSWORD > 配置文件。
+    # 让命令行/环境变量优先，是为了不改动配置文件就能临时排查——而配置文件里
+    # 那份仍然生效，不需要重复维护。
+    resolved_password = admin_password or os.environ.get("FRPSCTL_ADMIN_PASSWORD") or None
     inst = Instance(
         name=name,
         instances_root=(root or resolve_instances_root()).expanduser(),
@@ -83,7 +87,7 @@ def build_context(
         json=json_output,
         yes=yes,
         verbose=verbose,
-        admin_password=admin_password,
+        admin_password=resolved_password,
     )
 
 
@@ -135,10 +139,8 @@ def map_exceptions() -> Iterator[None]:
         raise SystemExit(130) from None
     except BrokenPipeError:
         # 例如 `frpsctl log | head`——正常终止，不要打印回溯吓人
-        try:
+        with contextlib.suppress(OSError):
             sys.stderr.close()
-        except OSError:
-            pass
         raise SystemExit(0) from None
     except Exception as exc:  # noqa: BLE001 - 顶层兜底，必须给退出码
         # Click 的用法错误族（UsageError / NoSuchOption / BadParameter…）自带

@@ -53,20 +53,14 @@ class HealthReport:
         时无法探 L2），把它当失败会让 `webServer.port = 0` 的合法配置永远
         无法通过启动检查。真正的失败必须是**观测到的失败**。
         """
-        return (
-            self.l1_process is not HealthLayer.FAIL
-            and self.l2_control is not HealthLayer.FAIL
-        )
+        return self.l1_process is not HealthLayer.FAIL and self.l2_control is not HealthLayer.FAIL
 
     @property
     def plugin_warning(self) -> str | None:
         """L3 失败时的告警文本：不改变退出码，但必须显著提示。"""
         if self.l3_plugin is not HealthLayer.FAIL:
             return None
-        return (
-            f"插件不可达：{self.detail or '见配置'} —— "
-            "客户端将无法登录（fail-closed），请先恢复插件服务"
-        )
+        return f"插件不可达：{self.detail or '见配置'} —— 客户端将无法登录（fail-closed），请先恢复插件服务"
 
     def render(self) -> str:
         """一行式展示（§7.4）。"""

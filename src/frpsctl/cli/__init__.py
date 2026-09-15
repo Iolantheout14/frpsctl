@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -23,18 +24,12 @@ from ..core import healthcheck, release
 from ..core import platform as plat
 from ..core.admin import AdminClient, sum_proxy_types
 from ..core.instance import Instance
-from ..core.lifecycle import Lifecycle, Owner, State
+from ..core.lifecycle import Lifecycle, State
 from ..core.systemd import Systemd
 from ..core.transaction import apply_change, rollback_to
-from ..core.version import parse_version, upgrade_hint
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
-from ..errors import (
-    AlreadyRunning,
-    ConfigError,
-    FrpsctlError,
-    NotRunning,
-)
+from ..errors import AdminUnreachable, AlreadyRunning, ConfigError, FrpsctlError
 from . import ui
 from .context import AppContext, build_context, run_cli
 
@@ -81,10 +76,19 @@ def _root(
     config: Path = typer.Option(None, "--config", help="直接指定配置文件（覆盖实例默认）"),
     binary: Path = typer.Option(None, "--binary", help="直接指定 frps 二进制"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    admin_password: str = typer.Option(
+        None, "--admin-password", help="dashboard 口令（优先于配置文件；也可用 FRPSCTL_ADMIN_PASSWORD）"
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过交互确认"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细输出"),
-    version: bool = typer.Option(
-        False, "--version", help="显示 frpsctl 版本", is_eager=True, callback=_show_version
+    version: bool = typer.Option(  # noqa: ARG001 - 值由 eager callback 消费，函数体不需要它
+        False,
+        "--version",
+        help="显示 frpsctl 版本",
+        is_eager=True,
+        callback=_show_version,
+        # 值由 eager callback 处理；这里留着是为了让 Click 生成帮助条目
+        expose_value=False,
     ),
 ) -> None:
     """解析全局选项。平台检查在这里做一次硬拒绝（§3.4）。"""
@@ -95,6 +99,7 @@ def _root(
         config=config,
         binary=binary,
         json_output=json_output,
+        admin_password=admin_password,
         yes=yes,
         verbose=verbose,
     )
@@ -256,7 +261,7 @@ def init(
     if not ranges:
         ui.emit("⚠ allowPorts 未设置：任何持有 token 的客户端都能申请任意端口。")
     ui.emit("")
-    ui.emit(f"下一步：frpsctl verify && frpsctl start")
+    ui.emit("下一步：frpsctl verify && frpsctl start")
 
 
 def _parse_port_ranges(spec: str) -> list[tuple[str, int, int]]:
@@ -372,10 +377,8 @@ def verify(
 
     text = target.read_text("utf-8")
     uses_unsafe = _config_uses_unsafe(text)
-    cfg.validate_text(
-        text, binary=binary, version=version, workdir=app_ctx.instance.dir, uses_unsafe=uses_unsafe
-    )
-    flags = " ".join(cfg.config_flags(version, uses_exec_token_source=uses_unsafe))
+    cfg.validate_text(text, binary=binary, workdir=app_ctx.instance.dir, uses_unsafe=uses_unsafe)
+    flags = " ".join(cfg.config_flags(uses_exec_token_source=uses_unsafe))
     if app_ctx.json:
         ui.emit_json({"file": str(target), "ok": True, "flags": flags})
     else:
@@ -389,7 +392,12 @@ def _config_uses_unsafe(text: str) -> bool:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError:
         return False
-    source = (data.get("auth") or {}).get("tokenSource") or {}
+    auth = data.get("auth")
+    if not isinstance(auth, dict):
+        return False  # `auth = "oops"` 这类类型错误交给 pydantic 报（退出码 3）
+    source = auth.get("tokenSource")
+    if not isinstance(source, dict):
+        return False
     return str(source.get("type", "")).lower() == "exec"
 
 
@@ -410,11 +418,11 @@ def start(
     lc = _lifecycle(app_ctx)
 
     # 落盘前先跑权威校验（§9 第 5 步的理念：把 verify 请到最前面）
+    cfg.load_config(app_ctx.config_path)  # 不存在 → ConfigError(3) 而非 FileNotFoundError(1)
     text = app_ctx.config_path.read_text("utf-8")
     cfg.validate_text(
         text,
         binary=lc.binary(),
-        version=lc.binary_version(),
         workdir=app_ctx.instance.dir,
         uses_unsafe=_config_uses_unsafe(text),
     )
@@ -431,7 +439,7 @@ def start(
     else:
         ui.emit(f"已启动：pid {report.pid}，frps {report.version}")
         ui.emit(f"health   : {report.health.render()}")
-    _emit_health_warnings(report.health, app_ctx)
+    _emit_health_warnings(report.health)
 
 
 @app.command()
@@ -469,7 +477,7 @@ def restart(
     else:
         ui.emit(f"已重启：pid {report.pid}，frps {report.version}")
         ui.emit(f"health   : {report.health.render()}")
-    _emit_health_warnings(report.health, app_ctx)
+    _emit_health_warnings(report.health)
 
 
 def _start_payload(report) -> dict:
@@ -486,8 +494,12 @@ def _start_payload(report) -> dict:
     }
 
 
-def _emit_health_warnings(health, app_ctx: AppContext) -> None:
-    """L3 失败不改变退出码，但必须显著提示（§3.7）。"""
+def _emit_health_warnings(health) -> None:
+    """L3 失败不改变退出码，但必须显著提示（§3.7）。
+
+    只接收 health：告警文案与 --json 无关（即使 --json 也要走 stderr 告警，
+    否则脚本会把"客户端登录不了"当成成功）。
+    """
     warning = health.plugin_warning
     if warning:
         ui.warn(f"⚠ {warning}")
@@ -522,14 +534,18 @@ def _print_status(app_ctx: AppContext) -> None:
     client_count = None
     proxy_counts: dict[str, int] = {}
     if report.state is State.RUNNING:
-        try:
-            with _admin(app_ctx) as client:
-                if client is not None:
+        # 先取对象再判 None：`with None` 会直接 TypeError，而 dashboard 未启用
+        # （webServer.port = 0）是**合法配置**，不是异常情况。status 必须永远能
+        # 回答"现在什么情况"，不能因为没开 dashboard 就崩。
+        client = _admin(app_ctx)
+        if client is not None:
+            try:
+                with client:
                     info = client.server_info()
                     client_count = info.client_counts
                     proxy_counts = info.proxy_type_counts
-        except FrpsctlError:
-            info = None
+            except FrpsctlError:
+                info = None
 
     if app_ctx.json:
         ui.emit_json(
@@ -537,6 +553,7 @@ def _print_status(app_ctx: AppContext) -> None:
                 "instance": report.instance,
                 "owner": report.owner.value,
                 "state": report.state.value,
+                "state_corrupted": report.state_corrupted,
                 "pid": report.pid,
                 "uptime_seconds": report.uptime_seconds,
                 "binary": str(report.binary) if report.binary else None,
@@ -544,6 +561,8 @@ def _print_status(app_ctx: AppContext) -> None:
                 "disk_version": report.disk_version,
                 "config": str(report.config) if report.config else None,
                 "config_mode": report.config_mode,
+                "systemd_unit": report.systemd_unit,
+                "systemd_main_pid": report.systemd_main_pid,
                 "health": None
                 if report.health is None
                 else {
@@ -560,7 +579,15 @@ def _print_status(app_ctx: AppContext) -> None:
         )
         return
 
+    if report.state_corrupted:
+        ui.warn(
+            f"⚠ 状态文件已损坏：{app_ctx.instance.state}\n"
+            "  无法判断进程归属，因此 stop/start/config set 都会拒绝执行。\n"
+            "  请确认没有 frps 在跑，然后删除该文件。"
+        )
     ui.emit(f"instance : {report.instance:<18} owner : {report.owner.value}")
+    if report.systemd_unit:
+        ui.emit(f"unit     : {report.systemd_unit} (MainPID {report.systemd_main_pid})")
     if report.state is State.RUNNING:
         uptime = ui.human_duration(report.uptime_seconds)
         ui.emit(f"state    : RUNNING (pid {report.pid}, up {uptime})")
@@ -605,13 +632,23 @@ def log(
     follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪"),
     lines: int = typer.Option(100, "--lines", "-n", help="显示行数"),
 ) -> None:
-    """看日志。优先 `log.to` 指向的文件；缺失时回退到 startup 日志（ADR-5）。"""
-    app_ctx = _ctx(ctx).with_json(json_output)
+    """看日志。优先 `log.to` 指向的文件；缺失时回退到 startup 日志（ADR-5）。
+
+    **不提供 `--json`**：日志是流式文本，把它塞进 JSON 只会让 `-f` 失去意义。
+    需要结构化日志请让 frp 自己输出（`log.to` 指向文件后用工具解析）。
+    """
+    app_ctx = _ctx(ctx)
     inst = app_ctx.instance
     target = _resolve_log_target(inst, app_ctx.config_path)
 
     if not target.exists():
-        raise NotRunning(f"{inst.name}（日志文件不存在：{target}）")
+        # 不是"实例未运行"——实例可能在跑，只是配置里的 log.to 指向了别处。
+        # 用 ConfigurationError 并**明确给出**解析出来的路径，否则用户不知道
+        # 去哪儿找日志（G6：失败可诊断）。
+        raise ConfigError(
+            f"日志文件不存在：{target}",
+            hint=("该路径来自配置的 log.to；若实例在运行，检查 log.to 是否是绝对路径或相对于实例目录"),
+        )
 
     argv = ["tail", "-n", str(lines)]
     if follow:
@@ -651,13 +688,15 @@ def config_get(
     """读单个键。敏感键默认打码（§10 硬约束 2）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     doc = cfg.load_config(app_ctx.config_path)
-    value = cfg.get_value(doc, key)
-    secret = cfg.is_secret_key(key)
+    raw_value = cfg.get_value(doc, key)
+    # 递归打码：`config get auth` 取到的是整张表，只判 `is_secret_key("auth")`
+    # 会漏掉表内的 token/password（实测会明文打印）。
+    value = cfg.mask_tree(raw_value, prefix=key, reveal=reveal)
 
     if app_ctx.json:
-        ui.emit_json({"key": key, "value": value if (reveal or not secret) else "***"})
-    elif secret:
-        ui.emit(ui.mask_secret(value, reveal=reveal))
+        ui.emit_json({"key": key, "value": value})
+    elif isinstance(value, (dict, list)):
+        ui.emit(json.dumps(value, ensure_ascii=False, default=str))
     else:
         ui.emit(str(value))
 
@@ -706,7 +745,7 @@ def config_set(
         )
         return
 
-    ui.emit(outcome.diff.rstrip() or "(无文本差异)")
+    ui.emit(cfg.mask_diff(outcome.diff).rstrip() or "(无文本差异)")
     ui.emit("")
     if outcome.note:
         ui.emit(f"✓ {outcome.note}")
@@ -721,18 +760,26 @@ def config_edit(
     ctx: typer.Context,
     health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
 ) -> None:
-    """用 $EDITOR 编辑，保存后走完全相同的闭环（先展示 diff 让人确认）。"""
+    """用 $EDITOR 编辑，保存后走完全相同的闭环（先展示 diff 让人确认）。
+
+    **不提供 `--json`**：它要展示 diff 并等待人确认，没有"机器可读"的语义。
+    """
     import tempfile
 
-    app_ctx = _ctx(ctx).with_json(json_output)
+    app_ctx = _ctx(ctx)
     lc = _lifecycle(app_ctx)
     original = app_ctx.config_path.read_text("utf-8")
 
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as handle:
-        handle.write(original)
-        draft_path = Path(handle.name)
+    # 同 validate_text：先拿到路径再写，否则写失败会把含机密的草稿留在 /tmp
+    # 同上：先拿路径再写，保证写失败时 /tmp 不残留含机密的草稿
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
+        "w", suffix=".toml", delete=False, encoding="utf-8"
+    )
+    draft_path = Path(handle.name)
     try:
+        with handle:
+            handle.write(original)
         code = subprocess.call([editor, str(draft_path)])
         if code != 0:
             raise ConfigError(f"编辑器退出码 {code}，放弃变更")
@@ -745,7 +792,7 @@ def config_edit(
         return
 
     diff = cfg.diff_texts(original, draft, app_ctx.config_path.name)
-    ui.emit(diff.rstrip())
+    ui.emit(cfg.mask_diff(diff).rstrip())
     ui.emit("")
     if not app_ctx.yes and not typer.confirm("应用以上改动并重启？", default=True):
         ui.emit("已放弃")
@@ -785,13 +832,11 @@ def config_diff(
     snapshot = entries[index] / "frps.toml"
     if not snapshot.exists():
         raise ConfigError(f"快照不完整：{snapshot}")
-    diff = cfg.diff_texts(
-        snapshot.read_text("utf-8"), app_ctx.config_path.read_text("utf-8"), "frps.toml"
-    )
+    diff = cfg.diff_texts(snapshot.read_text("utf-8"), app_ctx.config_path.read_text("utf-8"), "frps.toml")
     if app_ctx.json:
-        ui.emit_json({"snapshot": str(snapshot.parent), "diff": diff})
+        ui.emit_json({"snapshot": str(snapshot.parent), "diff": cfg.mask_diff(diff)})
     else:
-        ui.emit(diff.rstrip() or "(无差异)")
+        ui.emit(cfg.mask_diff(diff).rstrip() or "(无差异)")
         ui.emit("")
         ui.emit(f"# 快照：{snapshot.parent.name}")
 
@@ -814,10 +859,14 @@ def config_rollback(
     )
     if app_ctx.json:
         ui.emit_json(
-            {"target": outcome.after, "restarted": outcome.restarted, "diff": outcome.diff}
+            {
+                "target": outcome.after,
+                "restarted": outcome.restarted,
+                "diff": cfg.mask_diff(outcome.diff),
+            }
         )
         return
-    ui.emit(outcome.diff.rstrip() or "(无文本差异)")
+    ui.emit(cfg.mask_diff(outcome.diff).rstrip() or "(无文本差异)")
     ui.emit("")
     if outcome.restarted:
         ui.emit(f"✓ 已回滚到 {outcome.after} 并重启，健康检查通过")
@@ -931,12 +980,15 @@ def kick(
 ) -> None:
     """下线指定代理（`DELETE /api/proxies`）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
-    with _admin(app_ctx) as client:
-        if client is None:
-            raise ConfigError(
-                "dashboard 未启用（webServer.port = 0），无法下线代理",
-                hint="kick 依赖 Admin API；请设置 webServer.port",
-            )
+    client = _admin(app_ctx)
+    if client is None:
+        # 退出码 7 而不是 3：§7.3 把"dashboard 不可达/未启用"定义为 7，
+        # 脚本据此区分"配置写错了"与"这个功能当前不可用"。
+        raise AdminUnreachable(
+            "dashboard 未启用（webServer.port = 0），无法下线代理",
+            hint="kick 依赖 Admin API；请在配置里设置 webServer.port",
+        )
+    with client:
         client.kick(proxy_name)
     if app_ctx.json:
         ui.emit_json({"kicked": proxy_name})
@@ -989,10 +1041,8 @@ def plugin_init(
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_render_policy_template(), "utf-8")
-    try:
+    with contextlib.suppress(OSError):
         path.chmod(0o600)  # 它描述了谁能用哪些端口，属于安全配置
-    except OSError:
-        pass
 
     if app_ctx.json:
         ui.emit_json({"policy": str(path), "mode": "0600"})
@@ -1092,9 +1142,7 @@ def _sample_decisions(policy: PluginPolicy) -> list[dict]:
     samples: list[dict] = []
     for name in sorted(policy.users):
         decision = decide_login(policy, user=name, client_id=name)
-        samples.append(
-            {"case": f"Login {name}", "allowed": decision.allowed, "reason": decision.reason}
-        )
+        samples.append({"case": f"Login {name}", "allowed": decision.allowed, "reason": decision.reason})
 
         user = policy.user(name)
         assert user is not None

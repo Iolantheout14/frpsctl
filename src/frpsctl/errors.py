@@ -233,12 +233,17 @@ class UnsupportedPlatform(FrpsctlError):
 
 
 class ChangeRolledBack(FrpsctlError):
-    """配置写入后启动失败，已恢复上一版（ADR-6、§9 第 8 步）。"""
+    """变更后启动/健康检查失败，已尝试回滚（ADR-6、§9 第 8 步）。
+
+    `hint` 是**回滚结果本身**，不是泛泛的安慰话：回滚可能只恢复了配置文件而
+    没能把服务拉回来。用户据这一行决定"要不要人工介入"，所以必须如实——
+    说"已回滚"却留个 DOWN 的实例，比报错更糟。
+    """
 
     exit_code = ExitCode.ROLLED_BACK
 
-    def __init__(self, detail: str = "") -> None:
+    def __init__(self, detail: str = "", *, hint: str | None = None) -> None:
         super().__init__(
             "变更后启动失败，已自动回滚到上一份配置",
-            hint=detail.strip() or "原配置已恢复，服务使用的是回滚后的版本",
+            hint=hint.strip() if hint and hint.strip() else (detail.strip() or "原配置已恢复"),
         )

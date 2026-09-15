@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -61,9 +60,7 @@ class TestProcStartTime:
         造一个假的 /proc 文件：comm 是 `weird) name (x`，后面 20 个字段，
         第 20 个（索引 19）是 starttime = 424242。
         """
-        fake_stat = b"1234 (weird) name (x) S " + b" ".join(
-            [b"0"] * 18 + [b"424242"]
-        ) + b"\n"
+        fake_stat = b"1234 (weird) name (x) S " + b" ".join([b"0"] * 18 + [b"424242"]) + b"\n"
         fake_proc = tmp_path / "proc"
         pid_dir = fake_proc / "1234"
         pid_dir.mkdir(parents=True)
@@ -175,9 +172,8 @@ class TestInstanceLock:
 
     def test_released_on_exception(self, tmp_path) -> None:
         path = tmp_path / ".lock"
-        with pytest.raises(RuntimeError):
-            with instance_lock(path, timeout=0.5):
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), instance_lock(path, timeout=0.5):
+            raise RuntimeError("boom")
         with instance_lock(path, timeout=0.5):
             pass
 
@@ -208,9 +204,8 @@ class TestInstanceLock:
 
     def test_nested_release_is_balanced(self, tmp_path) -> None:
         path = tmp_path / ".lock"
-        with instance_lock(path, timeout=0.5):
-            with instance_lock(path, timeout=0.5):
-                pass
+        with instance_lock(path, timeout=0.5), instance_lock(path, timeout=0.5):
+            pass
         assert is_locked(path) is False  # 计数归零后才真正释放
         with instance_lock(path, timeout=0.5):
             pass
@@ -266,10 +261,14 @@ class TestPlanSet:
         assert "# frps 示例配置（这段注释必须原样存活）" in plan.text
         assert "# 行内注释也要活着" in plan.text
         assert "# 下面是安全相关设置" in plan.text
-        assert '[webServer]' in plan.text
+        assert "[webServer]" in plan.text
         assert "bindPort = 8000" in plan.text
         # 改动只有一行
-        changed = [ln for ln in plan.diff.splitlines() if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))]
+        changed = [
+            ln
+            for ln in plan.diff.splitlines()
+            if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+        ]
         assert len(changed) == 2, plan.diff
 
     def test_nested_key_creates_missing_table(self, tmp_path) -> None:
@@ -284,7 +283,7 @@ class TestPlanSet:
         path = tmp_path / "frps.toml"
         path.write_text(
             "bindPort = 7000\nmaxPortsPerClient = 20\n"
-            "[[httpPlugins]]\nname = \"auth\"\naddr = \"http://127.0.0.1:8080\"\n",
+            '[[httpPlugins]]\nname = "auth"\naddr = "http://127.0.0.1:8080"\n',
             "utf-8",
         )
         plan = cfg.plan_set(path, "bindPort", "8000")

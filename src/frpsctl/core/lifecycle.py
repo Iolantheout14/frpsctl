@@ -89,13 +89,25 @@ class ProcessRef:
     config: str
 
     def is_ours(self) -> bool:
-        """三重校验：pid 存活 + 启动时刻一致 + 命令行匹配（§8.3）。"""
+        """三重校验：pid 存活 + 启动时刻一致 + 命令行匹配（§8.3）。
+
+        **三个维度都必须成立，缺一即不是我们的进程**（fail-closed）：
+
+        - `start_time` 缺失（state.json 里没有，或 `/proc/<pid>/stat` 读不到）
+          时**直接返回 False**。这里曾经写成"读不到就跳过这一维"，后果是三重
+          校验退化成"pid 存活 + 命令行匹配"两维——而 pid 复用恰恰就是靠启动
+          时刻识别的。实测：一个无关的 `/bin/sleep` 只要 argv 路径与记录的
+          binary 相同，就会被判成"我们的"，随后被 stop() 杀掉。
+        - 安全边界上的"读不到"必须按"不是它"处理（ADR-7：不猜测）。代价是
+          极端情况下（`/proc` 异常）会拒绝停止一个其实属于我们的进程，用户
+          会看到明确的错误而不是一个可能杀错的成功。
+        """
         if not plat.pid_alive(self.pid):
             return False
-        if self.start_time is not None:
-            current = plat.proc_start_time(self.pid)
-            if current is not None and current != self.start_time:
-                return False  # pid 被复用 → 不是我们的进程
+        if self.start_time is None:
+            return False
+        if not plat.same_process(self.pid, self.start_time):
+            return False  # 要么已退出，要么 pid 被复用 → 都不是我们的进程
         return _cmdline_matches(plat.proc_cmdline(self.pid), self.binary)
 
 
@@ -159,6 +171,11 @@ class StatusReport:
     config_mode: str | None = None
     health: HealthReport | None = None
     version_hint: str | None = None
+    #: systemd 托管时填充（§8.3 要求状态表显示 unit 名与 ExecMainPID）
+    systemd_unit: str | None = None
+    systemd_main_pid: int | None = None
+    #: state.json 损坏（无法判断进程归属）。status 必须如实报告而不是崩掉。
+    state_corrupted: bool = False
 
     @property
     def binary_matches_disk(self) -> bool:
@@ -284,10 +301,7 @@ class Lifecycle:
             with AdminClient(dash.base_url, dash.user, dash.password, timeout=timeout) as client:
                 ok, ms = client.healthz()
             l2 = HealthLayer.OK if ok else HealthLayer.FAIL
-            if ok:
-                detail = f"/healthz 200, {ms:.0f}ms"
-            else:
-                detail = f"/healthz 无响应 ({dash.base_url})"
+            detail = f"/healthz 200, {ms:.0f}ms" if ok else f"/healthz 无响应 ({dash.base_url})"
 
         # L3：插件面（无 httpPlugins → SKIPPED）
         targets = parse_plugin_targets(self.inst.config)
@@ -301,13 +315,13 @@ class Lifecycle:
 
     def start(self, *, health_timeout: float = 10.0) -> StartReport:
         """启动流程（§8.3）。返回报告；失败抛对应异常。"""
+        self.inst.ensure_private()  # 状态与日志马上要落盘，先把目录收紧
         with instance_lock(self.inst.lock):
-            owner = self.resolve_owner()
-            if owner is Owner.SYSTEMD:
-                raise OwnershipConflict(
-                    f"实例 {self.inst.name} 正由 systemd 托管",
-                    hint="请使用 `frpsctl service status` 或 systemctl 操作该实例",
-                )
+            if self.resolve_owner() is Owner.SYSTEMD:
+                # ADR-1：所有权是 systemd 时**委托 systemctl**，不碰 pid 文件。
+                # 直接拒绝（旧行为）会让"已被 systemd 纳管"的实例在 frpsctl 里
+                # 完全不可操作，与文档承诺的"全部委托"相矛盾。
+                return self._start_via_systemd()
 
             ref = self.read_ref()
             if ref is not None and ref.is_ours():
@@ -337,18 +351,93 @@ class Lifecycle:
             binary = self.binary()
             version = self.binary_version()
 
+            # ⚠️ 从这里开始，我们已经 fork 出了一个真实进程。**任何**后续异常都必须
+            # 先把它收拾掉再往外抛，否则会留下一个"没人认领"的 frps：它继续跑、
+            # 继续占端口，而 state.json 没写成 → stop() 认为是 NotRunning、
+            # status 显示 STOPPED，工具再也管不到它，只能人工 kill。
+            #
+            # 触发面很实在：写 state.json 可能 ENOSPC/EACCES、`frps -v` 可能超时、
+            # 配置里 webServer.addr 写成 "127.0.0.1:7500" 会让 AdminClient 抛
+            # httpx.InvalidURL。
             proc = self._spawn(binary)
-            if not self._await_alive(proc.pid, STARTUP_GRACE):
-                raise StartupFailed(self._startup_tail())
-
-            self._write_state(proc)
-            health = self._await_health(health_timeout)
+            try:
+                if not self._await_alive(proc.pid, STARTUP_GRACE):
+                    raise StartupFailed(self._startup_tail())
+                self._write_state(proc, version=version)
+                health = self._await_health(health_timeout)
+                # ADR-3：确认 v2 API 真的在。版本门槛（§3.6）已保证 >= 0.70.0，
+                # 因此这里拿到 404 说明**二进制与预期不符**（例如 --binary 指向
+                # 自编译的怪版本）——报错退出 7，不猜、不降级。
+                self._assert_v2_api()
+            except BaseException:
+                # pid 是自己刚 fork 的，此刻不可能被复用，直接 SIGKILL 是安全的
+                self._reap_after_failure(proc.pid)
+                raise
             return StartReport(pid=proc.pid, version=version, health=health)
+
+    def _assert_v2_api(self, *, timeout: float = 3.0) -> None:
+        """确认 dashboard 提供 v2 API（ADR-3）。
+
+        要区分两种失败，它们的含义完全不同：
+
+        - **404** → 端点不存在，说明这个二进制不是我们预期的版本（例如
+          `--binary` 指向自编译的怪版本）。**立即报错**（退出码 7），不重试：
+          重试一万次也还是 404。
+        - **连接被拒/超时** → dashboard 可能只是还没绑定好端口。健康检查走的是
+          `/healthz`，它与 dashboard 是同一个 server，但绑定完成的时刻未必
+          早于我们这一问。这类**瞬时**失败按退避重试，超时后放弃（不再阻断启动，
+          因为服务本身是好的，只是统计暂时取不到）。
+
+        dashboard 未启用（`webServer.port = 0`）时直接跳过——那是合法配置。
+        """
+        dash = parse_dashboard(self.inst.config)
+        if not dash.enabled:
+            return
+        from .admin import AdminClient
+        from ..errors import ApiVersionMismatch, AdminUnreachable
+
+        deadline = time.monotonic() + timeout
+        last: Exception | None = None
+        while True:
+            try:
+                with AdminClient(dash.base_url, dash.user, dash.password, timeout=2.0) as client:
+                    client.server_info()  # 404 → ApiVersionMismatch
+                return
+            except ApiVersionMismatch:
+                raise  # 版本不符：重试没有意义
+            except AdminUnreachable as exc:
+                last = exc
+                if time.monotonic() >= deadline:
+                    # 服务本身已通过健康检查；统计暂时取不到不该拦下启动
+                    return
+                time.sleep(0.2)
+            except FrpsctlError as exc:  # 其它业务异常同样不阻断启动
+                last = exc
+                return
+        _ = last
+
+    def _reap_after_failure(self, pid: int) -> None:
+        """启动流程中途失败时收拾掉自己刚派生的进程。
+
+        先 SIGKILL（不等 SIGTERM 的宽限期：这个进程还没被确认可用，留着只会占端口），
+        再清掉可能已写一半的 state.json——**顺序不能反**：先清 state 会让这段时间里
+        的 stop() 认为"没有进程"，而这个进程其实还活着。
+        """
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            plat.terminate(pid, force=True)
+        deadline = time.monotonic() + KILL_TIMEOUT
+        while time.monotonic() < deadline:
+            if plat.process_gone(pid):
+                break
+            time.sleep(0.05)
+        self.inst.clear_state()
 
     def _spawn(self, binary: Path) -> subprocess.Popen:
         """派生进程。fd 生命周期必须正确：父进程写完就关，子进程持有独立 fd。"""
         log_path = self.inst.new_startup_log()
-        handle = open(log_path, "ab", buffering=0)
+        # 这里刻意不用 with：fd 必须存活到 Popen 返回，由 finally 保证关闭。
+        # 交给 with 会在 Popen 之前就关掉，子进程拿到的是已关闭的 fd。
+        handle = open(log_path, "ab", buffering=0)  # noqa: SIM115
         try:
             proc = subprocess.Popen(
                 [str(binary), "-c", str(self.inst.config)],
@@ -398,27 +487,40 @@ class Lifecycle:
             return ""
         return "".join(content.splitlines(keepends=True)[-lines:]).strip()
 
-    def _write_state(self, proc: subprocess.Popen) -> None:
+    def _write_state(self, proc: subprocess.Popen, *, version: Version) -> None:
         """落盘 state.json + pid 副本。
 
-        `binary` 记录**真实路径**（`actual_binary()` 做了 resolve），否则换软链后
-        `is_ours()` 的 cmdline 比对会失配——这是升级功能最容易埋进去的自伤 bug（R13）。
+        两个字段不能想当然：
+
+        - `binary` 记录**真实路径**（`actual_binary()` 做了 resolve），否则换软链后
+          `is_ours()` 的 cmdline 比对会失配——升级功能最容易埋进去的自伤 bug（R13）。
+        - `start_time` **必须**拿到。它是识别 pid 复用的唯一依据，缺失会让
+          `is_ours()` 直接 fail-closed（返回 False），于是这个进程立刻变成"外人"，
+          既 stop 不掉也 status 不出来。拿不到就当场失败、由调用方收拾进程，
+          好过写一份注定无法管理的状态。
+
+        `version` 由调用方传入：`start()` 已经算过一次，没必要再跑一次 `frps -v`
+        （那是一次可抛、可超时的外部调用）。
         """
+        start_time = plat.proc_start_time(proc.pid)
+        if start_time is None:
+            raise StartupFailed(
+                f"无法读取 pid {proc.pid} 的启动时刻（/proc/{proc.pid}/stat）",
+                hint="没有它就无法识别 pid 复用，该进程将无法被安全管理，已放弃接管",
+            )
         binary = self.actual_binary()
         payload = {
             "pid": proc.pid,
-            "start_time": plat.proc_start_time(proc.pid),
+            "start_time": start_time,
             "binary": str(binary),
             "config": str(self.inst.config),
-            "version": str(self.binary_version()),
+            "version": str(version),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "owner": Owner.DIRECT.value,
         }
         self.inst.write_state(payload)
-        try:
+        with contextlib.suppress(OSError):
             self.inst.pidfile.write_text(f"{proc.pid}\n", "utf-8")
-        except OSError:
-            pass
 
     def _await_health(self, timeout: float) -> HealthReport:
         """等待 L1 ∧ L2 通过；超时返回最后一次报告（由调用方决定如何处置）。"""
@@ -438,14 +540,10 @@ class Lifecycle:
         因为那条路径上唯一能保证的就是"可能杀错进程"。
         """
         with instance_lock(self.inst.lock):
-            owner = self.resolve_owner()
-            if owner is Owner.SYSTEMD:
-                raise OwnershipConflict(
-                    f"实例 {self.inst.name} 正由 systemd 托管",
-                    hint="请使用 systemctl 停止，或 `frpsctl service uninstall` 解除托管",
-                )
+            if self.resolve_owner() is Owner.SYSTEMD:
+                return self._stop_via_systemd()
 
-            ref = self.read_ref()
+            ref = self.read_ref()  # 损坏时抛 ConfigError(3)，绝不当作"未运行"
             if ref is None:
                 self.inst.clear_state()
                 raise NotRunning(self.inst.name)
@@ -453,45 +551,98 @@ class Lifecycle:
                 if plat.pid_alive(ref.pid):
                     raise OwnershipConflict(
                         f"pid {ref.pid} 存活但身份校验不通过，拒绝停止",
-                        hint=(
-                            "该 pid 可能已被复用为无关进程。确认后手工删除 "
-                            f"{self.inst.state} 即可恢复"
-                        ),
+                        hint=(f"该 pid 可能已被复用为无关进程。确认后手工删除 {self.inst.state} 即可恢复"),
                     )
                 self.inst.clear_state()
                 raise NotRunning(self.inst.name)
 
             if force:
                 plat.terminate(ref.pid, force=True)
-                gone = self._wait_gone(ref.pid, KILL_TIMEOUT)
+                gone = self._wait_gone(ref, KILL_TIMEOUT)
             else:
                 with contextlib.suppress(ProcessLookupError):
                     plat.terminate(ref.pid)  # SIGTERM：frps 立即终止（§3.5，非 graceful）
-                gone = self._wait_gone(ref.pid, timeout)
-                if not gone:
-                    plat.terminate(ref.pid, force=True)  # 兜底：应对卡死/无响应
-                    gone = self._wait_gone(ref.pid, KILL_TIMEOUT)
+                gone = self._wait_gone(ref, timeout)
+                if not gone and self._still_ours(ref):
+                    # 兜底：应对卡死/无响应。
+                    # ⚠️ 升到 SIGKILL 之前**必须重验身份**：等待期间进程可能已退出，
+                    # 而 pid 被无关进程复用——此时再发 SIGKILL 就是 R2 要防的误杀。
+                    plat.terminate(ref.pid, force=True)
+                    gone = self._wait_gone(ref, KILL_TIMEOUT)
+                elif not gone:
+                    # 身份已失效（进程退出或 pid 复用）：视作已停止，不发第二个信号
+                    gone = True
 
-            self.inst.clear_state()
+            if gone:
+                self.inst.clear_state()
             if not gone:
+                # 进程仍在且**确属我们**才报"杀不掉"。此处保留 state.json：
+                # 它是唯一的归属记录，清掉会让进程彻底失控（见 R2/M1）。
                 raise StartupFailed(
                     f"pid {ref.pid} 在 SIGKILL 后仍未退出",
                     hint="进程可能处于不可中断睡眠（D 状态），检查内核日志",
                 )
             return StopReport(stopped=True)
 
-    def _wait_gone(self, pid: int, timeout: float) -> bool:
+    def _still_ours(self, ref: ProcessRef) -> bool:
+        """等待期间的轻量身份复核（只比启动时刻，不读 cmdline）。
+
+        比 `is_ours()` 便宜且足够：这里要回答的只是"还能不能对这个 pid 发信号"，
+        而启动时刻一致就排除了 pid 复用。
+        """
+        if ref.start_time is None:
+            return False
+        return plat.pid_alive(ref.pid) and plat.same_process(ref.pid, ref.start_time)
+
+    def _wait_gone(self, ref: ProcessRef, timeout: float) -> bool:
         """等待进程**真的**结束。
 
-        用 `process_gone` 而不是 `not pid_alive`：后者对僵尸进程仍然返回
-        "存活"（见 platform.is_zombie 的说明），会让停止流程空等超时并误报失败。
+        两个判据都不能省：
+
+        - 用 `process_gone` 而不是 `not pid_alive`：后者对僵尸进程仍返回"存活"
+          （见 `platform.is_zombie`），会让停止流程空等超时并误报失败。
+        - 先看启动时刻是否还对得上：pid 一旦被复用，`process_gone` 会一直返回
+          False（那个无关进程活着），于是流程会走到"超时"分支——**必须在发
+          SIGKILL 之前用 `_still_ours` 拦住**（本函数只负责判定，不负责发信号）。
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if plat.process_gone(pid):
+            # 判据是"进程是否还在且仍属我们"，而不是"启动时刻是否还匹配"：
+            # 进程退出后会短暂处于僵尸态，而僵尸的 starttime **仍然可读**，
+            # 用 _still_ours 会把它当成"还没退出"→ 空等超时 → 误报"杀不掉"。
+            if not self._still_ours(ref) or plat.process_gone(ref.pid):
                 return True
             time.sleep(0.05)
-        return plat.process_gone(pid)
+        return not self._still_ours(ref) or plat.process_gone(ref.pid)
+
+    # --- systemd 委托 ---------------------------------------------------
+
+    def _start_via_systemd(self) -> StartReport:
+        """委托 systemctl 启动，然后按三层健康检查确认结果。
+
+        健康检查对 systemd 实例同样适用：`/healthz` 是 frps 自己提供的，与
+        谁把它拉起来无关。版本从 unit 的 ExecStart 指向的二进制上读——pid 文件
+        在 systemd 模式下不参与任何判定（ADR-1）。
+        """
+        from .systemd import Systemd
+
+        systemd = Systemd(self.inst)
+        systemd.start()
+        pid = systemd.main_pid()
+        version = self.disk_version() or read_binary_version(self.binary())
+        health = self._await_health(10.0)
+        if pid is None:
+            raise StartupFailed(
+                "systemd 报告启动成功，但拿不到 MainPID",
+                hint=f"用 `systemctl status {systemd.unit_name}` 查看 unit 状态",
+            )
+        return StartReport(pid=pid, version=version, health=health)
+
+    def _stop_via_systemd(self) -> StopReport:
+        from .systemd import Systemd
+
+        Systemd(self.inst).stop()
+        return StopReport(stopped=True)
 
     # --- restart -------------------------------------------------------
 
@@ -510,6 +661,23 @@ class Lifecycle:
 
     def status(self) -> StatusReport:
         """聚合状态（§7.4）。不抛异常——`status` 必须永远能回答"现在什么情况"。"""
+        corrupted = self.inst.state_corrupted()
+        if corrupted:
+            # status 必须**永远**能回答"现在什么情况"，不能因为状态文件损坏就
+            # 以异常收场。这里如实报告"不可判定"，把处置交给用户（stop/start
+            # 会拒绝，那是对的——它们要动进程）。
+            mode: str | None = None
+            if self.inst.config.exists():
+                with contextlib.suppress(OSError):
+                    mode = oct(self.inst.config.stat().st_mode & 0o777)[2:].zfill(4)
+            return StatusReport(
+                instance=self.inst.name,
+                owner=Owner.NONE,
+                state=State.STOPPED,
+                config=self.inst.config if self.inst.config.exists() else None,
+                config_mode=mode,
+                state_corrupted=True,
+            )
         state, ref = self.state()
         owner = self.resolve_owner()
 
@@ -536,7 +704,18 @@ class Lifecycle:
                     version_hint = upgrade_hint(parse_version(binary_version))
 
         health: HealthReport | None = None
-        if state is State.RUNNING:
+        unit_name: str | None = None
+        unit_pid: int | None = None
+        if state is State.SYSTEMD_ACTIVE:
+            from .systemd import Systemd
+
+            systemd = Systemd(self.inst)
+            unit_name = systemd.unit_name
+            with contextlib.suppress(Exception):
+                unit_pid = systemd.main_pid()
+            with contextlib.suppress(FrpsctlError):
+                health = self.check_health(expect_pid=unit_pid)
+        elif state is State.RUNNING:
             with contextlib.suppress(FrpsctlError):
                 health = self.check_health()
 
@@ -558,6 +737,9 @@ class Lifecycle:
             config_mode=mode,
             health=health,
             version_hint=version_hint,
+            systemd_unit=unit_name,
+            systemd_main_pid=unit_pid,
+            state_corrupted=corrupted,
         )
 
 

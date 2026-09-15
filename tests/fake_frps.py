@@ -23,12 +23,13 @@
 from __future__ import annotations
 
 import http.server
+import json
 import os
 import signal
-import socket
 import sys
 import threading
 import time
+
 
 def _detect_version() -> str:
     """版本号来源优先级：环境变量 > **自身文件名**。
@@ -95,19 +96,58 @@ def _read_port(config_path: str | None) -> int:
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     slow = False
+    #: 是否提供 v2 Admin API。置 False 可模拟"二进制与预期不符"（ADR-3 的 404 路径）。
+    v2_api = True
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
-        if self.path != "/healthz":
-            self.send_error(404)
+        if self.path == "/healthz":
+            if self.slow:
+                time.sleep(3)
+            # 免认证：故意**不**检查 Authorization 头（与真 frps 一致，§3.2）
+            body = b"ok"
+            self._send(200, body, "text/plain")
             return
-        if self.slow:
-            time.sleep(3)
-        # 免认证：故意**不**检查 Authorization 头（与真 frps 一致，§3.2）
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", "2")
+
+        # v2 Admin API：字段名与真 frps 0.71.0 实测一致（§3.2）。
+        # 集成层要覆盖 ADR-3（启动后确认 v2 可用），所以这里必须真的实现它，
+        # 而不是让被测代码绕过检查。
+        if self.path.startswith("/api/v2/"):
+            if not self.v2_api:
+                self.send_error(404)
+                return
+            if self.path.startswith("/api/v2/system/info"):
+                payload = {
+                    "code": 200,
+                    "msg": "success",
+                    "data": {
+                        "version": VERSION,
+                        "status": {
+                            "clientCounts": 0,
+                            "proxyTypeCount": {},
+                            "curConns": 0,
+                            "totalTrafficIn": 0,
+                            "totalTrafficOut": 0,
+                        },
+                        "config": {"tlsForce": False},
+                    },
+                }
+            else:
+                payload = {
+                    "code": 200,
+                    "msg": "success",
+                    "data": {"total": 0, "page": 1, "pageSize": 50, "items": []},
+                }
+            self._send(200, json.dumps(payload).encode(), "application/json")
+            return
+
+        self.send_error(404)
+
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(body)
 
     def log_message(self, *args: object) -> None:
         pass  # 保持启动日志干净，便于断言
@@ -115,6 +155,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 def _serve(port: int) -> None:
     _Handler.slow = MODE == "slow"
+    # 允许用 FRPS_FAKE_NO_V2=1 模拟"该二进制没有 v2 API"（ADR-3 的 404 路径）
+    _Handler.v2_api = os.environ.get("FRPS_FAKE_NO_V2") != "1"
     if port <= 0:
         # 未启用 dashboard：阻塞等待信号
         while True:
@@ -172,4 +214,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        raise SystemExit(0)
+        raise SystemExit(0) from None

@@ -293,7 +293,7 @@ class TestHealthLayers:
         assert health.gate is True
 
     def test_l2_skipped_when_dashboard_disabled(self, inst, write_config):
-        write_config("bindPort = 17000\n[auth]\ntoken = \"t\"\n[webServer]\nport = 0\n")
+        write_config('bindPort = 17000\n[auth]\ntoken = "t"\n[webServer]\nport = 0\n')
         fake = make_fake_frps(inst.bin_dir)
         lc = make_lifecycle(inst, fake)
         report = lc.start(health_timeout=3)
@@ -308,8 +308,7 @@ class TestHealthLayers:
         """§3.7 最关键的一条：L3 失败**不得**触发回滚判据失败。"""
         dead = free_port()
         write_config(
-            BASIC_CONFIG
-            + f'\n[[httpPlugins]]\nname = "auth"\naddr = "http://127.0.0.1:{dead}"\n'
+            BASIC_CONFIG + f'\n[[httpPlugins]]\nname = "auth"\naddr = "http://127.0.0.1:{dead}"\n'
             'path = "/handler"\nops = ["Login"]\n'
         )
         fake = make_fake_frps(inst.bin_dir)
@@ -443,3 +442,37 @@ def inst_alive(pid: int) -> bool:
             return False
         time.sleep(0.05)
     return True
+
+
+class TestV2ApiAssertion:
+    """ADR-3：启动后必须确认 v2 API 真的在。
+
+    版本门槛（§3.6）已保证 >= 0.70.0，因此拿到 404 说明**二进制与预期不符**
+    （例如 --binary 指向自编译版本）。此时应当报错退出 7，而不是降级——降级会
+    让"状态显示"从此悄悄出错。
+    """
+
+    def test_missing_v2_api_is_reported(self, inst, write_config):
+        from frpsctl.errors import ApiVersionMismatch
+
+        write_config(BASIC_CONFIG)
+        # 这个假二进制只有 /healthz，没有 v2 API
+        fake = make_fake_frps(inst.bin_dir, no_v2=True)
+        lc = make_lifecycle(inst, fake)
+
+        with pytest.raises(ApiVersionMismatch) as excinfo:
+            lc.start(health_timeout=5)
+        assert int(excinfo.value.exit_code) == 7
+        # 关键是：**不能**留下一个跑着的进程（校验失败要么重来要么收拾干净）
+        assert not inst.state.exists()
+        assert lc.state()[0] is State.STOPPED
+
+    def test_dashboard_disabled_skips_the_check(self, inst, write_config):
+        write_config('bindPort = 17000\n[auth]\ntoken = "t"\n[webServer]\nport = 0\n')
+        fake = make_fake_frps(inst.bin_dir, no_v2=True)
+        lc = make_lifecycle(inst, fake)
+        report = lc.start(health_timeout=3)  # 未启用 dashboard → 不做 v2 校验
+        try:
+            assert report.healthy is True
+        finally:
+            kill_quietly(report.pid)

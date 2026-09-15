@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import tomllib
-from pathlib import Path
 
 import pytest
 from frpsctl.cli import app
@@ -60,6 +59,17 @@ class _Cli:
 
 
 runner = _Cli()
+
+
+def install_fake_binary(tmp_path, *, version: str = "0.71.0"):
+    """给 CLI 测试装一个假 frps（版本号来自文件名，与生产布局一致）。
+
+    凡是要走 `config set` / `verify` 的用例都需要它——那些路径会调用真实二进制
+    做权威校验，没有二进制时一律以退出码 4 收场。
+    """
+    from .conftest import make_fake_frps
+
+    return make_fake_frps(tmp_path / "data" / "bin", version=version)
 
 
 @pytest.fixture
@@ -120,17 +130,61 @@ class TestJsonOutput:
         assert json.loads(result.output)["state"] == "STOPPED"
 
     def test_config_get_masks_secret_by_default(self, cli_env) -> None:
-        """§10 硬约束 2：机密绝不进 `--json`，除非显式 --reveal。"""
+        """§10 硬约束 2：机密绝不进 `--json`，除非显式 --reveal。
+
+        打码形式是"保留首尾各两字符"（`SU***56`）而不是全 `***`：既防止泄露，
+        又让人能核对"改的是不是同一个值"。
+        """
         runner.invoke(app, ["init", "--no-input"])
         import json
 
         result = runner.invoke(app, ["config", "get", "auth.token", "--json"])
         assert result.exit_code == 0, result.output
-        payload = json.loads(result.output)
-        assert payload["value"] == "***", "token 泄露进了 --json"
+        masked = json.loads(result.output)["value"]
+        assert "***" in masked, f"token 未被识别为敏感：{masked}"
+
+        # 真实值绝不能出现在输出里
+        raw = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
+        import re
+
+        token = re.search(r'token = "([^"]+)"', raw).group(1)
+        assert token not in result.output, "token 原文泄露进了 --json"
 
         revealed = runner.invoke(app, ["config", "get", "auth.token", "--json", "--reveal"])
-        assert json.loads(revealed.output)["value"] != "***"
+        assert json.loads(revealed.output)["value"] == token
+
+    def test_config_get_table_masks_nested_secrets(self, cli_env) -> None:
+        """回归：`config get <表>` 曾整表明文输出，把表内的 token/口令漏出去。
+
+        `is_secret_key("auth")` 是 False，所以只判被查询的那个键名是不够的——
+        必须递归到 `auth.token` / `webServer.password` 这一层。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+        raw = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
+        import re
+
+        token = re.search(r'token = "([^"]+)"', raw).group(1)
+        password = re.search(r'password = "([^"]+)"', raw).group(1)
+
+        for key in ("auth", "webServer"):
+            result = runner.invoke(app, ["config", "get", key, "--json"])
+            assert result.exit_code == 0, result.output
+            assert token not in result.output, f"config get {key} 泄露了 token"
+            assert password not in result.output, f"config get {key} 泄露了口令"
+
+    def test_config_diff_masks_secrets(self, cli_env) -> None:
+        """回归：diff 就是配置原文，不打码会把机密从这一个出口漏光。"""
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["config", "set", "maxPortsPerClient", "30"])
+        raw = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
+        import re
+
+        token = re.search(r'token = "([^"]+)"', raw).group(1)
+
+        result = runner.invoke(app, ["config", "diff", "--json"])
+        assert result.exit_code == 0, result.output
+        assert token not in result.output, "config diff --json 泄露了 token"
 
 
 class TestInitConfig:
@@ -142,9 +196,7 @@ class TestInitConfig:
         写在表头之后，TOML 会把它归入那张表（`log.allowPorts`），frps 报
         `unknown field "allowPorts"`——一个把人引向错误方向的错误信息。
         """
-        result = runner.invoke(
-            app, ["init", "--no-input", "--allow-ports", "6000-6100"]
-        )
+        result = runner.invoke(app, ["init", "--no-input", "--allow-ports", "6000-6100"])
         assert result.exit_code == 0, result.output
         text = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
 
@@ -204,6 +256,7 @@ class TestConfigSetValidation:
 
     def test_template_syntax_rejected(self, cli_env) -> None:
         """§3.1 推论 2：值含 `{{` 会被 frp 当模板渲染，必须拒绝。"""
+        install_fake_binary(cli_env)
         runner.invoke(app, ["init", "--no-input"])
         result = runner.invoke(app, ["config", "set", "subDomainHost", '"{{ .Envs.X }}"'])
         assert result.exit_code == 3
@@ -214,3 +267,77 @@ class TestConfigSetValidation:
         result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "20"])
         assert result.exit_code == 0
         assert "无需变更" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 回归：曾因漏加参数而 NameError 的两条命令（此前零覆盖）
+# ---------------------------------------------------------------------------
+
+
+class TestCommandsThatWereBroken:
+    """`log` 与 `config edit` 曾因批量加 `--json` 时漏参数而 NameError。
+
+    133 个测试都没抓到，原因是这两条命令当时**零覆盖**。这类"代码能 import
+    但一执行就崩"的问题只有真正调用才能发现，因此这里补上冒烟级断言。
+    """
+
+    def test_log_does_not_crash_and_reports_missing_file(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["log"])
+        # 日志文件还不存在：必须给出**明确**的配置错误（退出码 3），而不是 NameError
+        assert "NameError" not in result.output
+        assert result.exit_code == 3, result.output
+        assert "日志文件不存在" in result.output
+
+    def test_log_tails_an_existing_file(self, cli_env, capfd) -> None:
+        """`log` 把文件交给 `tail` 子进程（流式输出），因此要断言**真实** stdout。
+
+        用 `capfd`（捕获文件描述符）而不是 `capsys`/CliRunner：子进程直接继承
+        父进程的 fd，只有 fd 级捕获才看得到它写的内容。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+        log_file = cli_env / "instances" / "default" / "frps.log"
+        log_file.write_text("第一行\n第二行\n", "utf-8")
+
+        result = runner.invoke(app, ["log", "-n", "5"])
+        assert result.exit_code == 0, result.output
+
+        captured = capfd.readouterr()
+        assert "第二行" in captured.out
+
+    def test_config_edit_reports_no_change(self, cli_env, monkeypatch) -> None:
+        """`EDITOR=true` 不修改文件 → 应当报告"没有改动"而不是崩掉。"""
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setenv("EDITOR", "true")
+        result = runner.invoke(app, ["config", "edit"])
+        assert "NameError" not in result.output
+        assert result.exit_code == 0, result.output
+        assert "没有改动" in result.output
+
+    def test_every_subcommand_is_invokable(self, cli_env) -> None:
+        """把每条命令都真正调用一次，捕捉"能 import 但一跑就崩"的漏网之鱼。
+
+        刻意不校验业务结果（各命令有自己的用例），只要求**不出现 NameError /
+        TypeError 这类编程错误**。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+        for args in (
+            ["--version"],
+            ["status"],
+            ["status", "--json"],
+            ["doctor"],
+            ["verify"],
+            ["log"],
+            ["config", "get", "bindPort"],
+            ["config", "diff"],
+            ["service", "status"],
+            ["plugin", "check"],
+            ["plugin", "--help"],
+            ["kick", "some-proxy"],
+            ["stop"],
+            ["restart"],
+        ):
+            result = runner.invoke(app, args)
+            assert "NameError" not in result.output, f"{args} 触发 NameError"
+            assert "TypeError" not in result.output, f"{args} 触发 TypeError"
+            assert "UnboundLocalError" not in result.output, f"{args} 触发 UnboundLocalError"

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import re
 import os
 import subprocess
 import tempfile
@@ -35,7 +36,6 @@ from ..errors import (
     TemplateSyntaxRejected,
     UsageError,
 )
-from .version import Version
 
 __all__ = [
     "ChangePlan",
@@ -48,6 +48,8 @@ __all__ = [
     "plan_set",
     "reject_template_syntax",
     "validate_text",
+    "mask_tree",
+    "mask_diff",
     "SECRET_KEYS",
     "is_secret_key",
 ]
@@ -69,6 +71,71 @@ def is_secret_key(dotted: str) -> bool:
     return dotted in SECRET_KEYS or dotted.endswith(".password") or dotted.endswith(".token")
 
 
+def mask_tree(value: Any, *, prefix: str = "", reveal: bool = False) -> Any:
+    """递归打码一棵配置子树。
+
+    **为什么必须递归**：`config get auth` 拿到的是整张表，而
+    `is_secret_key("auth")` 是 False —— 于是 `auth.token` 会明文打印出来。
+    实测过：`frpsctl config get webServer` 直接输出 `password` 原值，
+    人读与 `--json` 两种模式都泄。
+
+    子树里哪些键敏感由**完整点分路径**决定（`auth.token`、`webServer.password`），
+    因此递归时必须一路把 prefix 传下去。
+    """
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            out[key] = mask_tree(item, prefix=child, reveal=reveal)
+        return out
+    if isinstance(value, list):
+        return [mask_tree(item, prefix=prefix, reveal=reveal) for item in value]
+    if not reveal and prefix and is_secret_key(prefix):
+        from ..cli.ui import mask_secret
+
+        return mask_secret(value)
+    return value
+
+
+#: diff 里的敏感键赋值。**必须容忍行首的 `-`/`+` 标记**——否则 `-token = "..."`
+#: 匹配不上，打码静默失效（实测踩过）。首组同时捕获标记、缩进、键名、等号。
+_ASSIGN_RE = re.compile(r"^([-+ ]?)(\s*)([A-Za-z_][\w.-]*)(\s*=\s*)(.*)$")
+
+
+def mask_diff(diff: str) -> str:
+    """把 unified diff 里敏感键的值打码。
+
+    `config diff` / `config rollback` / `config set` 都会展示 diff，而 diff 的
+    内容就是配置原文——里面必然包含 `token = "..."` 这样的行。不给它打码，
+    前面所有"机密不进日志/不进 --json"的努力都会从这一个出口漏光。
+    """
+    from ..cli.ui import mask_secret
+
+    out_lines: list[str] = []
+    current_table = ""
+    for line in diff.splitlines():
+        stripped = line.lstrip("+-")
+        table_match = re.match(r"^\s*\[([^\]]+)\]", stripped)
+        if table_match:
+            current_table = table_match.group(1).strip()
+            out_lines.append(line)
+            continue
+        match = _ASSIGN_RE.match(line)
+        if not match:
+            out_lines.append(line)
+            continue
+        marker, indent, key, eq, raw = match.groups()
+        prefix = f"{current_table}.{key}" if current_table else key
+        if not is_secret_key(prefix):
+            out_lines.append(line)
+            continue
+        # 保留引号形态，只替换值
+        quote = '"' if raw.lstrip().startswith('"') else ""
+        masked = mask_secret(raw.strip().strip('"'))
+        out_lines.append(f"{marker}{indent}{key}{eq}{quote}{masked}{quote}")
+    return "\n".join(out_lines) + ("\n" if diff.endswith("\n") else "")
+
+
 # ---------------------------------------------------------------------------
 # 原子写
 # ---------------------------------------------------------------------------
@@ -83,8 +150,11 @@ def atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        os.fchmod(fd, mode)
+        # 用 with 包住 fdopen：fchmod 抛异常时（不支持 chmod 的文件系统、EPERM）
+        # 由它负责关闭 fd。此前 fchmod 在 fdopen 之外，异常路径只 unlink 不 close，
+        # 会留下一个指向已删除文件的打开 fd（实测新增 fd 未释放）。
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            os.fchmod(handle.fileno(), mode)  # 先定权限再写内容，无权限窗口
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -275,27 +345,26 @@ def validate_candidate(parts: list[str], value: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def config_flags(version: Version, *, uses_exec_token_source: bool = False) -> list[str]:
-    """按 §3.6 构造 frps 标志，**必须放在子命令之前**（Cobra 持久标志）。
+def config_flags(*, uses_exec_token_source: bool = False) -> list[str]:
+    """构造 frps 标志，**必须放在子命令之前**（Cobra 持久标志）。
 
-    `>= 0.70.0` 上 `--strict_config` 默认已是 `true`，这里仍**显式传**：
-    该默认值在 v0.53 → v0.66 之间变过一次（false → true），依赖"某个版本的
-    默认值"是脆弱的，而显式传值只花一个字节，却把"键名写错必须硬报错"
-    这条护栏钉死。
+    **刻意不接收版本号**：版本门槛（§3.6）在 `install` 阶段就把 `< 0.70.0`
+    拒之门外，因此运行时不存在"这个版本认不认这个标志"的分支。早先的设计里
+    确有版本矩阵（0.52–0.65 无 `--allow-unsafe`、strict 默认 false），但门槛
+    上收之后那段分支已成为死代码——留一个被忽略的 `version` 参数只会让人
+    以为这里还在按版本判断。
+
+    `--strict_config=true` 仍**显式传**：0.70+ 上它默认已是 true，但这个默认值
+    在 v0.53 → v0.66 之间变过一次（false → true）。依赖"某个版本的默认值"是
+    脆弱的，而显式传值只花一个字节，却把"键名写错必须硬报错"这条护栏钉死。
 
     `--allow-unsafe` 仅在配置使用 `auth.tokenSource` 的 exec 源时追加，
     且它是 `StringSlice` 而非布尔开关（附录 B-2 复核纪律 2）。
     """
     flags: list[str] = ["--strict_config=true"]
     if uses_exec_token_source:
-        flags.append("--allow-unsafe")
-        flags.append("TokenSourceExec")
+        flags.extend(["--allow-unsafe", "TokenSourceExec"])
     return flags
-
-
-def verify_flags(version: Version) -> list[str]:
-    """兼容别名，语义同 `config_flags`（文档中称 `verify_flags()`）。"""
-    return config_flags(version)
 
 
 def uses_exec_token_source(doc: Any) -> bool:
@@ -313,7 +382,6 @@ def validate_text(
     text: str,
     *,
     binary: Path,
-    version: Version,
     workdir: Path,
     uses_unsafe: bool = False,
 ) -> None:
@@ -327,15 +395,24 @@ def validate_text(
 
     # 第二层：官方权威判定
     workdir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
+    # 先把路径拿到手再进 try：候选文件里可能有 webServer.password / auth.token，
+    # 写入中途失败（ENOSPC/EIO）时若不清理，就会把一份含机密的文件留在实例目录里。
+    # 刻意不用 with 包住创建：路径必须在 try 之前拿到，否则写失败时 finally 不生效。
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
         "w", suffix=".toml", dir=workdir, delete=False, encoding="utf-8"
-    ) as handle:
-        handle.write(text)
-        candidate = Path(handle.name)
+    )
+    candidate = Path(handle.name)
     try:
+        with handle:
+            handle.write(text)
         proc = subprocess.run(
-            [str(binary), *config_flags(version, uses_exec_token_source=uses_unsafe),
-             "verify", "-c", str(candidate)],
+            [
+                str(binary),
+                *config_flags(uses_exec_token_source=uses_unsafe),
+                "verify",
+                "-c",
+                str(candidate),
+            ],
             cwd=workdir,
             capture_output=True,
             text=True,

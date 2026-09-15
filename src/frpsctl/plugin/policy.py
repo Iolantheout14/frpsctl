@@ -228,11 +228,18 @@ class PluginPolicy:
 
     def describe(self) -> list[str]:
         """人读摘要（`plugin check` 与启动日志共用）。"""
+        if not self.audit.enabled:
+            audit_text = "关闭"
+        elif self.audit.path is None:
+            audit_text = "仅内存（未配置 path）"
+        else:
+            audit_text = f"写入 {self.audit.path}"
+
         lines = [
             f"用户数：{len(self.users)}"
             + ("（未列出的用户一律拒绝）" if not self.allow_unknown_user else "（未知用户放行 ⚠）"),
             f"客户端身份校验：{'开启' if self.require_client_id else '关闭 ⚠'}",
-            f"审计：{'写入 ' + str(self.audit.path) if self.audit.enabled and self.audit.path else ('仅内存' if self.audit.enabled else '关闭')}",
+            f"审计：{audit_text}",
         ]
         if any(user.max_proxies for user in self.users.values()):
             source = self.admin_url or "（未配置 admin_url，配额计数不准确 ⚠）"
@@ -271,9 +278,7 @@ class PluginPolicy:
         users_raw = raw.get("users") or {}
         if not isinstance(users_raw, dict):
             raise ConfigError("users 必须是对象（用户名为键）")
-        users = {
-            str(name): UserPolicy.parse(str(name), value) for name, value in users_raw.items()
-        }
+        users = {str(name): UserPolicy.parse(str(name), value) for name, value in users_raw.items()}
         return cls(
             users=users,
             allow_unknown_user=bool(raw.get("allow_unknown_user", False)),
@@ -309,7 +314,7 @@ class Decision:
         return cls(allowed=False, user=user, reason=reason)
 
 
-def decide_login(policy: PluginPolicy, *, user: str, client_id: str, reqid: str = "") -> Decision:
+def decide_login(policy: PluginPolicy, *, user: str, client_id: str) -> Decision:
     """`Login` 裁决：这个用户能不能登录？
 
     只回答"是谁、允不允许"，不碰端口——端口在 `NewProxy` 时才知道。
@@ -415,8 +420,7 @@ def decide_new_proxy(
         )
     return Decision.deny(
         user,
-        f"{_REASON_PREFIX}: 端口 {remote_port} 不在用户 {user!r} 的许可范围"
-        f"（允许：{owner.render_ports()}）",
+        f"{_REASON_PREFIX}: 端口 {remote_port} 不在用户 {user!r} 的许可范围（允许：{owner.render_ports()}）",
     )
 
 

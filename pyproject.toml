@@ -27,6 +27,34 @@ frpsctl = "frpsctl.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/frpsctl"]
 
+[tool.ruff]
+# 110 而不是 100：本项目的注释与文档表格是中文，每字占两列宽，
+# 100 列会把正常的说明文字频繁判为超长，反而促使大家把注释写短写糊。
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "SIM", "RET", "C4", "ARG", "PTH", "S"]
+ignore = [
+    # B008：Typer/Click 的官方用法就是把 typer.Option(...) 写在默认值位置，
+    # 这是框架约定而非缺陷；抑制它以免噪音掩盖真正的问题。
+    "B008",
+    # S603/S607：我们确实要执行外部程序（frps / systemctl / tail / curl），
+    # 且参数全部来自本工具自身构造，非用户拼接的 shell 字符串。
+    "S603",
+    "S607",
+    # S104：0.0.0.0 出现在"检测到用户配了非回环地址"的告警逻辑里，不是绑定动作。
+    "S104",
+    # S101：assert 用在内部不变量（状态机自检）上，配合 -O 也不会影响正确性。
+    "S101",
+    # PTH：Path 与 os.path 混用是历史遗留，不构成缺陷。
+    "PTH",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里断言宽泛、参数未用、硬编码口令都是刻意的
+"tests/*" = ["ARG001", "ARG002", "PT011", "S105", "S106", "S108", "B011"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"

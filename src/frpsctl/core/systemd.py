@@ -15,7 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..errors import PermissionRequired, UsageError
+from ..errors import FrpsctlError, PermissionRequired, UsageError
 from .instance import Instance
 
 __all__ = ["Systemd", "UNIT_TEMPLATE_PATH", "SYSTEMD_UNIT_DIR", "render_unit"]
@@ -119,8 +119,7 @@ class Systemd:
         """
         if not self.available:
             return False
-        out = self._run("list-units", "--type=service", "--all", "--no-legend",
-                        "--plain", "frps*", timeout=5)
+        out = self._run("list-units", "--type=service", "--all", "--no-legend", "--plain", "frps*", timeout=5)
         for line in out.stdout.splitlines():
             unit = line.split()[0] if line.split() else ""
             if not unit:
@@ -178,15 +177,15 @@ class Systemd:
     # --- 内部 ----------------------------------------------------------
 
     def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["systemctl", *args], capture_output=True, text=True, timeout=timeout
-        )
+        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
 
     def _run_checked(self, *args: str) -> None:
         proc = self._run(*args)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()
-            raise UsageError(
+            # 用 FrpsctlError(1) 而不是 UsageError(2)：systemctl 执行失败不是
+            # "参数写错了"，脚本据此区分"重试可能有用"与"命令本身无效"。
+            raise FrpsctlError(
                 f"systemctl {' '.join(args)} 失败：{detail or proc.returncode}",
                 hint="确认 unit 名与权限；systemd 操作通常需要 root",
             )

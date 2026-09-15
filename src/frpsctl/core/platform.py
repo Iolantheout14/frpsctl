@@ -17,6 +17,7 @@ __all__ = [
     "assert_supported",
     "pid_alive",
     "is_zombie",
+    "same_process",
     "process_gone",
     "proc_start_time",
     "proc_cmdline",
@@ -118,6 +119,23 @@ def is_zombie(pid: int) -> bool:
         return False
     rest = raw[rparen + 2 :].split()
     return bool(rest) and rest[0] == b"Z"
+
+
+def same_process(pid: int, start_time: int) -> bool:
+    """`pid` 现在还是当初那个进程吗？（用启动时刻比对，识别 pid 复用）
+
+    这是 `stop()` 在**等待退出期间**反复调用的判据，也是本工具防误杀的核心：
+
+    - 返回 False 有两种含义：进程已退出，**或者** pid 被复用了。两种情况都
+      **绝不能**再向该 pid 发信号——对复用了 pid 的无关进程发 SIGKILL 正是
+      R2 要防的事故。
+    - `/proc` 读不到时返回 False（fail-closed）：读不到就无法证明"还是它"，
+      而"无法证明"必须按"不是它"处理（ADR-7）。
+    """
+    current = proc_start_time(pid)
+    if current is None:
+        return False
+    return current == start_time
 
 
 def process_gone(pid: int) -> bool:

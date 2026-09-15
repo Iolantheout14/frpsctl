@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -28,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..errors import BinaryNotFound, UsageError
+from ..errors import BinaryNotFound, ConfigError, UsageError
 
 __all__ = [
     "Instance",
@@ -161,51 +162,95 @@ class Instance:
         """创建实例目录（0700：内含 token 与 dashboard 口令）。"""
         for path in (self.dir, self.history_dir, self.startup_dir, self.bin_dir):
             path.mkdir(parents=True, exist_ok=True)
-        try:
-            self.dir.chmod(0o700)
-        except OSError:
-            pass
+        self.ensure_private()
 
     # --- 状态文件 ------------------------------------------------------
 
     def read_state(self) -> dict | None:
-        """读 state.json；损坏或缺失返回 None（由调用方决定如何处置）。"""
+        """读 state.json。**缺失返回 None；损坏抛异常。**
+
+        以前"损坏也返回 None"，于是 `status` 报 STOPPED、`stop` 报 NotRunning
+        并把文件删掉——而 frps 可能还在跑。工具就此彻底失去对该进程的追踪，
+        下次 `start` 还会在同一端口上再拉一个。拿不准时的正确反应是拒绝（ADR-7），
+        不是假装"没有这回事"。
+        """
         try:
             raw = self.state.read_text("utf-8")
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError as exc:
+            raise ConfigError(f"无法读取状态文件 {self.state}：{exc}") from None
         try:
             data = json.loads(raw)
-        except ValueError:
-            return None
-        return data if isinstance(data, dict) else None
+        except ValueError as exc:
+            raise ConfigError(
+                f"状态文件已损坏：{self.state}（{exc}）",
+                hint=(
+                    "它记录着实例进程的归属信息，损坏后无法安全判断进程是否属于本工具。"
+                    "请确认没有 frps 在跑，然后手工删除该文件"
+                ),
+            ) from None
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"状态文件内容不是对象：{self.state}",
+                hint="请确认没有 frps 在跑，然后手工删除该文件",
+            )
+        return data
+
+    def state_corrupted(self) -> bool:
+        """损坏探测（供 status/doctor 使用：它们要报告而不是抛异常）。"""
+        try:
+            self.read_state()
+        except ConfigError:
+            return True
+        return False
 
     def write_state(self, payload: dict) -> None:
         """原子写 state.json。**这个文件不参与 is_ours() 的命令行比对来源**，
         它只是记录"我们曾经启动过什么"。"""
         tmp = self.state.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
-        try:
+        with contextlib.suppress(OSError):
             tmp.chmod(0o600)
-        except OSError:
-            pass
         os.replace(tmp, self.state)
 
     def clear_state(self) -> None:
         """清除陈旧状态。`missing_ok` 语义，重复调用安全。"""
         for path in (self.state, self.pidfile):
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 path.unlink()
-            except FileNotFoundError:
-                pass
 
     # --- 启动日志 ------------------------------------------------------
 
+    def ensure_private(self) -> None:
+        """把实例目录与子目录收紧到 0700。
+
+        配置里含 token 与 dashboard 口令，而目录若是 0755，同机其他用户就能
+        列目录、读到配置文件与快照（它们的权限是第二道防线，第一道是目录）。
+        这个方法在**每次**会落盘的路径上调用，而不只在 init/install。
+        """
+        for path in (self.dir, self.history_dir, self.startup_dir):
+            with contextlib.suppress(OSError):
+                if path.exists():
+                    path.chmod(0o700)
+        with contextlib.suppress(OSError):
+            self.dir.chmod(0o700)
+
     def new_startup_log(self) -> Path:
-        """新开一份启动日志，并修剪到最近 STARTUP_KEEP 份（ADR-5）。"""
+        """新开一份启动日志，并修剪到最近 STARTUP_KEEP 份（ADR-5）。
+
+        日志同样可能含敏感信息（frp 会把配置错误、token 校验失败等写进去），
+        因此以 0600 创建，而不是跟随 umask。
+        """
         self.startup_dir.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self.startup_dir.chmod(0o700)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = self.startup_dir / f"startup-{stamp}-{os.getpid()}.log"
+        # 先创建并定权限，再交给调用方以 "ab" 打开追加
+        with contextlib.suppress(OSError):
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+            os.close(fd)
         # 先修剪到 KEEP-1，再创建新文件 → 最终恰好保留 KEEP 份
         self._prune_startup_logs(keep=STARTUP_KEEP - 1)
         return path
@@ -217,25 +262,34 @@ class Instance:
     def _prune_startup_logs(self, *, keep: int) -> None:
         logs = sorted(self.startup_dir.glob("startup-*.log"))
         for stale in logs[: max(0, len(logs) - keep)]:
-            try:
+            with contextlib.suppress(OSError):
                 stale.unlink()
-            except OSError:
-                pass
 
     # --- 备份历史 ------------------------------------------------------
 
     def next_history_slot(self) -> Path:
-        """返回下一个快照目录（序号递增，序号最大的最新）。
+        """**原子地**占下一个快照目录（序号递增，序号最大的最新）。
 
         用序号而非时间戳：同一秒内连续两次变更不会撞名，rollback N 的语义
         也变成确定的"数第 N 个"。
+
+        ⚠️ 必须是"先 mkdir 再返回"，不能"先 glob 再返回路径"：后者在并发调用
+        时会算出**同一个**候选名，两个操作互相覆盖（实测复现）。这里用
+        `mkdir` 的 EEXIST 作为原子占位——谁先建成谁拿到这个序号。
         """
         self.history_dir.mkdir(parents=True, exist_ok=True)
         existing = sorted(self.history_dir.glob("[0-9][0-9][0-9][0-9]-*"))
-        seq = 1
-        if existing:
-            seq = int(existing[-1].name.split("-", 1)[0]) + 1
-        return self.history_dir / f"{seq:04d}-{time.strftime('%Y%m%d-%H%M%S')}"
+        seq = int(existing[-1].name.split("-", 1)[0]) + 1 if existing else 1
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for _ in range(1000):
+            candidate = self.history_dir / f"{seq:04d}-{stamp}"
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                seq += 1  # 被别人抢了，换下一个序号
+                continue
+            return candidate
+        raise RuntimeError(f"无法在 {self.history_dir} 分配快照序号（连续冲突过多）")
 
     def history_entries(self) -> list[Path]:
         """所有快照，**从新到旧**（便于 rollback [N] 取第 N 个）。"""
@@ -254,6 +308,13 @@ class Instance:
 
         removed: list[Path] = []
         for stale in self.history_entries()[HISTORY_KEEP:]:
-            shutil.rmtree(stale, ignore_errors=True)
-            removed.append(stale)
+            try:
+                shutil.rmtree(stale)
+                removed.append(stale)
+            except OSError:
+                # 删不掉就留着：快照含机密，"保留 10 份"这条约定失效必须可见，
+                # 不能像以前那样 ignore_errors 静默放过。
+                import sys
+
+                sys.stderr.write(f"[frpsctl] 无法清理过期配置快照：{stale}\n")
         return removed

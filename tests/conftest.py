@@ -36,6 +36,8 @@ class FakeFrps:
     path: Path
     version: str
     mode: str
+    #: True 表示这个假二进制**不提供** v2 Admin API（模拟 ADR-3 的 404 情形）
+    no_v2: bool = False
 
     def env(self) -> dict[str, str]:
         """子进程环境。
@@ -47,6 +49,8 @@ class FakeFrps:
         base = {k: v for k, v in os.environ.items() if not k.startswith("FRPS_FAKE_")}
         base["FRPS_FAKE_VERSION"] = self.version
         base["FRPS_FAKE_MODE"] = self.mode
+        if self.no_v2:
+            base["FRPS_FAKE_NO_V2"] = "1"
         return base
 
 
@@ -55,6 +59,7 @@ def make_fake_frps(
     *,
     version: str = DEFAULT_VERSION,
     mode: str = "ok",
+    no_v2: bool = False,
 ) -> FakeFrps:
     """把假 frps 装成 `bin/frps-<version>` + `bin/frps` 软链。
 
@@ -69,7 +74,7 @@ def make_fake_frps(
     if link.is_symlink() or link.exists():
         link.unlink()
     link.symlink_to(target.name)
-    return FakeFrps(path=target, version=version, mode=mode)
+    return FakeFrps(path=target, version=version, mode=mode, no_v2=no_v2)
 
 
 @pytest.fixture
@@ -94,8 +99,16 @@ def _clean_proxy_env(monkeypatch):
     毫无关系。生产代码对此已有防御（回环地址 `trust_env=False`），这里清掉变量
     是为了让**非回环地址**的用例也不会被宿主环境污染。
     """
-    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
-                 "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -150,7 +163,8 @@ def _spawn_with_env(inst: Instance, fake: FakeFrps, binary: Path) -> subprocess.
     `_cmdline_matches` 的解释器分支。
     """
     log_path = inst.new_startup_log()
-    handle = open(log_path, "ab", buffering=0)
+    # 刻意不用 with：fd 必须存活到 Popen 返回，由 finally 关闭（同生产代码）
+    handle = open(log_path, "ab", buffering=0)  # noqa: SIM115
     try:
         proc = subprocess.Popen(
             [sys.executable, str(binary), "-c", str(inst.config)],
@@ -192,7 +206,31 @@ def wait_port(host: str, port: int, *, timeout: float = 5.0) -> bool:
     return False
 
 
+def free_ports(count: int) -> list[int]:
+    """一次性拿到 `count` 个**互不相同**的空闲端口。
+
+    ⚠️ 为什么不能用 `free_port()` 连续调用：它是"绑定→取号→关闭"，取号与真正
+    绑定之间存在竞态窗口，而且内核可能把刚释放的号**再分配一次**，于是两次调用
+    返回同一个端口。测试会表现为"frps 没起来"这种与真因无关的失败，
+    或者更糟——flaky 通过。
+
+    做法：**同时持有**所有 socket 直到全部取号完毕，再一起关闭。这样内核只能
+    给出互不相同的号（它们在同一时刻都处于已绑定状态）。
+    """
+    if count < 1:
+        raise ValueError("count 必须 >= 1")
+    socks: list[socket.socket] = []
+    try:
+        for _ in range(count):
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            socks.append(sock)
+        return [int(sock.getsockname()[1]) for sock in socks]
+    finally:
+        for sock in socks:
+            sock.close()
+
+
 def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    """单个空闲端口。**需要多个时请用 `free_ports(n)`**，见其说明。"""
+    return free_ports(1)[0]

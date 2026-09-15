@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import socket
@@ -30,6 +29,8 @@ import pytest
 
 from frpsctl.core.admin import AdminClient, sum_proxy_types
 from frpsctl.core.version import MINIMUM_VERSION, parse_version
+
+from .conftest import free_ports
 
 pytestmark = pytest.mark.contract
 
@@ -66,8 +67,7 @@ REAL_FRPS = find_real_frps()
 requires_binary = pytest.mark.skipif(
     REAL_FRPS is None,
     reason=(
-        "未找到真实 frps 二进制：契约层需要它。"
-        f"用 `frpsctl install` 安装，或设置 {_ENV_BINARY}=/path/to/frps"
+        f"未找到真实 frps 二进制：契约层需要它。用 `frpsctl install` 安装，或设置 {_ENV_BINARY}=/path/to/frps"
     ),
 )
 
@@ -84,8 +84,7 @@ def real_server(tmp_path):
     用高位端口、临时目录、独立实例，测完必定清理。
     """
     assert REAL_FRPS is not None
-    port = _free_port()
-    dash_port = _free_port()
+    port, dash_port = free_ports(2)
     config = tmp_path / "frps.toml"
     config.write_text(
         f"""\
@@ -99,7 +98,7 @@ user = "admin"
 password = "contract-test"
 
 [log]
-to = "{tmp_path / 'frps.log'}"
+to = "{tmp_path / "frps.log"}"
 level = "info"
 """,
         "utf-8",
@@ -119,12 +118,6 @@ level = "info"
     finally:
         proc.kill()
         proc.wait(timeout=5)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _wait_port(host: str, port: int, *, timeout: float) -> bool:
@@ -155,9 +148,7 @@ class TestC1ProxyTypeCount:
         import httpx
 
         base_url, user, password, _ = real_server
-        resp = httpx.get(
-            f"{base_url}/api/v2/system/info", auth=(user, password), timeout=5
-        )
+        resp = httpx.get(f"{base_url}/api/v2/system/info", auth=(user, password), timeout=5)
         assert resp.status_code == 200
         payload = resp.json()["data"]
         status = payload["status"]
@@ -182,15 +173,12 @@ class TestC1ProxyTypeCount:
         base_url, user, password, _ = real_server
         with AdminClient(base_url, user, password) as client:
             info = client.server_info()
-            per_type = {
-                ptype: len(client.proxies(ptype)) for ptype in ("tcp", "http", "udp")
-            }
+            per_type = {ptype: len(client.proxies(ptype)) for ptype in ("tcp", "http", "udp")}
 
-        assert info.proxy_type_counts == {
-            k: v for k, v in per_type.items() if v
-        } or sum(per_type.values()) == info.proxy_total, (
-            f"求和口径不一致：proxyCount={info.proxy_type_counts}，逐类型={per_type}"
-        )
+        assert (
+            info.proxy_type_counts == {k: v for k, v in per_type.items() if v}
+            or sum(per_type.values()) == info.proxy_total
+        ), f"求和口径不一致：proxyCount={info.proxy_type_counts}，逐类型={per_type}"
         assert sum_proxy_types(info.proxy_type_counts) == info.proxy_total
 
 
@@ -249,7 +237,7 @@ class TestC2V2Only:
         assert "/api/serverinfo" not in source, "v1 降级路径被加回来了（ADR-3）"
         # v2 的字段名恰好也叫 proxyTypeCount（真机实测），因此这里改为断言
         # "没有 v1 端点的解析路径"，而不是断言字段名不存在。
-        assert "source=\"v1\"" not in source, "保留了 v1 的来源标记"
+        assert 'source="v1"' not in source, "保留了 v1 的来源标记"
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +271,7 @@ class TestC4Envelope:
         import httpx
 
         base_url, user, password, _ = real_server
-        body = httpx.get(
-            f"{base_url}/api/v2/system/info", auth=(user, password), timeout=5
-        ).json()
+        body = httpx.get(f"{base_url}/api/v2/system/info", auth=(user, password), timeout=5).json()
         assert set(body) >= {"code", "msg", "data"}, f"信封字段异常：{sorted(body)}"
         assert "status" in body["data"] and "version" in body["data"]
 
@@ -311,8 +297,7 @@ class TestC5NoAuthMeansNoAuth:
         这不是"弹窗要求登录"，而是任何人都能读全部状态、并下线任意代理。
         整份安全基线（§10）都建立在这条事实上，因此必须自动化确认。
         """
-        port = _free_port()
-        dash_port = _free_port()
+        port, dash_port = free_ports(2)
         config = tmp_path / "frps-open.toml"
         config.write_text(
             f"""\
@@ -382,7 +367,7 @@ class TestC6VerifyIsAuthoritative:
         写错键名会静默无效。
         """
         config = tmp_path / "unknown.toml"
-        config.write_text('bindPort = 7000\nnotARealKey = 1\n', "utf-8")
+        config.write_text("bindPort = 7000\nnotARealKey = 1\n", "utf-8")
         proc = subprocess.run(
             [str(REAL_FRPS), "--strict_config=true", "verify", "-c", str(config)],
             capture_output=True,
@@ -394,11 +379,10 @@ class TestC6VerifyIsAuthoritative:
     def test_our_flag_construction_is_accepted(self, tmp_path) -> None:
         """我们构造的标志必须被真 frps 接受（§8.4 `config_flags`）。"""
         from frpsctl.core.config import config_flags
-        from frpsctl.core.version import parse_version as pv
 
         config = tmp_path / "flags.toml"
-        config.write_text('bindPort = 7000\n', "utf-8")
-        flags = config_flags(pv("0.71.0"))
+        config.write_text("bindPort = 7000\n", "utf-8")
+        flags = config_flags()
         proc = subprocess.run(
             [str(REAL_FRPS), *flags, "verify", "-c", str(config)],
             capture_output=True,
@@ -408,7 +392,7 @@ class TestC6VerifyIsAuthoritative:
         assert proc.returncode == 0, f"标志 {flags} 被拒绝：{proc.stdout}{proc.stderr}"
 
         # --allow-unsafe 是 StringSlice，值必须是 TokenSourceExec
-        flags2 = config_flags(pv("0.71.0"), uses_exec_token_source=True)
+        flags2 = config_flags(uses_exec_token_source=True)
         assert "--allow-unsafe" in flags2 and "TokenSourceExec" in flags2
 
 
@@ -420,17 +404,20 @@ class TestC6VerifyIsAuthoritative:
 @requires_binary
 class TestC7VersionGate:
     def test_version_output_has_no_v_prefix(self) -> None:
+        """§3.1：`frps -v` 输出**无 `v` 前缀**，我们的解析依赖这一点。
+
+        断言两件事：前缀形态，以及这串文本确实能被 `parse_version` 吃下——
+        后者才是我们真正依赖的能力。
+        """
         proc = subprocess.run([str(REAL_FRPS), "-v"], capture_output=True, text=True, timeout=10)
         assert proc.returncode == 0
-        version = parse_version(proc.stdout)
         assert not proc.stdout.strip().startswith("v"), proc.stdout
+        assert parse_version(proc.stdout).tuple >= MINIMUM_VERSION
 
     def test_installed_version_meets_the_gate(self) -> None:
         proc = subprocess.run([str(REAL_FRPS), "-v"], capture_output=True, text=True, timeout=10)
         version = parse_version(proc.stdout)
-        assert version.tuple >= MINIMUM_VERSION, (
-            f"契约层要求 >= {MINIMUM_VERSION}，实际 {version}"
-        )
+        assert version.tuple >= MINIMUM_VERSION, f"契约层要求 >= {MINIMUM_VERSION}，实际 {version}"
 
     def test_help_exposes_the_flags_we_pass(self) -> None:
         """§3.6：我们要传的标志必须真实存在。

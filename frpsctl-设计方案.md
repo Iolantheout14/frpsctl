@@ -497,7 +497,7 @@ class Instance:
 | `frpsctl verify [--file P]` | 双保险校验 | pydantic 语义校验 + `frps verify`；用临时副本，不动线上文件 |
 | `frpsctl start [--foreground]` | 启动 | verify → 加锁 → 派生进程 → **早退检测** → 写 state → 健康检查 |
 | `frpsctl stop [--force] [--timeout 10]` | 停止 | SIGTERM → 轮询确认退出 → 超时 SIGKILL；身份不符则拒绝 |
-| `frpsctl restart [--health-timeout 10] [--no-rollback]` | 重启 | stop → start → 健康检查；失败且配置有变更时自动回滚 |
+| `frpsctl restart [--health-timeout 10] [--timeout 10]` | 重启 | stop → start → 健康检查。**没有 `--no-rollback`**：重启不读配置，也就没有"新旧版本"可比，自动回滚只属于配置变更路径（`config set` / `edit` / `rollback`） |
 | `frpsctl status [--watch]` | 状态聚合 | `owner / 状态 / pid / 版本 / 运行时长 / 客户端 / 各类型代理 / 今日流量 / 健康` |
 | `frpsctl config get <key>` | 读单键 | 点分路径，如 `transport.tls.force` |
 | `frpsctl config set <key> <value> [--no-restart]` | 写单键 | 走 §9 事务闭环 |
@@ -650,7 +650,13 @@ class LockBusy(RuntimeError):
 
 @contextlib.contextmanager
 def instance_lock(path: Path, timeout: float = 5.0):
-    """串行化实例级变更操作：start / stop / 配置写入 互斥。"""
+    """串行化实例级变更操作：start / stop / 配置写入 互斥。
+
+    ⚠️ 实现比这里的示意版**多一层进程内可重入**（按 (路径, 线程) 计数）：
+    配置变更事务自己持锁，内部又会调用 `restart()`，而 restart 也要取同一把锁。
+    `flock` 按 fd 计，同进程另开 fd 再锁同一文件会**阻塞自己**，表现为
+    "变更后启动失败"这种完全不指向真因的错误。详见 §17.3 第 1 条。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
@@ -1106,7 +1112,7 @@ frpsctl config set bindPort 8000
 | 项 | 默认值 | 理由 |
 |----|-------|------|
 | `webServer.addr` | `127.0.0.1` | 与 frp 默认一致；dashboard 只有 Basic Auth 一层防护 |
-| `webServer.user` / `password` | 随机 24 字符 | **两者全空 = 完全不鉴权**（§3.3），不是"要求登录" |
+| `webServer.user` / `password` | user 固定 `admin`，password 随机 24 字符 | **两者全空 = 完全不鉴权**（§3.3），不是"要求登录"。user 不随机是刻意的：它只是个标识符，真正起作用的是随机口令；随机化 user 只会让人无法从记忆/文档中复现登录名，而 dashboard 本就只监听回环 |
 | `transport.tls.force` | `true` | 拒绝明文 frpc 连接（frp 默认 false） |
 | `allowPorts` | 交互引导填写 | 否则任何持有 token 的客户端都能申请任意端口 |
 | `maxPortsPerClient` | `20` | frp 默认为 0（不限），单客户端可耗尽端口 |
@@ -1118,6 +1124,9 @@ frpsctl config set bindPort 8000
 其他硬约束：
 
 1. **拒绝危险组合**：`config set` 与 `doctor` 双重拦截"dashboard 绑非回环 + 口令为空"。
+   判据是 `schema.check_dangerous_combination()`，**针对合并后的完整配置**判断——
+   单看被改的那一个键永远看不出问题（把 `user` 改成空串本身无害，配上
+   `addr = "0.0.0.0"` 才是缺口）。
 2. **不回显机密**：口令与 token 不进日志、不进 `--json`、不进异常消息。
 3. **拒绝模板语法**：写入含 `{{` 的字符串会拒绝（§3.1 推论 2）。
 4. **拒绝来路不明的二进制**：校验和不匹配即拒绝安装（§8.6）。
@@ -1435,6 +1444,74 @@ CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13），容器内跑全部四层；**
 
 ---
 
+## 15.5 全量回归 review（M0–M5 完成后）
+
+M5 落地后做了一次**全量回归 review**：4 路独立审查（资源生命周期、并发竞态、
+异常路径、文档-代码交叉核对）＋静态分析（ruff 全规则）＋真实二进制端到端。
+
+结论：**发现 30 余处真实缺陷**，其中 4 处高危。全部已修复并补了回归测试。
+这一节记录**值得后人记住的几条**，详细清单不再逐条罗列（代码与测试即证据）。
+
+### 15.5.1 四处高危（都是"照着读代码看不出来"的类型）
+
+| # | 缺陷 | 后果 | 为什么危险 |
+|---|------|------|-----------|
+| 1 | `ProcessRef.is_ours()` 在 `start_time` 缺失/读失败时**静默跳过**复用校验 | 三重校验退化为"pid 存活 + 命令行匹配"；实测一个无关的 `/bin/sleep` 被判成"我们的"，随后被 stop 杀掉 | 这正是 R2 要防的事故，而且**降级是静默的**——没有任何日志 |
+| 2 | `stop()` 等待退出期间只校验一次身份 | pid 被复用后 `process_gone` 一直为 False → 超时 → 对**无关进程**发 SIGKILL | 误杀窗口真实存在；修法是"升 SIGKILL 前重验身份" |
+| 3 | `start()` 在 `_spawn()` 之后抛异常，进程无人认领 | frps 继续跑、继续占端口，而 state.json 没写成 → `stop` 报 NotRunning、`status` 显示 STOPPED，工具彻底失去追踪 | 触发面很实在：写 state 遇 ENOSPC、`frps -v` 超时、`webServer.addr` 写成带端口的字符串 |
+| 4 | 回滚是"**假回滚**"：磁盘回滚了、服务没有 | `config set` 报退出码 9"已自动回滚"，实际实例留在 DOWN；另一条路径更隐蔽——磁盘是旧配置、跑着的是新配置（frps 无热重载），回滚等于没做 | 用户会据此认为"问题已自动解决"，从而不去人工介入 |
+
+**共同点**：都是**安全/可用性语义在异常路径上悄悄失效**，正常路径完全正常。
+这解释了为什么"跑通主流程"的自测永远发现不了它们——必须刻意构造异常。
+
+### 15.5.2 一条反复出现的模式：**降级必须可见**
+
+review 发现好几处"遇到问题就悄悄降低保证"：
+
+| 位置 | 曾经的降级 | 现在的做法 |
+|------|-----------|-----------|
+| `is_ours()` | 读不到启动时刻 → 跳过复用校验 | **fail-closed**（返回 False） |
+| 审计写盘失败 | 记录回灌缓冲，静默 | 保留 + `dropped` 计数 + `describe()` 可见 |
+| 配额计数查不到 | 退化为本地计数，静默 | 审计记 `quota_source=local`，`plugin check` 明确告警 |
+| `prune_history` | `ignore_errors=True`，快照无限增长 | 失败时打印警告 |
+| systemd 托管 | `start/stop` 直接抛 11 | **委托 systemctl**（文档承诺的行为） |
+
+写进设计原则：**降级可以，但必须在输出、审计或退出码里留下痕迹**。一个
+"看起来正常工作"的降级，比一个明确的失败更有害。
+
+### 15.5.3 测试基础设施本身也有缺陷
+
+契约层的端口分配用"绑定→取号→关闭"连续调用两次，取号与真正绑定之间有竞态
+窗口，且内核可能重复分配刚释放的号 → 契约测试**间歇性失败**，而重跑就好。
+
+已改为"同时持有多个 socket 直到全部取号完毕再一起关闭"，并抽成
+`conftest.free_ports(n)`。教训：**flaky 测试比没有测试更糟**——它会训练人忽略红灯。
+
+### 15.5.4 文档与实现的 drift（已按"以文档为准"修正）
+
+交叉核对查出 11 处行为级不一致，其中**代码确实没做到文档承诺**的有 6 处：
+
+| 文档承诺 | 修正 |
+|---------|------|
+| ADR-1/§12.2 systemd 所有权下全部委托 systemctl | 已实现委托（此前直接抛 11，`systemd.py` 的三个方法零调用点） |
+| §8.3 SYSTEMD_ACTIVE 显示 unit 名与 ExecMainPID | 已显示 |
+| §10 硬约束 1 要求 `config set` 与 `doctor` 双重拦截 | 已补 `config set` 一侧 |
+| §8.5 凭据优先级 `--admin-password` > 环境变量 > 配置 | 已实现该选项与环境变量 |
+| ADR-3 启动后拉 `server_info`，404 → 退出 7 并附实测版本 | 已实现（并区分 404 与瞬时连接失败） |
+| §7.3 退出码 7 = dashboard 不可达/未启用 | `kick` 在未启用时改为 7（原为 3） |
+
+**反向修正 3 处**（文档写错了，以代码为准）：`restart --no-rollback` 收回
+（重启不读配置，不存在回滚语义）；`webServer.user` 明确为固定 `admin`（见 §10）；
+§8.2 `instance_lock` 补记"实现为可重入"。
+
+### 15.5.5 一处刻意保留的不一致
+
+`config get` 的打码形式是"保留首尾各两字符"（`SU***56`）而非全 `***`：既防止
+泄露，又让人能核对"改的是不是同一个值"。`config get <表>` 与所有 diff 输出
+（`config set` / `diff` / `rollback` / `edit`）都走同一套递归打码。
+
+---
+
 ## 16. 设计评审变更记录（问题 1–5 闭环）
 
 本章记录一次设计评审后的修订，**目的是让"为什么这么改"可追溯**，避免后续实现时把结论当成凭空规定。
@@ -1533,6 +1610,8 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 
 ## 17. 实现验证记录（M0–M5 已落地）
 
+> 本节记录 M5 之前的实现验证；M5 之后的全量回归 review 见 §15.5。
+
 本章记录实现过程中**文档被现实修正**的地方，以及只有真机测试才能照出来的问题。
 它的用途是：下次改这块代码的人，不必重新踩一遍。
 
@@ -1540,8 +1619,8 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 
 | 项 | 状态 |
 |----|------|
-| 代码 | `src/frpsctl/`（core 14 模块 + `plugin/` 5 模块 + CLI 3 模块） |
-| 测试 | **127 个用例**；单元 / 集成 / CLI / 契约四层 |
+| 代码 | `src/frpsctl/`（core 15 模块 + `plugin/` 6 模块 + CLI 3 模块） |
+| 测试 | **141 个用例**；单元 / 集成 / CLI / 契约四层（review 后新增 14 个回归用例） |
 | 真机验证（M0–M4） | frps **0.71.0** 全链路冒烟通过：`init → verify → start → status → config set（自动重启）→ doctor → config rollback → stop` |
 | 真机验证（M5） | **真 frpc → 真 frps → 我们的插件**：授权用户建代理成功、未授权用户登录被拒、白名单外端口被拒且理由回到客户端 |
 | 契约层 | C1–C7 全绿（真二进制），CI 里作为升级门禁 |
