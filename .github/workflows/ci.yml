@@ -1,0 +1,81 @@
+name: CI
+
+# 平台范围由设计文档 §3.4 决定：只支持 Linux，因此 CI 只有 Linux job。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # 契约层需要真实 frps：CI 里按需下载并强校验（不缓存二进制，避免供应链漂移）
+  FRPS_VERSION: "0.71.0"
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装依赖
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: 拉取真实 frps（契约层用）
+        run: |
+          # 用我们自己的 install 下载 + sha256 强校验 —— 顺带验证 §8.6 的信任模型
+          .venv/bin/frpsctl install --version "$FRPS_VERSION"
+          echo "FRPSCTL_TEST_BINARY=$HOME/.local/share/frpsctl/bin/frps-${FRPS_VERSION}" >> "$GITHUB_ENV"
+          "$HOME/.local/share/frpsctl/bin/frps-${FRPS_VERSION}" -v
+
+      - name: 单元 + 集成 + CLI 层
+        run: .venv/bin/pytest tests/ -q -m "not contract"
+
+      - name: 契约层（设计文档事实基线的自动化守卫）
+        run: .venv/bin/pytest tests/test_facts.py -q
+
+      - name: 端到端冒烟（真 frps 全链路）
+        run: |
+          set -euo pipefail
+          export FRPSCTL_ROOT="$RUNNER_TEMP/smoke/instances"
+          export FRPSCTL_DATA_HOME="$RUNNER_TEMP/smoke/data"
+          mkdir -p "$FRPSCTL_DATA_HOME/bin"
+          cp "$FRPSCTL_TEST_BINARY" "$FRPSCTL_DATA_HOME/bin/"
+          ln -sf "frps-${FRPS_VERSION}" "$FRPSCTL_DATA_HOME/bin/frps"
+
+          free_port() { python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])"; }
+          BP=$(free_port); DP=$(free_port)
+
+          .venv/bin/frpsctl init --no-input --bind-port "$BP" --dashboard-port "$DP" --allow-ports 6000-6100
+          .venv/bin/frpsctl verify
+          .venv/bin/frpsctl start --health-timeout 10
+          .venv/bin/frpsctl status
+          .venv/bin/frpsctl config set maxPortsPerClient 30
+          .venv/bin/frpsctl status --json
+          .venv/bin/frpsctl doctor
+          .venv/bin/frpsctl stop
+          .venv/bin/frpsctl status
+
+  no-binary:
+    name: 无二进制降级路径（Python 3.13）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: 安装依赖
+        run: |
+          uv venv --python 3.13
+          uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: 契约层必须整体 skip 而不是失败
+        run: .venv/bin/pytest tests/test_facts.py -q -rs
