@@ -30,6 +30,7 @@ from typing import Any
 import tomlkit
 
 from ..errors import (
+    ConfigError,
     ConfigKeyMissing,
     ConfigRejected,
     FrpsctlError,
@@ -64,6 +65,10 @@ SECRET_KEYS: frozenset[str] = frozenset(
 )
 
 _MISSING = object()
+
+#: `frps verify` 的超时（秒）。配置校验是纯本地解析，正常在毫秒级完成；
+#: 给 30 秒是防"二进制卡死"，而不是给它慢慢跑。
+VERIFY_TIMEOUT = 30
 
 
 def is_secret_key(dotted: str) -> bool:
@@ -177,8 +182,6 @@ def atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
 
 def load_config(path: Path) -> tomlkit.TOMLDocument:
     """解析 TOML。文件缺失或语法错误都转成 `ConfigError` 系异常。"""
-    from ..errors import ConfigError
-
     try:
         text = path.read_text("utf-8")
     except FileNotFoundError:
@@ -405,19 +408,29 @@ def validate_text(
     try:
         with handle:
             handle.write(text)
-        proc = subprocess.run(
-            [
-                str(binary),
-                *config_flags(uses_exec_token_source=uses_unsafe),
-                "verify",
-                "-c",
-                str(candidate),
-            ],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    str(binary),
+                    *config_flags(uses_exec_token_source=uses_unsafe),
+                    "verify",
+                    "-c",
+                    str(candidate),
+                ],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=VERIFY_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            # 必须接住：让它冒出去只会变成"未分类错误"，而真正该说的是
+            # "校验没能在 N 秒内完成"——用户据此判断是二进制卡住了还是机器太慢。
+            raise ConfigError(
+                f"配置校验超时（{VERIFY_TIMEOUT} 秒）：{binary} verify 没有返回",
+                hint="该二进制可能卡住或不可执行；可先手工运行它确认真实行为",
+            ) from None
+        except OSError as exc:
+            raise ConfigError(f"无法执行配置校验：{exc}") from None
     finally:
         candidate.unlink(missing_ok=True)
     if proc.returncode != 0:

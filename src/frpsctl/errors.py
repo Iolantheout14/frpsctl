@@ -31,6 +31,7 @@ __all__ = [
     "PermissionRequired",
     "ChangeRolledBack",
     "StartupFailed",
+    "StopFailed",
     "OwnershipConflict",
     "LockBusy",
     "UnsupportedPlatform",
@@ -190,6 +191,23 @@ class StartupFailed(FrpsctlError):
         super().__init__(
             "frps 启动后立即退出",
             hint=hint if hint is not None else (detail.strip() or "见 startup 日志"),
+        )
+
+
+class StopFailed(FrpsctlError):
+    """进程停不下来（连 SIGKILL 都无效，例如 D 状态）。
+
+    独立于 `StartupFailed` 存在：后者的消息是"frps 启动后立即退出"，用它描述
+    "停止失败"会给出与事实**相反**的结论——用户会去查启动日志，而真问题是
+    进程卡在内核里出不来。诊断信息错了比没有诊断更费时间。
+    """
+
+    exit_code = ExitCode.STARTUP_FAILED
+
+    def __init__(self, pid: int, *, hint: str | None = None) -> None:
+        super().__init__(
+            f"无法停止 pid {pid}：发出 SIGKILL 后进程仍存在",
+            hint=hint or "进程可能处于不可中断睡眠（D 状态），检查内核日志（dmesg）",
         )
 
 

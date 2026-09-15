@@ -50,6 +50,9 @@ jobs:
       - name: 契约层（设计文档事实基线的自动化守卫）
         run: .venv/bin/pytest tests/test_facts.py -q
 
+      - name: 故障注入层（异常路径的五项不变量）
+        run: .venv/bin/pytest tests/test_faults.py -q
+
       - name: 插件契约层（真 frpc → 真 frps → 我们的插件）
         run: .venv/bin/pytest tests/test_plugin.py -q -m contract
 

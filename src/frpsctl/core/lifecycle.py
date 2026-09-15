@@ -27,6 +27,7 @@ from ..errors import (
     NotRunning,
     OwnershipConflict,
     StartupFailed,
+    StopFailed,
 )
 from . import platform as plat
 from .health import HealthLayer, HealthReport, probe_plugins
@@ -298,14 +299,26 @@ class Lifecycle:
         else:
             from .admin import AdminClient
 
-            with AdminClient(dash.base_url, dash.user, dash.password, timeout=timeout) as client:
-                ok, ms = client.healthz()
+            # 整个 L2 探针必须吞掉**所有**网络层异常并降级为 FAIL。
+            # 只接 FrpsctlError 是不够的：httpx 的异常（InvalidURL、ConnectError…）
+            # 继承自 Exception 而非我们的基类，socket 层的 OSError 同理。
+            # 漏掉它们会让 `status` 在 dashboard 抖动时直接崩——而 status 的设计
+            # 承诺是"永远能回答现在什么情况"。
+            try:
+                with AdminClient(dash.base_url, dash.user, dash.password, timeout=timeout) as client:
+                    ok, ms = client.healthz()
+            except Exception:  # noqa: BLE001 - 探针失败只能说明"不健康"，不是调用方的错
+                ok, ms = False, 0.0
             l2 = HealthLayer.OK if ok else HealthLayer.FAIL
             detail = f"/healthz 200, {ms:.0f}ms" if ok else f"/healthz 无响应 ({dash.base_url})"
 
-        # L3：插件面（无 httpPlugins → SKIPPED）
+        # L3：插件面（无 httpPlugins → SKIPPED）。同样不能被异常打断：探针内部
+        # 只捕 OSError，而 URL 解析等仍可能抛出别的东西。
         targets = parse_plugin_targets(self.inst.config)
-        l3, l3_detail = probe_plugins(targets)
+        try:
+            l3, l3_detail = probe_plugins(targets)
+        except Exception:  # noqa: BLE001 - 探针失败只意味着"不可达"
+            l3, l3_detail = HealthLayer.FAIL, "插件探针异常"
         if l3 is HealthLayer.FAIL:
             detail = l3_detail
 
@@ -556,32 +569,50 @@ class Lifecycle:
                 self.inst.clear_state()
                 raise NotRunning(self.inst.name)
 
-            if force:
-                plat.terminate(ref.pid, force=True)
-                gone = self._wait_gone(ref, KILL_TIMEOUT)
-            else:
-                with contextlib.suppress(ProcessLookupError):
-                    plat.terminate(ref.pid)  # SIGTERM：frps 立即终止（§3.5，非 graceful）
-                gone = self._wait_gone(ref, timeout)
-                if not gone and self._still_ours(ref):
-                    # 兜底：应对卡死/无响应。
-                    # ⚠️ 升到 SIGKILL 之前**必须重验身份**：等待期间进程可能已退出，
-                    # 而 pid 被无关进程复用——此时再发 SIGKILL 就是 R2 要防的误杀。
+            force_sent = force
+            try:
+                if force:
                     plat.terminate(ref.pid, force=True)
                     gone = self._wait_gone(ref, KILL_TIMEOUT)
-                elif not gone:
-                    # 身份已失效（进程退出或 pid 复用）：视作已停止，不发第二个信号
-                    gone = True
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        plat.terminate(ref.pid)  # SIGTERM：frps 即终止（§3.5，非 graceful）
+                    gone = self._wait_gone(ref, timeout)
+            except PermissionError as exc:
+                # 信号没发出去（进程不属于当前用户 / 权限被降级）。
+                # **必须保留 state.json**：进程还在跑，它是唯一的归属记录；
+                # 清掉就等于把一个活着的 frps 交给运气——工具再也找不到它。
+                raise OwnershipConflict(
+                    f"无权向 pid {ref.pid} 发送停止信号：{exc}",
+                    hint=(
+                        "该进程仍在运行。请用有权限的账号重试（例如 sudo），"
+                        f"或确认它已停止后再删除 {self.inst.state}"
+                    ),
+                ) from None
+            except OSError as exc:
+                raise FrpsctlError(
+                    f"停止 pid {ref.pid} 时出错：{exc}",
+                    hint=f"state.json 已保留；确认进程状态后再处理 {self.inst.state}",
+                ) from None
+
+            # 兜底：SIGTERM 没奏效（卡死/无响应）→ 升级 SIGKILL。
+            # ⚠️ 发 SIGKILL 之前**必须重验身份**：等待期间进程可能已退出，而 pid
+            # 被无关进程复用——此时再发信号就是 R2 要防的误杀。
+            # ⚠️ 这段曾在重构中被误缩进进 except 块而变成**不可达代码**，
+            # 后果是卡死的 frps 再也停不掉（集成测试抓住了它）。
+            if not gone and not force_sent and self._still_ours(ref):
+                plat.terminate(ref.pid, force=True)
+                gone = self._wait_gone(ref, KILL_TIMEOUT)
+            elif not gone and not self._still_ours(ref):
+                # 身份已失效（进程退出或 pid 复用）：视作已停止，不发第二个信号
+                gone = True
 
             if gone:
                 self.inst.clear_state()
             if not gone:
                 # 进程仍在且**确属我们**才报"杀不掉"。此处保留 state.json：
                 # 它是唯一的归属记录，清掉会让进程彻底失控（见 R2/M1）。
-                raise StartupFailed(
-                    f"pid {ref.pid} 在 SIGKILL 后仍未退出",
-                    hint="进程可能处于不可中断睡眠（D 状态），检查内核日志",
-                )
+                raise StopFailed(ref.pid)
             return StopReport(stopped=True)
 
     def _still_ours(self, ref: ProcessRef) -> bool:
