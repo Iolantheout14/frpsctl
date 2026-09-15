@@ -40,6 +40,8 @@ class AuditRecord:
     source: str = ""
     #: 该次裁决的耗时（毫秒）。用于回答"插件拖慢了登录吗"。
     elapsed_ms: float = 0.0
+    #: 配额计数的来源（`dashboard` 权威 / `local` 退化 / 空表示未涉及配额）。
+    quota_source: str = ""
 
     @property
     def at(self) -> float:
@@ -62,6 +64,7 @@ class AuditRecord:
             "client_id": self.client_id,
             "source": self.source,
             "elapsed_ms": round(self.elapsed_ms, 2),
+            "quota_source": self.quota_source,
         }
 
 

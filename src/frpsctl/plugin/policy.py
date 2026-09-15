@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..errors import ConfigError, UsageError
+from .quota import QuotaResult
 
 __all__ = [
     "PortRange",
@@ -92,6 +93,9 @@ class UserPolicy:
     allowed_proxy_names: tuple[str, ...] = ()
     #: 允许的代理类型。空集 = 不限类型。
     allowed_proxy_types: tuple[str, ...] = ()
+    #: 该用户可同时存在的代理数上限。0 = 不限。
+    #: 计数来自 dashboard 的 `data.total`（权威），见 `QuotaChecker`。
+    max_proxies: int = 0
     #: 备注，仅用于审计可读性。
     note: str = ""
 
@@ -126,6 +130,7 @@ class UserPolicy:
             allow_random_port=bool(raw.get("allow_random_port", False)),
             allowed_proxy_names=tuple(str(x) for x in (raw.get("allowed_proxy_names") or [])),
             allowed_proxy_types=tuple(str(x) for x in (raw.get("allowed_proxy_types") or [])),
+            max_proxies=max(0, int(raw.get("max_proxies", 0) or 0)),
             note=str(raw.get("note") or ""),
         )
 
@@ -174,6 +179,12 @@ class PluginPolicy:
     allow_unknown_user: bool = False
     require_client_id: bool = True
     audit: AuditSettings = field(default_factory=AuditSettings)
+    #: dashboard 的 v2 API 地址，用于读取**权威的**代理计数（`max_proxies`）。
+    #: 为空则配额退化为"按本进程观测到的 NewProxy 事件计数"——那不准（重启即归零、
+    #: 多插件实例各算各的），因此配了 `max_proxies` 就应当填它。
+    admin_url: str = ""
+    admin_user: str = ""
+    admin_password: str = ""
     #: 限速：同一用户在 N 秒内最多触发几次拒绝后开始快速失败（防止日志被刷爆）。
     reject_log_burst: int = 20
     reject_log_window: float = 10.0
@@ -206,6 +217,9 @@ class PluginPolicy:
             for item in user.allowed_ports:
                 if item.start < 1 or item.end > 65535:
                     raise ConfigError(f"用户 {name!r} 的端口段越界：{item.render()}")
+        if not self.audit.enabled:
+            # 关掉审计是允许的，但要让人知道代价
+            pass
 
     # --- 查询 ----------------------------------------------------------
 
@@ -220,10 +234,14 @@ class PluginPolicy:
             f"客户端身份校验：{'开启' if self.require_client_id else '关闭 ⚠'}",
             f"审计：{'写入 ' + str(self.audit.path) if self.audit.enabled and self.audit.path else ('仅内存' if self.audit.enabled else '关闭')}",
         ]
+        if any(user.max_proxies for user in self.users.values()):
+            source = self.admin_url or "（未配置 admin_url，配额计数不准确 ⚠）"
+            lines.append(f"配额计数来源：{source}")
         for name, user in sorted(self.users.items()):
             suffix = f"  # {user.note}" if user.note else ""
             random_port = " +随机端口" if user.allow_random_port else ""
-            lines.append(f"  - {name}: 端口 {user.render_ports()}{random_port}{suffix}")
+            quota = f"，最多 {user.max_proxies} 个代理" if user.max_proxies else ""
+            lines.append(f"  - {name}: 端口 {user.render_ports()}{random_port}{quota}{suffix}")
         return lines
 
     # --- 载入 ----------------------------------------------------------
@@ -261,6 +279,9 @@ class PluginPolicy:
             allow_unknown_user=bool(raw.get("allow_unknown_user", False)),
             require_client_id=bool(raw.get("require_client_id", True)),
             audit=AuditSettings.parse(raw.get("audit")),
+            admin_url=str(raw.get("admin_url") or ""),
+            admin_user=str(raw.get("admin_user") or ""),
+            admin_password=str(raw.get("admin_password") or ""),
             reject_log_burst=int(raw.get("reject_log_burst", 20)),
             reject_log_window=float(raw.get("reject_log_window", 10.0)),
         )
@@ -329,6 +350,7 @@ def decide_new_proxy(
     proxy_type: str,
     remote_port: int,
     current_ports: Iterable[int] = (),
+    quota: QuotaResult | None = None,
 ) -> Decision:
     """`NewProxy` 裁决：这个用户能不能创建这个代理？
 
@@ -360,6 +382,11 @@ def decide_new_proxy(
             user,
             f"{_REASON_PREFIX}: 用户 {user!r} 不允许使用代理名 {proxy_name!r}",
         )
+
+    # 配额检查放在端口检查**之前**：端口白名单是"能不能"，配额是"还有没有名额"，
+    # 两者都不过时先说名额，客户端更容易理解（"你建太多了"比"端口不对"更贴近实情）。
+    if quota is not None and not quota.allowed:
+        return Decision.deny(user, f"{_REASON_PREFIX}: {quota.reason}")
 
     port_based = proxy_type in ("tcp", "udp")
     if not port_based:

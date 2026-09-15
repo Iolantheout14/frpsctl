@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 from .audit import AuditLog, AuditRecord
 from .policy import PluginPolicy, decide_login, decide_new_proxy
+from .quota import QuotaChecker
 from .types import (
     LoginContent,
     NewProxyContent,
@@ -45,9 +46,20 @@ class EngineResult:
 class DecisionEngine:
     """把 `PluginRequest` 变成 `PluginResponse`，并留下审计记录。"""
 
-    def __init__(self, policy: PluginPolicy, audit: AuditLog | None = None) -> None:
+    def __init__(
+        self,
+        policy: PluginPolicy,
+        audit: AuditLog | None = None,
+        quota: QuotaChecker | None = None,
+    ) -> None:
         self.policy = policy
         self.audit = audit
+        # 只有在真的配了 max_proxies 时才需要外部计数，否则纯本地判断即可
+        self.quota = quota or QuotaChecker(
+            admin_url=policy.admin_url,
+            admin_user=policy.admin_user,
+            admin_password=policy.admin_password,
+        )
 
     def handle(self, request: PluginRequest, *, source: str = "") -> PluginResponse:
         started = time.monotonic()
@@ -70,7 +82,22 @@ class DecisionEngine:
         if request.op is Op.NEW_PROXY:
             return self._new_proxy(request, common)
 
-        # CloseProxy / Ping / NewWorkConn / NewUserConn：不涉及权限边界。
+        if request.op is Op.CLOSE_PROXY:
+            # 关闭代理要递减本地计数，否则"建了又删"会白占配额
+            closed = NewProxyContent.parse(request.content)
+            self.quota.note_closed(closed.user.user)
+            return (
+                PluginResponse.pass_through(),
+                AuditRecord(
+                    user=closed.user.user,
+                    decision="allow",
+                    reason="pass-through",
+                    proxy_name=closed.proxy_name,
+                    **common,
+                ),
+            )
+
+        # Ping / NewWorkConn / NewUserConn：不涉及权限边界。
         # 必须显式 unchange=True，否则 frps 会用零值覆盖内容（§11.1）。
         return (
             PluginResponse.pass_through(),
@@ -103,13 +130,22 @@ class DecisionEngine:
     ) -> tuple[PluginResponse, AuditRecord]:
         # NewProxy 时 content.user 是**对象**（UserInfo）——与 Login 不同型
         content = NewProxyContent.parse(request.content)
+        owner = self.policy.user(content.user.user)
+        quota = None
+        if owner is not None and owner.max_proxies:
+            quota = self.quota.check(content.user.user, owner.max_proxies)
         decision = decide_new_proxy(
             self.policy,
             user=content.user.user,
             proxy_name=content.proxy_name,
             proxy_type=content.proxy_type,
             remote_port=content.remote_port,
+            quota=quota,
         )
+        if decision.allowed and owner is not None and owner.max_proxies:
+            # 主动记账：dashboard 的统计可能有秒级延迟，本地记账让"刚建完立刻再建"
+            # 也能被正确拦住。
+            self.quota.note_created(content.user.user)
         record = AuditRecord(
             user=decision.user or content.user.user,
             decision="allow" if decision.allowed else "deny",
@@ -117,6 +153,7 @@ class DecisionEngine:
             proxy_name=content.proxy_name,
             proxy_type=content.proxy_type,
             remote_port=content.remote_port,
+            quota_source=quota.source if quota is not None else "",
             **common,
         )
         if decision.allowed:

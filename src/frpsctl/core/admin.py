@@ -181,13 +181,12 @@ class AdminClient:
         )
 
     def clients(self) -> list[dict]:
-        """客户端列表。v2 的信封里是 `data.items`（真机实测），不是 `data.clients`。"""
-        payload = self._unwrap(self._get("/api/v2/clients"))
-        if isinstance(payload, dict):
-            items = payload.get("items") or payload.get("clients") or []
-        else:
-            items = payload
-        return list(items or [])
+        """客户端列表。v2 的信封里是 `data.items`（真机实测），不是 `data.clients`。
+
+        ⚠️ **这是分页结果**：默认 `pageSize` 只有 50，超过就只返回前 50 条。
+        需要"有多少"时请用 `page_total()`——把分页片段当成全量是静默错误。
+        """
+        return _page_items(self._unwrap(self._get("/api/v2/clients")))
 
     def proxies(self, ptype: str) -> list[ProxyStat]:
         """某个类型的全部代理。`proxyTypeCount` 的交叉验证靠它（§13.1 C1）。"""
@@ -197,6 +196,31 @@ class AdminClient:
         body = resp.json()
         items = body.get("proxies") if isinstance(body, dict) else body
         return [ProxyStat.from_api(item) for item in (items or [])]
+
+    def page_total(self, endpoint: str) -> int:
+        """取某个分页端点的**总数**（`data.total`），而不是当前页条数。
+
+        frp 的 v2 列表端点统一返回 `{total, page, pageSize, items}`，`total` 是
+        过滤后的总数。要"按用户统计代理数"就必须用它——逐页拉取既慢，又容易
+        在 pageSize 上悄悄截断。
+        """
+        payload = self._unwrap(self._get(endpoint))
+        if isinstance(payload, dict) and isinstance(payload.get("total"), int):
+            return int(payload["total"])
+        return len(_page_items(payload))
+
+    def proxy_count_for_user(self, user: str) -> int:
+        """某用户当前的代理数（插件 `max_proxies` 配额用）。
+
+        用 `total` 而不是 items 长度：后者受 pageSize 限制（默认 50），
+        会在大户身上把配额判断变成"永远没超"。
+        """
+        payload = self._unwrap(
+            self._get("/api/v2/proxies", params={"user": user, "page_size": "1"})
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("total"), int):
+            return int(payload["total"])
+        return len(_page_items(payload))
 
     def kick(self, proxy_name: str) -> None:
         """下线指定代理。`DELETE /api/proxies`（v1 路径，v2 无对应写接口）。"""
@@ -209,9 +233,9 @@ class AdminClient:
 
     # --- 内部 ----------------------------------------------------------
 
-    def _get(self, path: str) -> httpx.Response:
+    def _get(self, path: str, *, params: dict | None = None) -> httpx.Response:
         try:
-            return self._client.get(path)
+            return self._client.get(path, params=params)
         except httpx.HTTPError as exc:
             raise AdminUnreachable(
                 f"dashboard 不可达（{self._base_url}{path}）：{exc}",
@@ -238,6 +262,21 @@ class AdminClient:
         if isinstance(body, dict) and "data" in body:
             return body["data"] or {}
         return body if isinstance(body, dict) else {}
+
+
+def _page_items(payload: object) -> list[dict]:
+    """从 v2 分页信封里取 items。
+
+    兼容两种形状：`{total,page,pageSize,items}`（真机）与直接是列表（v1 风格
+    的裸数组）。**只取 items 而不校验 total**，因为调用方若关心总数应当用
+    `page_total()`——这里保持"列表就是列表"的单一语义。
+    """
+    if isinstance(payload, dict):
+        items = payload.get("items") or payload.get("clients") or []
+        return [item for item in items if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
 
 
 def _as_int(value: object) -> int:

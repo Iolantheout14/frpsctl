@@ -1017,12 +1017,20 @@ def _render_policy_template() -> str:
             "flush_every": 32,
             "flush_interval": 2.0,
         },
+        "_admin_comment": (
+            "若使用 max_proxies 配额，请填写 dashboard 地址，否则计数只在本进程内有效"
+            "（重启归零、多实例各算各的）"
+        ),
+        "admin_url": "",
+        "admin_user": "",
+        "admin_password": "",
         "users": {
             "alice": {
                 "allowed_ports": ["6000-6010"],
                 "allow_random_port": False,
                 "allowed_proxy_types": ["tcp", "udp"],
                 "allowed_proxy_names": ["alice-*"],
+                "max_proxies": 5,
                 "note": "示例用户：换成本地实际用户，并收窄端口范围",
             }
         },

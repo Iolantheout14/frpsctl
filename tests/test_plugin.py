@@ -574,3 +574,99 @@ ops = ["Login"]
     def test_loopback_plugin_address_is_not_flagged(self, tmp_path: Path) -> None:
         findings = self._run(tmp_path, "http://127.0.0.1:8080")
         assert not [f for f in findings if f.check == "插件暴露面"]
+
+
+# ---------------------------------------------------------------------------
+# 配额（max_proxies）
+# ---------------------------------------------------------------------------
+
+
+class TestQuota:
+    """`max_proxies` 的判定与计数来源。
+
+    配额只在 `NewProxy` 上做——`NewUserConn` 落在**每次用户连接**的关键路径上，
+    且其错误只以 info 级记录、content 里也没有连接 id，无法可靠统计并发连接。
+    详见 `frpsctl/plugin/quota.py` 的模块文档。
+    """
+
+    def _engine(self, tmp_path: Path, limit: int) -> tuple[DecisionEngine, AuditLog]:
+        policy = PluginPolicy.parse(
+            {
+                "users": {"alice": {"allowed_ports": ["6000-6100"], "max_proxies": limit}},
+                "audit": {"path": str(tmp_path / "q.jsonl")},
+            }
+        )
+        log = AuditLog(tmp_path / "q.jsonl", flush_every=1000)
+        return DecisionEngine(policy, log), log
+
+    def _new_proxy(self, engine: DecisionEngine, port: int, name: str = "p") -> dict:
+        return engine.handle(
+            PluginRequest.from_payload(
+                op="NewProxy", version="0.1.0",
+                body={"content": {"user": {"user": "alice"}, "proxy_name": name,
+                                  "proxy_type": "tcp", "remote_port": port}},
+            )
+        ).to_payload()
+
+    def test_quota_blocks_after_limit(self, tmp_path: Path) -> None:
+        engine, log = self._engine(tmp_path, limit=2)
+        assert self._new_proxy(engine, 6000, "p1")["reject"] is False
+        assert self._new_proxy(engine, 6001, "p2")["reject"] is False
+        third = self._new_proxy(engine, 6002, "p3")
+        assert third["reject"] is True
+        assert "上限" in third["reject_reason"]
+        log.close()
+
+    def test_close_proxy_frees_a_slot(self, tmp_path: Path) -> None:
+        """建了又删不能白占配额——否则重启客户端就再也建不出代理。"""
+        engine, log = self._engine(tmp_path, limit=1)
+        assert self._new_proxy(engine, 6000, "p1")["reject"] is False
+        assert self._new_proxy(engine, 6001, "p2")["reject"] is True
+
+        engine.handle(
+            PluginRequest.from_payload(
+                op="CloseProxy", version="0.1.0",
+                body={"content": {"user": {"user": "alice"}, "proxy_name": "p1",
+                                  "proxy_type": "tcp"}},
+            )
+        )
+        assert self._new_proxy(engine, 6001, "p2")["reject"] is False
+        log.close()
+
+    def test_zero_limit_means_unlimited(self, tmp_path: Path) -> None:
+        engine, log = self._engine(tmp_path, limit=0)
+        for i in range(5):
+            assert self._new_proxy(engine, 6000 + i, f"p{i}")["reject"] is False
+        log.close()
+
+    def test_quota_source_is_recorded_in_audit(self, tmp_path: Path) -> None:
+        """审计必须写明计数来源——退化模式的计数不准，运维得看得出来。"""
+        engine, log = self._engine(tmp_path, limit=1)
+        self._new_proxy(engine, 6000, "p1")
+        log.close()
+
+        record = json.loads((tmp_path / "q.jsonl").read_text("utf-8").strip().split("\n")[0])
+        assert record["quota_source"] == "local", "未配 admin_url 时应标注为 local"
+
+    def test_dashboard_unreachable_degrades_instead_of_blocking(self, tmp_path: Path) -> None:
+        """dashboard 不可达时**不能**让所有人都建不了代理。
+
+        配额是治理手段，不是可用性前提。降级为本地计数并如实标注来源。
+        """
+        from frpsctl.plugin.quota import QuotaChecker
+
+        checker = QuotaChecker(admin_url="http://127.0.0.1:1", timeout=0.2)
+        count, source = checker.current("alice")
+        assert (count, source) == (0, "local")
+        assert checker.check("alice", 1).allowed is True
+
+    def test_dashboard_mode_uses_authoritative_total(self) -> None:
+        """配了 admin_url 时计数来源应标记为 dashboard（用假客户端验证装配）。"""
+        from frpsctl.plugin.quota import QuotaChecker
+
+        checker = QuotaChecker(admin_url="http://example.invalid:7500")
+        checker._cache["alice"] = (checker._clock(), 7, "dashboard")
+        assert checker.current("alice") == (7, "dashboard")
+        result = checker.check("alice", 7)
+        assert result.allowed is False
+        assert "dashboard" in result.reason
