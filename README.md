@@ -958,7 +958,8 @@ export FRPSCTL_TEST_FRPC=~/.local/share/frpsctl/bin/frpc-0.71.0
 
 ## 许可
 
-MIT（见 [LICENSE](LICENSE)）。
+frpsctl 自身代码以 **MIT** 发布，全文见 [LICENSE](LICENSE)。
 
 本仓库**不包含** frp 的源代码或二进制。`frpsctl install` 会按需从官方发布页下载
-frps，该二进制遵循其自身的 **Apache-2.0** 许可，由使用者自行获取与遵守。
+`frps`，该二进制是独立第三方软件，遵循其自身的 **Apache-2.0**，不随本包分发。
+详见 [NOTICE](NOTICE)。

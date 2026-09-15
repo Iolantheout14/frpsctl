@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-注意：frp 本身的许可
-
-本仓库**不包含** frp 的源代码或二进制。`frpsctl install` 会按需从官方
-发布页下载 frps 二进制，该二进制遵循其自身的 Apache-2.0 许可，由使用者
-自行获取与遵守；本仓库的 MIT 许可仅覆盖 frpsctl 自身的 Python 代码。

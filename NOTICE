@@ -1,0 +1,28 @@
+# NOTICE
+
+## 本仓库的许可
+
+frpsctl 自身的代码以 **MIT** 许可发布，全文见 [`LICENSE`](LICENSE)。
+
+## 关于 frp 的许可（重要）
+
+本仓库**不包含** frp 的源代码，也不包含其二进制。
+
+`frpsctl install` 会按需从 [fatedier/frp](https://github.com/fatedier/frp) 的
+官方发布页下载 `frps` 二进制。该二进制是独立的第三方软件，遵循其自身的
+**Apache License 2.0**，与本仓库的 MIT 许可互不相干：
+
+- 它**不随本包分发**，由使用者自行获取；
+- 使用它需要遵守 Apache-2.0 的条款（包括其许可与声明的保留要求）；
+- 本仓库的 MIT 许可**只覆盖 frpsctl 的 Python 代码**，不覆盖那个二进制。
+
+本工具的设计前提正是"把 frps 当作外部可替换依赖"（见设计文档 ADR-4）：
+不 fork、不 patch、不内嵌，始终使用官方原版二进制，并对其做 sha256 强校验。
+
+## 为什么不把这段写在 LICENSE 里
+
+GitHub 的许可识别要求 `LICENSE` 文件**以标准模板开头且基本不被改动**。
+把第三方软件的许可说明附在 MIT 正文之后，会导致该文件无法被识别为 MIT
+（仓库页面会显示 "Other"），从而少一个 license 徽章。
+
+因此拆成两个文件，各归其位：`LICENSE` 只放 MIT 正文，第三方许可说明放这里。
