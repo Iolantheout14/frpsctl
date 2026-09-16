@@ -46,7 +46,20 @@ class DashboardInfo:
 
     @property
     def auth_enabled(self) -> bool:
-        """user 与 password **同时为空**时 frp 完全不鉴权（§3.3）。"""
+        """frp 是否对 dashboard 施加 Basic Auth。
+
+        判据是"**任一非空即启用**"：user 与 password 同时为空时 frp 完全不鉴权。
+        实测（真 frps 0.71.0）：
+
+        | user | password | 无凭据请求 |
+        |------|----------|-----------|
+        | `"admin"` | 未设/空 | **401** |
+        | 未设 | 未设 | **200** |
+        | `"admin"` | `"secret"` | 401 |
+
+        注意"启用了鉴权"不等于"有像样的口令"：上表第一行里 `admin:` + **空口令**
+        就能拿到 200。空口令的强度问题由 `doctor` 单独告警（§8.7）。
+        """
         return bool(self.user or self.password)
 
 

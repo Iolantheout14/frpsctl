@@ -235,6 +235,19 @@ def _check_dashboard(inst: Instance) -> list[Finding]:
                 "任何人都能读取全部状态并下线任意代理；请设置口令或改回 127.0.0.1",
             )
         )
+    elif dash.auth_enabled and not dash.password:
+        # frp 的鉴权开关是"任一非空即启用"，而 Basic Auth 里的**空口令是合法口令**：
+        # 实测 `user="admin"` + 空口令时，`admin:` 就能拿到 200。此时用户名是唯一
+        # 防护，而它通常就是 "admin" —— 与"完全不鉴权"只差一步。
+        out.append(
+            Finding(
+                "dashboard 弱口令",
+                Severity.WARN,
+                f"password 为空（user = {dash.user!r}）—— frp 把空口令当作合法口令，"
+                "等于只用用户名保护 dashboard",
+                "设置一个随机口令：`frpsctl config set webServer.password '\"...\"'`",
+            )
+        )
     elif not dash.auth_enabled:
         out.append(
             Finding(

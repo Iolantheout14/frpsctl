@@ -5,13 +5,14 @@
 
 | 断言 | 需要真 frps | 守住的事实 |
 |------|-----------|-----------|
-| C1 | ✔ | `proxyCount` 是 map 而非总数，且求和口径正确 |
+| C1 | ✔ | `proxyTypeCount` 是 map 而非总数，且求和口径正确 |
 | C2 | ✘（静态） | 我们只用 v2，没有偷偷加回 v1 降级路径 |
 | C3 | ✔ | `/healthz` 免认证 |
 | C4 | ✔ | v2 信封 `{code,msg,data}` |
 | C5 | ✔ | user/password 双空 = **完全不鉴权** |
 | C6 | ✔ | `frps verify` 是权威判定（退出码 + 成功措辞） |
 | C7 | ✔ | 版本门槛与标志可用性（§3.6） |
+| C8 | ✔ | 鉴权开关是"**任一非空**"，且**空口令是合法口令**（§3.3） |
 
 缺二进制时整组 skip，但断言本身始终留在仓库里——CI 有二进制时它们就是门禁。
 """
@@ -479,3 +480,95 @@ class TestC7VersionGate:
 
         with pytest.raises(UnsupportedVersion):
             install(bin_dir=Path("/tmp/frpsctl-contract-should-not-exist"), version="0.69.1")
+
+
+# ---------------------------------------------------------------------------
+# C8 —— 鉴权开关是"任一非空"，且空口令是合法口令（§3.3）
+# ---------------------------------------------------------------------------
+
+
+@requires_binary
+class TestC8PasswordlessAuth:
+    """守 `check_dangerous_combination()` 的**判据边界**。
+
+    它只拒绝"user/password 两者全空 + 绑非回环"（真·无鉴权），而放行"有 user、
+    口令为空"——后者交给 `doctor` 以 WARN 告警。这个分工只有在下面这条事实成立时
+    才正确：**frp 的鉴权开关是"任一非空即启用"，而空口令是合法口令**。
+
+    若哪天 frp 改成"口令必须非空才启用鉴权"，那么"有 user + 空口令"会**静默退化
+    成完全不鉴权**，而 `check_dangerous_combination()` 仍然放行——安全缺口就此产生。
+    这条断言就是那个变化的哨兵。
+    """
+
+    def _start(self, tmp_path, name: str, extra: str) -> tuple[subprocess.Popen, int]:
+        """起一个 frps，返回 (进程, dashboard 端口)。extra 是 [webServer] 里的额外键。"""
+        port, dash_port = free_ports(2)
+        config = tmp_path / f"{name}.toml"
+        config.write_text(
+            f"""\
+bindAddr = "127.0.0.1"
+bindPort = {port}
+
+[webServer]
+addr = "127.0.0.1"
+port = {dash_port}
+{extra}
+""",
+            "utf-8",
+        )
+        proc = subprocess.Popen(
+            [str(REAL_FRPS), "-c", str(config)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        if not _wait_port("127.0.0.1", dash_port, timeout=10):
+            proc.kill()
+            pytest.fail(f"{name}: 真 frps 未起来")
+        return proc, dash_port
+
+    @staticmethod
+    def _status(dash_port: int, auth: tuple[str, str] | None) -> int:
+        import httpx
+
+        resp = httpx.get(
+            f"http://127.0.0.1:{dash_port}/api/v2/clients",
+            auth=auth,
+            timeout=5,
+        )
+        return resp.status_code
+
+    def test_nonempty_user_with_empty_password_still_enforces_auth(self, tmp_path) -> None:
+        """`user = "admin"` + 口令为空 → 无凭据 401，而 `admin:`+空口令 200。
+
+        `401` 那一半证明 `check_dangerous_combination()` 的"两者全空才拒绝"是
+        **有依据的**（这里确实启用了鉴权）；`200` 那一半证明"免口令 dashboard"
+        的强度问题真实存在，因此需要 `doctor` 的 WARN。
+        """
+        proc, dash_port = self._start(tmp_path, "user-only", 'user = "admin"')
+        try:
+            assert self._status(dash_port, None) == 401, (
+                "user 非空但口令为空时无凭据请求竟拿到 200 —— 鉴权开关语义已变，"
+                "`check_dangerous_combination()` 的判据必须重新收紧"
+            )
+            assert self._status(dash_port, ("admin", "")) == 200, (
+                "空口令不再是合法口令 —— §3.3 的实测表与 doctor 的告警文案需要重写"
+            )
+            assert self._status(dash_port, ("admin", "whatever")) == 401, "口令校验被跳过了"
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_password_only_config_requires_empty_username(self, tmp_path) -> None:
+        """只设 `password`（user 留空）→ 必须用 `:secret` 才能进。
+
+        这是 `DashboardInfo.auth_enabled`（`bool(user or password)`）的另一半依据：
+        "只有口令"同样启用鉴权，但调用方要发**空用户名**的 Basic Auth。
+        """
+        proc, dash_port = self._start(tmp_path, "pass-only", 'password = "secret"')
+        try:
+            assert self._status(dash_port, None) == 401
+            assert self._status(dash_port, ("", "secret")) == 200
+            assert self._status(dash_port, ("bogus", "secret")) == 401
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
