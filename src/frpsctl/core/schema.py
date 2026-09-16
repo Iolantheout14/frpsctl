@@ -195,6 +195,12 @@ def check_dangerous_combination(data: dict[str, Any]) -> str | None:
     `webServer.password` **同时为空时 frp 完全不鉴权**——不是"要求登录"，而是
     任何人都能读取全部状态、并下线任意代理。
 
+    ⚠️ 判据只覆盖"**完全不鉴权**"，因此刻意写成"两者都为空才拒绝"。frp 的
+    鉴权开关是"**任一非空即启用 Basic Auth**"（实测：`user="admin"` + 空口令时
+    无凭据请求得 401，而 `admin:`+空口令得 200）。也就是说"有 user 但口令为空"
+    仍然是"免口令 dashboard"，但它**毕竟启用了鉴权**，属于强度不足而非缺口——
+    由 `doctor` 以 WARN 提示，不在这里否决用户的显式选择。
+
     单看 `webServer.user = ""` 或 `webServer.addr = "0.0.0.0"` 都无害，**只有
     组合起来才是缺口**。因此校验必须针对**合并后的完整配置**，而不是被修改的
     那一个键——`config set webServer.user '""'` 自身永远看不出问题。
