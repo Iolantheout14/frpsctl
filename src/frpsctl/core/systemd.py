@@ -6,10 +6,26 @@
 
 unit 以模板形式安装（`frps@.service`），多实例即多 unit，与 §6 的实例模型
 天然对齐：实例名映射为 `%i`。
+
+**部署体检（install_template 的前置检查）**：unit 装上去只是一半，能不能起来
+取决于三个环境事实，缺任何一项都会在 `systemctl start` 时炸——而那时错误信息
+与安装命令相隔很远。因此把它们搬进安装流程，当场拒绝：
+
+1. `User`/`Group` 必须存在（否则 systemd 报 "Failed to determine user
+   credentials"）；
+2. `ExecStart` 的二进制对服务用户必须可达（`sudo frpsctl install` 会把二进制
+   放进 `/root/...`，而 `/root` 是 0700——服务用户读不到，这是最隐蔽的一类
+   部署失败）；
+3. `ReadWritePaths` 的日志目录必须存在（`ProtectSystem=strict` 下 systemd
+   拒绝挂载不存在的路径）。
 """
 
 from __future__ import annotations
 
+import contextlib
+import grp
+import os
+import pwd
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -18,12 +34,12 @@ from pathlib import Path
 from ..errors import FrpsctlError, PermissionRequired, UsageError
 from .instance import Instance
 
-__all__ = ["Systemd", "UNIT_TEMPLATE_PATH", "SYSTEMD_UNIT_DIR", "render_unit"]
+__all__ = ["Systemd", "UNIT_TEMPLATE_PATH", "SYSTEMD_UNIT_DIR", "DEFAULT_SERVICE_USER", "render_unit"]
 
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frps@.service"
 
-#: 渲染用的 unit 模板（§12.2）。占位符只有 %i —— systemd 自己的实例说明符。
+#: 渲染用的 unit 模板（§12.2）。占位符：%i（systemd 实例说明符）与三个具名参数。
 UNIT_TEMPLATE = """\
 [Unit]
 Description=frps service (%i)
@@ -32,8 +48,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=frps
-Group=frps
+User={user}
+Group={group}
 ExecStart={exec_start} -c {config_dir}/%i/frps.toml
 WorkingDirectory={config_dir}/%i
 Restart=on-failure
@@ -49,14 +65,26 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths={log_dir}
+# 实例目录必须在列：ProtectSystem=strict 会把其余路径挂成只读，而 frp 默认
+# 在实例目录下写日志（`log.to = "./frps.log"`）——不放行就等于让 frps 写不了盘。
+ReadWritePaths={log_dir} {config_dir}/%i
 
 [Install]
 WantedBy=multi-user.target
 """
 
+#: 默认服务用户：与 unit 模板、README 的部署示例保持一致。
+DEFAULT_SERVICE_USER = "frps"
 
-def render_unit(*, binary: str, config_dir: Path, log_dir: Path) -> str:
+
+def render_unit(
+    *,
+    binary: str,
+    config_dir: Path,
+    log_dir: Path,
+    user: str = DEFAULT_SERVICE_USER,
+    group: str | None = None,
+) -> str:
     """渲染 unit 模板。
 
     `ExecStart` 写的是**具体二进制路径**而不是 `bin/frps` 软链：软链换版本后
@@ -66,7 +94,129 @@ def render_unit(*, binary: str, config_dir: Path, log_dir: Path) -> str:
         exec_start=binary,
         config_dir=config_dir,
         log_dir=log_dir,
+        user=user,
+        group=group or user,
     )
+
+
+# ---------------------------------------------------------------------------
+# 部署体检（纯函数，便于测试）
+# ---------------------------------------------------------------------------
+
+
+def _account_ids(user: str, group: str | None) -> tuple[int, int] | None:
+    """查系统账户的 (uid, gid)；用户或组不存在返回 None。"""
+    try:
+        record = pwd.getpwnam(user)
+    except KeyError:
+        return None
+    uid = record.pw_uid
+    gid = record.pw_gid
+    if group:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            return None
+    return uid, gid
+
+
+def _mode_for(st: os.stat_result, *, uid: int, gid: int) -> int:
+    """按目标用户的身份取权限三元组（owner → group → other，与内核一致）。"""
+    if st.st_uid == uid:
+        return (st.st_mode >> 6) & 0o7
+    if st.st_gid == gid:
+        return (st.st_mode >> 3) & 0o7
+    return st.st_mode & 0o7
+
+
+def _access_problem(path: Path, *, uid: int, gid: int) -> str | None:
+    """目标用户能否执行该路径？返回问题描述，None 表示可达。
+
+    逐级检查路径元素（含文件自身）：目录需要 `x` 才能穿过，文件需要 `x`
+    才能执行。这能精确抓出"二进制落在 /root 或某个 0700 家目录下"这类
+    部署失败——`stat` 直接给出权限位，不依赖当前进程的身份。
+    """
+    target = path.resolve()
+    for element in (target, *target.parents):
+        try:
+            st = element.stat()
+        except OSError:
+            return f"{element} 不存在或无法 stat"
+        if not _mode_for(st, uid=uid, gid=gid) & 0o1:
+            kind = "文件" if element == target else "目录"
+            return f"{kind} {element} 对服务用户缺少执行（x）权限"
+    return None
+
+
+def _protect_home_conflict(path: Path) -> str | None:
+    """路径是否会被 unit 的 `ProtectHome=true` 挡住？返回冲突的家目录前缀。
+
+    `ProtectHome=true` 会让 `/home`、`/root`、`/run/user` 对服务进程不可见
+    ——权限位检查（`_access_problem`）看不出这一点，因为这是 systemd 的挂载
+    隔离，不是文件模式。唯一可靠的做法是**识别路径位置**并提前拒绝。
+    """
+    text = str(path.resolve())
+    for prefix in ("/home/", "/root/", "/run/user/"):
+        if text.startswith(prefix) or text == prefix.rstrip("/"):
+            return prefix
+    return None
+
+
+def _ensure_log_dir(log_dir: Path, *, uid: int, gid: int) -> None:
+    """保证 `ReadWritePaths` 的目录存在且服务用户可写。
+
+    systemd 在 `ProtectSystem=strict` 下会拒绝挂载一个不存在的 ReadWritePaths
+    ——表现为 unit 启动失败。因此"顺手建目录"不是锦上添花，是 unit 能起来的
+    一部分；目录已存在时尝试交给服务用户（chown 失败不阻断：可能已经是正确的
+    属主，随后的可写性检查会给出准确结论）。
+    """
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise UsageError(
+            f"无法创建日志目录 {log_dir}：{exc}",
+            hint="用 --log-dir 指定一个可创建的目录，或先手工创建它",
+        ) from None
+    with contextlib.suppress(OSError):
+        os.chown(log_dir, uid, gid)
+    st = log_dir.stat()
+    if _mode_for(st, uid=uid, gid=gid) & 0o3 != 0o3:
+        raise UsageError(
+            f"日志目录对服务用户不可写：{log_dir}",
+            hint=(
+                f"chown {uid}:{gid} {log_dir} 并确保属主有写权限，"
+                "或用 --log-dir 指定其他目录"
+            ),
+        )
+
+
+def _hand_over_instance(inst: Instance, *, uid: int, gid: int) -> None:
+    """把实例目录（含配置与快照目录）移交给服务用户。
+
+    为什么必须做：实例目录是 0700（§6，内含 token 与 dashboard 口令），而
+    `init` 由 root 执行时属主是 root。不移交的话，以服务用户运行的 frps 在
+    `ProtectSystem=strict` 下连 `frps.toml` 都读不到，unit 必然启动失败。
+
+    安全性不降级：目录仍是 0700，只是属主从 root 换成专用的服务用户——
+    同机其他用户依然读不到，而 root 不受权限位限制、后续运维照常。
+    """
+    targets = [inst.dir, inst.history_dir, inst.startup_dir]
+    # `--config` 指向实例目录之外时**不碰那个文件**：unit 的 ExecStart 固定
+    # 使用实例内的 frps.toml，那个外部文件与 systemd 托管无关，动它属于越界。
+    if inst.config.exists() and inst.config.parent == inst.dir:
+        targets.append(inst.config)
+    for path in targets:
+        if not path.exists():
+            continue
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            st = path.stat()
+            if st.st_uid != uid or st.st_gid != gid:
+                raise FrpsctlError(
+                    f"无法把实例路径移交给服务用户：{path}",
+                    hint="确认当前用户有权限（需要 root），或检查文件系统是否支持 chown",
+                ) from None
 
 
 @dataclass
@@ -147,18 +297,84 @@ class Systemd:
 
     # --- 安装 ----------------------------------------------------------
 
-    def install_template(self, *, binary: Path, log_dir: Path, force: bool = False) -> Path:
-        """安装 `frps@.service` 模板并 `daemon-reload`。**需要 root**。"""
+    def install_template(
+        self,
+        *,
+        binary: Path,
+        log_dir: Path,
+        force: bool = False,
+        user: str = DEFAULT_SERVICE_USER,
+        group: str | None = None,
+    ) -> Path:
+        """安装 `frps@.service` 模板并 `daemon-reload`。**需要 root**。
+
+        渲染之前先做三项体检（见模块文档）：账户存在、二进制对服务用户可达、
+        日志目录可写。任何一项不满足都当场拒绝——装一个起不来的 unit 比不装
+        更浪费时间。
+        """
         self._require_root("安装 systemd unit")
         if self.template_path.exists() and not force:
             raise UsageError(
                 f"{self.template_path} 已存在",
                 hint="确认要覆盖请加 --force（会覆盖同名的自定义 unit）",
             )
+
+        accounts = _account_ids(user, group)
+        if accounts is None:
+            raise UsageError(
+                f"系统用户或组不存在：{user}/{group or user}",
+                hint=(
+                    "先创建专用用户（推荐）："
+                    f"sudo useradd --system --no-create-home --shell /usr/sbin/nologin {user}；"
+                    "或用 --user / --group 指定已有账户"
+                ),
+            )
+        uid, gid = accounts
+
+        problem = _access_problem(binary, uid=uid, gid=gid)
+        if problem is not None:
+            raise UsageError(
+                f"服务用户 {user!r} 无法执行 ExecStart 的二进制：{problem}",
+                hint=(
+                    "unit 以专用用户运行，二进制必须对它是可执行的。"
+                    "常见原因是二进制落在 /root 或某个 0700 家目录下（sudo 场景）；"
+                    "请用共享数据目录重装："
+                    "`sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl install`，"
+                    "或调整该路径权限"
+                ),
+            )
+
+        # ProtectHome=true 是挂载隔离，权限位检查看不出来——只能识别路径位置。
+        for label, path in (("二进制", binary), ("实例目录", self.inst.dir)):
+            home_prefix = _protect_home_conflict(path)
+            if home_prefix is not None:
+                raise UsageError(
+                    f"{label}位于 {home_prefix} 下（{path}），会被 unit 的 ProtectHome=true 挡住",
+                    hint=(
+                        "把数据放到系统路径（如 /opt/frpsctl、/etc/frps/instances）再安装托管："
+                        "`sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl install`"
+                    ),
+                )
+
+        unit_config = self.inst.dir / "frps.toml"
+        if not unit_config.exists():
+            raise UsageError(
+                f"unit 需要的配置文件不存在：{unit_config}",
+                hint=(
+                    "ExecStart 固定使用实例目录内的 frps.toml。先 `frpsctl init`，"
+                    "或把配置放到该路径；若你用 --config 指向了别处，systemd 托管不会使用它"
+                ),
+            )
+
+        _ensure_log_dir(log_dir, uid=uid, gid=gid)
+        _hand_over_instance(self.inst, uid=uid, gid=gid)
+
         content = render_unit(
             binary=str(binary),
             config_dir=self.inst.instances_root,
             log_dir=log_dir,
+            user=user,
+            group=group,
         )
         # 先建目录：`unit_dir` 可被注入（测试）或指向一个尚未存在的自定义位置；
         # 真实部署里 /etc/systemd/system 通常存在，但没有理由依赖这一点。

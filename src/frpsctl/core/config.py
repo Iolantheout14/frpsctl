@@ -71,9 +71,26 @@ _MISSING = object()
 VERIFY_TIMEOUT = 30
 
 
+#: 敏感键名后缀（小写比较，覆盖 camelCase 的 clientSecret）。
+_SECRET_SUFFIXES = (".password", ".token", ".clientsecret")
+
+#: 裸键名也算敏感：diff 片段里可能出现不带表头的 `token = "..."`（内联表跨行、
+#: 或用户把键写错了位置）。防御性判定，误伤面为零。
+_BARE_SECRETS = frozenset({"token", "password", "clientsecret"})
+
+
 def is_secret_key(dotted: str) -> bool:
-    """判断一个点分键是否敏感。前后缀匹配以覆盖 `httpPlugins[].*` 之类。"""
-    return dotted in SECRET_KEYS or dotted.endswith(".password") or dotted.endswith(".token")
+    """判断一个点分键是否敏感。
+
+    三类命中：精确名单（`SECRET_KEYS`）、`.password`/`.token`/`.clientSecret`
+    后缀、以及**裸键名**（防止无表头的片段漏判）。
+    """
+    lowered = dotted.lower()
+    return (
+        dotted in SECRET_KEYS
+        or lowered.endswith(_SECRET_SUFFIXES)
+        or lowered in _BARE_SECRETS
+    )
 
 
 def mask_tree(value: Any, *, prefix: str = "", reveal: bool = False) -> Any:
@@ -106,6 +123,132 @@ def mask_tree(value: Any, *, prefix: str = "", reveal: bool = False) -> Any:
 #: 匹配不上，打码静默失效（实测踩过）。首组同时捕获标记、缩进、键名、等号。
 _ASSIGN_RE = re.compile(r"^([-+ ]?)(\s*)([A-Za-z_][\w.-]*)(\s*=\s*)(.*)$")
 
+#: 表头（含 `[[数组表]]`）。必须同时吞掉双方括号——否则 `[[httpPlugins]]` 会把
+#: `[` 混进表名，使该表下的敏感键路径匹配失效（`[foo].token` 匹配不上 `.token`）。
+_TABLE_RE = re.compile(r"^\s*\[\[?([^\[\]]+)\]\]?")
+
+#: 形似敏感键的兜底匹配：仅用于"值解析失败"时的保守打码（见 `mask_diff`）。
+_SECRET_LIKE_RE = re.compile(r"token|password|clientSecret", re.IGNORECASE)
+
+
+def _mask_inline_value(raw: str, prefix: str) -> str | None:
+    """对**单行内**的 TOML 内联表 / 数组做递归打码，返回渲染后的值片段。
+
+    **为什么需要它**：`_ASSIGN_RE` 只能识别 `key = "value"` 这种逐行形式，而
+    TOML 允许把整张表写成内联形式（`auth = { token = "..." }`）——机密就藏在
+    "值"里。实测确认：不处理内联表时 `config diff` 会把 token 原文打印出来，
+    等于给 §10 硬约束 2 开了一个出口。
+
+    借助 `mask_tree` 的完整点分路径匹配（`auth.token` / `webServer.password`），
+    任意深度的内联结构都能被覆盖。
+
+    - 值里没有敏感键 → 返回 None，调用方原样保留该行（diff 可读性优先）。
+    - 顶级值解析失败（多行结构的起始行 / 不完整的行）→ 返回 None，由调用方
+      的**跨行状态机**接手（见 `mask_diff`）。
+    """
+    text = raw.strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        parsed = tomlkit.parse(f"v = {text}")["v"]
+    except Exception:  # noqa: BLE001 - 不完整的行必然解析失败，属正常情形
+        return None
+    plain = parsed.unwrap() if hasattr(parsed, "unwrap") else parsed
+    masked = mask_tree(plain, prefix=prefix)
+    if masked == plain:
+        return None
+    doc = tomlkit.document()
+    doc["v"] = masked
+    rendered = tomlkit.dumps(doc).strip()
+    return rendered[len("v = ") :] if rendered.startswith("v = ") else rendered
+
+
+#: 三引号（多行字符串）标记。
+_TRIPLE_QUOTES = ('"""', "'''")
+
+
+def _triple_quote_open(raw: str) -> str | None:
+    """值以**未闭合**的三引号多行字符串开头时返回该引号，否则 None。
+
+    同一行内出现两次（例如三个双引号包围的完整字符串）说明已经闭合，
+    按普通字符串处理。
+    """
+    text = raw.lstrip()
+    for quote in _TRIPLE_QUOTES:
+        if text.startswith(quote) and text.count(quote) == 1:
+            return quote
+    return None
+
+
+def _bracket_imbalance(text: str) -> int:
+    """粗略的括号深度：`[`/`{` 加一，`]`/`}` 减一。
+
+    不解析字符串字面量——字符串里的括号会让计数偏移，但偏移方向是安全的：
+    要么多遮蔽几行（保守），要么提前结束追踪（后续行仍会被逐行逻辑处理）。
+    """
+    depth = 0
+    for char in text:
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+    return depth
+
+
+def _mask_fragment(text: str, prefix: str) -> str:
+    """对**跨行结构内部**的一行做定点打码；无敏感内容时原样返回。
+
+    续行的两种形态：
+    - 完整的内联表 / 数组片段：`{ token = "x" },`（数组元素）
+    - 裸赋值：`token = "x",`（内联表被拆成了多行书写）
+
+    两者的敏感判定都走完整键路径（`prefix` + 片段内的键），因此
+    `foo.token` 这类"父键不敏感但子键敏感"的片段也能命中。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return text
+    candidate = stripped.rstrip(",")
+    trailing = "," if stripped.endswith(",") else ""
+    indent = text[: len(text) - len(text.lstrip())]
+
+    # 形态一：完整的内联表 / 数组片段
+    if candidate.startswith(("{", "[")):
+        rendered = _mask_inline_value(candidate, prefix)
+        if rendered is not None:
+            return f"{indent}{rendered}{trailing}"
+        if _SECRET_LIKE_RE.search(candidate):
+            return f"{indent}(含疑似机密，已打码){trailing}"
+        return text
+
+    # 形态二：裸赋值片段（内联表跨行书写）
+    fragment = _ASSIGN_RE.match(stripped)
+    if fragment:
+        _, findent, fkey, feq, fraw = fragment.groups()
+        fprefix = f"{prefix}.{fkey}" if prefix else fkey
+        if is_secret_key(fprefix):
+            quote = '"' if fraw.lstrip().startswith('"') else ""
+            return f"{indent}{fkey}{feq}{quote}{_mask_scalar(fraw)}{quote}{trailing}"
+        rendered = _mask_inline_value(fraw.strip().rstrip(","), fprefix)
+        if rendered is not None:
+            return f"{indent}{fkey}{feq}{rendered}{trailing}"
+        if _SECRET_LIKE_RE.search(fraw):
+            return f"{indent}{fkey}{feq}(含疑似机密，已打码){trailing}"
+    return text
+
+
+def _mask_scalar(raw: str) -> str:
+    """打码一个标量值的文本形态（保留首尾便于核对，见 `mask_secret`）。"""
+    from ..cli.ui import mask_secret
+
+    return mask_secret(raw.strip().strip('"'))
+
+
+def _mask_assignment_value(raw: str) -> str:
+    """打码一个单行赋值的右侧值（保留引号形态，便于核对改动）。"""
+    quote = '"' if raw.lstrip().startswith('"') else ""
+    return f"{quote}{_mask_scalar(raw)}{quote}"
+
 
 def mask_diff(diff: str) -> str:
     """把 unified diff 里敏感键的值打码。
@@ -113,14 +256,38 @@ def mask_diff(diff: str) -> str:
     `config diff` / `config rollback` / `config set` 都会展示 diff，而 diff 的
     内容就是配置原文——里面必然包含 `token = "..."` 这样的行。不给它打码，
     前面所有"机密不进日志/不进 --json"的努力都会从这一个出口漏光。
-    """
-    from ..cli.ui import mask_secret
 
+    覆盖路径（由 `_mask_diff` 的状态机逐行执行）：
+    1. 逐行赋值（`token = "..."`）——`is_secret_key` 判定后打码；
+    2. 单行内联表 / 数组（`auth = { token = "..." }`）——解析后按完整点分路径打码；
+    3. **跨行结构**（三引号多行字符串、多行内联表 / 数组）——追踪到闭合，
+       期间逐行定点打码（`_mask_fragment`）；
+    4. 解析失败但形似含机密——保守整体打码（宁可少一段 diff 信息）。
+    """
     out_lines: list[str] = []
     current_table = ""
+    #: 跨行敏感值的追踪状态（见 `_triple_quote_open` / `_bracket_imbalance`）。
+    pending_quote: str | None = None
+    bracket_depth = 0
+    bracket_prefix = ""
+
     for line in diff.splitlines():
-        stripped = line.lstrip("+-")
-        table_match = re.match(r"^\s*\[([^\]]+)\]", stripped)
+        marker = "-" if line.startswith("-") else ("+" if line.startswith("+") else " ")
+        body = line.lstrip("+-")
+
+        # --- 跨行结构内部：定点打码，直到闭合 ---
+        if pending_quote is not None:
+            out_lines.append(f"{marker}(敏感值续行，已打码)")
+            if body.count(pending_quote) >= 1:
+                pending_quote = None
+            continue
+        if bracket_depth > 0:
+            out_lines.append(f"{marker}{_mask_fragment(body, bracket_prefix)}")
+            bracket_depth = max(0, bracket_depth + _bracket_imbalance(body))
+            continue
+
+        # --- 正常行 ---
+        table_match = _TABLE_RE.match(body)
         if table_match:
             current_table = table_match.group(1).strip()
             out_lines.append(line)
@@ -131,13 +298,42 @@ def mask_diff(diff: str) -> str:
             continue
         marker, indent, key, eq, raw = match.groups()
         prefix = f"{current_table}.{key}" if current_table else key
-        if not is_secret_key(prefix):
-            out_lines.append(line)
+        if is_secret_key(prefix):
+            quote = _triple_quote_open(raw)
+            if quote is not None:
+                # 多行字符串：值本身打码，后续行进入遮蔽状态
+                out_lines.append(f"{marker}{indent}{key}{eq}(敏感值，已打码)")
+                pending_quote = quote
+                continue
+            imbalance = _bracket_imbalance(raw)
+            if raw.lstrip().startswith(("[", "{")) and imbalance > 0:
+                # 多行内联结构：值本身打码，续行交给 `_mask_fragment`
+                out_lines.append(f"{marker}{indent}{key}{eq}(敏感值，已打码)")
+                bracket_depth = imbalance
+                bracket_prefix = prefix
+                continue
+            out_lines.append(f"{marker}{indent}{key}{eq}{_mask_assignment_value(raw)}")
             continue
-        # 保留引号形态，只替换值
-        quote = '"' if raw.lstrip().startswith('"') else ""
-        masked = mask_secret(raw.strip().strip('"'))
-        out_lines.append(f"{marker}{indent}{key}{eq}{quote}{masked}{quote}")
+        masked_value = _mask_inline_value(raw, prefix)
+        if masked_value is not None:
+            out_lines.append(f"{marker}{indent}{key}{eq}{masked_value}")
+            continue
+        if raw.strip().startswith(("[", "{")):
+            imbalance = _bracket_imbalance(raw)
+            if imbalance > 0:
+                # 非敏感键的多行结构：本身通常不改动，但**起始行内可能已经
+                # 写了敏感片段**（`foo = { token = "x"`），且续行里也可能有
+                # （`{ token = "..." },`）。统一交给 `_mask_fragment` 定点处理。
+                bracket_depth = imbalance
+                bracket_prefix = prefix
+                out_lines.append(f"{marker}{indent}{key}{eq}{_mask_fragment(raw, prefix)}")
+                continue
+            if _SECRET_LIKE_RE.search(raw):
+                # 解析失败（diff 行可能被截断）却形似含机密：保守打码。
+                # 代价只是 diff 少一段展示，而放行的代价是机密泄露。
+                out_lines.append(f"{marker}{indent}{key}{eq}(含疑似机密，已打码)")
+                continue
+        out_lines.append(line)
     return "\n".join(out_lines) + ("\n" if diff.endswith("\n") else "")
 
 
@@ -160,6 +356,14 @@ def atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
         # 会留下一个指向已删除文件的打开 fd（实测新增 fd 未释放）。
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             os.fchmod(handle.fileno(), mode)  # 先定权限再写内容，无权限窗口
+            # 保留原属主：systemd 部署会把配置/目录**移交**给服务用户（§12.2），
+            # 重建文件若把属主换回安装者（root），服务用户下次启动就读不到配置
+            # ——unit 直接失败，而报错现场离 config set 很远。
+            # 非 root 或 FS 不支持 fchown 时保持常规语义（新文件属于当前用户），
+            # 因此失败不阻断：那两种情况本来就不该由本进程改变属主。
+            with contextlib.suppress(OSError):
+                old = os.stat(path)
+                os.fchown(handle.fileno(), old.st_uid, old.st_gid)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())

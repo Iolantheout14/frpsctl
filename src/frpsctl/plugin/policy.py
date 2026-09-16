@@ -17,12 +17,12 @@ frps 发请求时只带 `X-Frp-Reqid` 与 `Content-Type`（`http.go:104-105`）�
 
 from __future__ import annotations
 
-import ipaddress
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..core.healthcheck import is_loopback
 from ..errors import ConfigError, UsageError
 from .quota import QuotaResult
 
@@ -198,7 +198,7 @@ class PluginPolicy:
         暴露到非回环等于把"谁能登录 frps"的决定权交给网络上任何人。
         """
         host = _host_of(bind)
-        if not _is_loopback(host):
+        if not is_loopback(host):
             raise UsageError(
                 f"插件拒绝绑定非回环地址：{bind}",
                 hint=(
@@ -437,15 +437,6 @@ def _host_of(bind: str) -> str:
     if text.count(":") == 1:
         return text.rsplit(":", 1)[0]
     return text
-
-
-def _is_loopback(host: str) -> bool:
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def _glob_match(pattern: str, value: str) -> bool:

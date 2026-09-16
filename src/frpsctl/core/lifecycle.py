@@ -31,7 +31,7 @@ from ..errors import (
 )
 from . import platform as plat
 from .health import HealthLayer, HealthReport, probe_plugins
-from .healthcheck import parse_dashboard, parse_plugin_targets
+from .healthcheck import ListenInfo, parse_dashboard, parse_listen, parse_plugin_targets
 from .instance import Instance
 from .lock import instance_lock
 from .version import (
@@ -177,6 +177,8 @@ class StatusReport:
     systemd_main_pid: int | None = None
     #: state.json 损坏（无法判断进程归属）。status 必须如实报告而不是崩掉。
     state_corrupted: bool = False
+    #: 控制连接监听（`bindAddr:bindPort`，附录 A 默认 0.0.0.0:7000）。
+    listen: ListenInfo | None = None
 
     @property
     def binary_matches_disk(self) -> bool:
@@ -378,6 +380,11 @@ class Lifecycle:
                     raise StartupFailed(self._startup_tail())
                 self._write_state(proc, version=version)
                 health = self._await_health(health_timeout)
+                if health.l1_process is HealthLayer.FAIL:
+                    # 进程在早退检测窗口（STARTUP_GRACE）**之后**才死。这仍是
+                    # "启动失败"（不是"起来了但不健康"）：进程已经不在，必须
+                    # 按失败收尾并清理 state.json，否则会留下假 RUNNING 状态。
+                    raise StartupFailed(self._startup_tail())
                 # ADR-3：确认 v2 API 真的在。版本门槛（§3.6）已保证 >= 0.70.0，
                 # 因此这里拿到 404 说明**二进制与预期不符**（例如 --binary 指向
                 # 自编译的怪版本）——报错退出 7，不猜、不降级。
@@ -540,6 +547,10 @@ class Lifecycle:
         deadline = time.monotonic() + max(0.0, timeout)
         report = self.check_health()
         while not report.gate and time.monotonic() < deadline:
+            if report.l1_process is HealthLayer.FAIL:
+                # 进程已经不在了：继续等不可能等出 gate=True，立即返回，
+                # 让调用方按"启动失败"收尾（`start` 会清理 state.json）。
+                return report
             time.sleep(0.3)
             report = self.check_health()
         return report
@@ -693,6 +704,7 @@ class Lifecycle:
     def status(self) -> StatusReport:
         """聚合状态（§7.4）。不抛异常——`status` 必须永远能回答"现在什么情况"。"""
         corrupted = self.inst.state_corrupted()
+        listen = parse_listen(self.inst.config)
         if corrupted:
             # status 必须**永远**能回答"现在什么情况"，不能因为状态文件损坏就
             # 以异常收场。这里如实报告"不可判定"，把处置交给用户（stop/start
@@ -708,6 +720,7 @@ class Lifecycle:
                 config=self.inst.config if self.inst.config.exists() else None,
                 config_mode=mode,
                 state_corrupted=True,
+                listen=listen,
             )
         state, ref = self.state()
         owner = self.resolve_owner()
@@ -771,6 +784,7 @@ class Lifecycle:
             systemd_unit=unit_name,
             systemd_main_pid=unit_pid,
             state_corrupted=corrupted,
+            listen=listen,
         )
 
 

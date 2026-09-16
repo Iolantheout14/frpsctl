@@ -35,6 +35,7 @@ __all__ = [
     "OwnershipConflict",
     "LockBusy",
     "UnsupportedPlatform",
+    "UnhealthyAfterStart",
 ]
 
 
@@ -53,6 +54,7 @@ class ExitCode(IntEnum):
     ROLLED_BACK = 9
     STARTUP_FAILED = 10
     OWNERSHIP_CONFLICT = 11
+    UNHEALTHY = 12
 
 
 class FrpsctlError(Exception):
@@ -215,6 +217,28 @@ class OwnershipConflict(FrpsctlError):
     """身份校验不通过 / systemd 与 direct 混用（ADR-1、ADR-7）。"""
 
     exit_code = ExitCode.OWNERSHIP_CONFLICT
+
+
+class UnhealthyAfterStart(FrpsctlError):
+    """进程已启动，但健康 gate（L1 ∧ L2）未通过（§3.7）。
+
+    与 `StartupFailed` 的区别在"进程还在不在"：那个是进程根本没起来（或以
+    早退收场），这个是进程在跑、但控制面探针失败。两者的处置完全不同——
+    直接重试 `start` 只会得到 AlreadyRunning(6)，正确动作是先 `status`、
+    检查 dashboard 端口，或等控制面恢复。独立退出码（12）就是为了让脚本
+    能区分这两种情形。
+
+    ⚠️ 进程**不会被清理**：它仍由本工具托管（state.json 保留），`status`
+    看得见、`stop` 停得掉。
+    """
+
+    exit_code = ExitCode.UNHEALTHY
+
+    def __init__(self, pid: int, detail: str = "") -> None:
+        super().__init__(
+            f"实例已启动（pid {pid}），但健康检查未通过",
+            hint=detail or "用 `frpsctl status` 查看详情，或检查 dashboard 端口是否被占用",
+        )
 
 
 # --- 控制面（7） --------------------------------------------------------

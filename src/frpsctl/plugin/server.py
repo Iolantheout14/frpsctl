@@ -256,6 +256,11 @@ class PluginServer:
         审计恰恰是"谁在什么时候申请了什么端口"的唯一记录，停机时丢掉它是最不该
         丢的时候。转成 KeyboardInterrupt 后走的是同一条优雅退出路径。
 
+        ⚠️ `signal.signal` **必须在 try 内**：handler 安装与 `serve_forever()`
+        之间有一个窗口，若信号恰在此刻到达，而 finally 尚未生效，审计同样会丢。
+        放进 try 之后，只要 handler 被装上，任何时刻的 SIGTERM 都会走到
+        `close()`（含刷盘）。
+
         退出语义：**先 `close()`（含审计刷盘），再把 `KeyboardInterrupt` 放出去**，
         由调用方决定怎么收尾（CLI 打印审计摘要，`serve()` 直接冒到顶层）。
         """
@@ -264,8 +269,8 @@ class PluginServer:
         assert self._httpd is not None
 
         previous = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
         try:
+            signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
             self._httpd.serve_forever()
         finally:
             # 关闭只在这里发生（CLI 不再重复 close）。关完再把 KeyboardInterrupt

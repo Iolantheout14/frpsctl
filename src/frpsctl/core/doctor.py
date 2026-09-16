@@ -25,7 +25,7 @@ from pathlib import Path
 from ..errors import FrpsctlError
 from .config import config_flags
 from .health import HealthLayer, probe_plugins
-from .healthcheck import parse_dashboard, parse_plugin_targets
+from .healthcheck import is_loopback, parse_dashboard, parse_plugin_targets
 from .instance import Instance
 from .lifecycle import Lifecycle, Owner, State
 from .lock import is_locked
@@ -225,7 +225,7 @@ def _check_dashboard(inst: Instance) -> list[Finding]:
         )
         return out
 
-    loopback = dash.addr in ("127.0.0.1", "::1", "localhost")
+    loopback = is_loopback(dash.addr)
     if not loopback and not dash.auth_enabled:
         out.append(
             Finding(
@@ -461,7 +461,7 @@ def _check_plugins(inst: Instance) -> list[Finding]:
         return out
 
     for target in targets:
-        if not _is_loopback_host(target.host):
+        if not is_loopback(target.host):
             out.append(
                 Finding(
                     "插件暴露面",
@@ -487,14 +487,3 @@ def _check_plugins(inst: Instance) -> list[Finding]:
     else:
         out.append(Finding("插件可达性", Severity.INFO, f"{len(targets)} 个目标可达"))
     return out
-
-
-def _is_loopback_host(host: str) -> bool:
-    import ipaddress
-
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False

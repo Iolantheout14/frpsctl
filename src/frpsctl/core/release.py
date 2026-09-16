@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import threading
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,7 @@ __all__ = [
     "download_checksums",
     "expected_sha256",
     "install",
+    "resolve_mirrors",
     "switch_symlink",
     "arch_tag",
     "os_tag",
@@ -97,6 +99,22 @@ def arch_tag() -> str:
 def asset_name(version: str) -> str:
     """发布资产名，如 `frp_0.71.0_linux_amd64.tar.gz`。"""
     return f"frp_{version}_{os_tag()}_{arch_tag()}.tar.gz"
+
+
+def resolve_mirrors(extra: Sequence[str] = ()) -> tuple[str, ...]:
+    """解析下载源列表。优先级：**CLI 参数 > `FRPSCTL_MIRROR`（逗号分隔）> 内置**。
+
+    CLI 给的是**替换**而不是追加：用户指定镜像通常意味着"内置源在我这里不通"，
+    此时他要的是"用我给的这几个"，而不是"再试一遍刚才失败的"。
+
+    空项被忽略、尾斜杠被规整（URL 拼接时统一补 `rstrip('/')`，避免 `//v0.71.0`）。
+    """
+    cleaned = tuple(item.strip().rstrip("/") for item in extra if item.strip())
+    if cleaned:
+        return cleaned
+    env = os.environ.get("FRPSCTL_MIRROR", "")
+    from_env = tuple(item.strip().rstrip("/") for item in env.split(",") if item.strip())
+    return from_env or DEFAULT_MIRRORS
 
 
 @dataclass(frozen=True)
@@ -259,11 +277,21 @@ def install(
     if not place_frps and not place_frpc:
         # 两边都已在盘上：不碰网络。但**换链仍要照做**——用户没加 `--only-download`
         # 时，"让 bin/frps 指向这个版本"就是他要的结果（幂等，且修得回手工改歪的链）。
-        # `switched` 如实反映"这次是否真的建立了指向"。
-        switched = switch
+        # `switched` / `switched_frpc` 如实反映"这次是否真的建立了指向"。
         if switch:
             switch_symlink(bin_dir / "frps", dest)
-        return InstallResult(version=version, binary=dest, switched=switched, downloaded=False)
+            switched_frpc = with_frpc and frpc_dest.exists()
+            if switched_frpc:
+                switch_symlink(bin_dir / "frpc", frpc_dest)
+        else:
+            switched_frpc = False
+        return InstallResult(
+            version=version,
+            binary=dest,
+            switched=switch,
+            downloaded=False,
+            switched_frpc=switched_frpc,
+        )
 
     from ..cli.ui import trace
 
@@ -296,9 +324,12 @@ def install(
 
     # 4b) 可按需附带 frpc（供插件契约测试使用）。它与 frps 的落盘判定互相独立，
     #     因此"已有 frps"时也能补装。
+    #     `--only-download`（switch=False）对 frps 与 frpc **一视同仁**：都只落盘、
+    #     不动软链——同一命令两套语义会让"先备好、再统一切换"的运维节奏失效。
     if place_frpc:
         _place_binary(blob, member="frpc", dest=frpc_dest)
-        switch_symlink(bin_dir / "frpc", frpc_dest)
+        if switch:
+            switch_symlink(bin_dir / "frpc", frpc_dest)
 
     # 5) 切换（不影响运行中的进程）。`--only-download` 时 place_frps 只由 force 决定，
     #    此时不该动链，因此这里再判一次 switch。
@@ -309,7 +340,7 @@ def install(
         binary=dest,
         switched=switch and place_frps,
         downloaded=True,
-        switched_frpc=place_frpc,
+        switched_frpc=place_frpc and switch,
     )
 
 

@@ -9,4 +9,6 @@ from __future__ import annotations
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+#: 版本号唯一来源：pyproject.toml 通过 hatchling 从这里读取（tool.hatch.version）。
+#: 发布新版本时只改这里，然后打 `v<version>` tag——release workflow 会校验两者一致。
+__version__ = "0.2.0"

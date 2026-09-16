@@ -22,6 +22,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ..errors import ConfigError
+from .healthcheck import is_loopback
 
 __all__ = [
     "ServerConfig",
@@ -216,7 +217,7 @@ def check_dangerous_combination(data: dict[str, Any]) -> str | None:
     if not isinstance(port, int) or port <= 0:
         return None  # 未启用 dashboard，不存在暴露面
     addr = str(web.get("addr") or "127.0.0.1")
-    if _is_loopback(addr):
+    if is_loopback(addr):
         return None
     user = web.get("user") or ""
     password = web.get("password") or ""
@@ -226,22 +227,6 @@ def check_dangerous_combination(data: dict[str, Any]) -> str | None:
         f"webServer 绑定非回环地址 {addr}:{port}，且 user/password 均为空 = "
         "**完全不鉴权**（任何人都能读取全部状态并下线任意代理）"
     )
-
-
-def _is_loopback(addr: str) -> bool:
-    import ipaddress
-
-    host = addr.strip()
-    if host.startswith("["):  # [::1]:7500 形式
-        host = host[1:].split("]", 1)[0]
-    elif host.count(":") == 1:
-        host = host.rsplit(":", 1)[0]
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def validate_mapping(data: dict[str, Any]) -> ServerConfig:

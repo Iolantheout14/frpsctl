@@ -74,7 +74,14 @@ class QuotaChecker:
         self._clock = clock
         self._local: dict[str, int] = {}
         self._cache: dict[str, tuple[float, int, str]] = {}
+        #: 全局锁只保护共享字典（`_local` / `_cache` / `_user_locks`），
+        #: **绝不包住网络调用**。
         self._lock = threading.Lock()
+        #: 按用户拆分的"读-判-占"锁。为什么不用一把全局锁：frp 侧对插件的
+        #: HTTP 客户端**没有超时**（§11.2），dashboard 查询一旦变慢，全局锁会
+        #: 把所有用户的登录链路一起挂住。拆到用户级后，只有同一用户的并发
+        #: NewProxy 互相串行（这正是正确性需要的），不同用户完全并行。
+        self._user_locks: dict[str, threading.Lock] = {}
 
     # --- 查询 ----------------------------------------------------------
 
@@ -144,10 +151,13 @@ class QuotaChecker:
     def check(self, user: str, limit: int, *, reserve: bool = False) -> QuotaResult:
         """还能再建吗？`limit <= 0` 表示不限。
 
-        `reserve=True` 时**检查与预占在同一次持锁中完成**。这不是优化，是正确性：
-        原先"读计数 → 决策 → 事后 +1"是典型的 check-then-act，两个并发的
-        NewProxy 会同时读到旧计数并双双通过（实测 limit=1 时两个都拿到 0）。
-        frp 的 NewProxy 回调确实可能并发（多客户端同时上线）。
+        `reserve=True` 时"检查 + 预占"在**同一用户的锁内**完成。这不是优化，
+        是正确性：原先"读计数 → 决策 → 事后 +1"是典型的 check-then-act，
+        两个并发的 NewProxy 会同时读到旧计数并双双通过（实测 limit=1 时
+        两个都拿到 0）。frp 的 NewProxy 回调确实可能并发（多客户端同时上线）。
+
+        **网络调用在用户锁内、全局锁外**：dashboard 查询只在缓存未命中时发生，
+        只影响当前用户，与全局锁无关。
         """
         if limit <= 0:
             return QuotaResult(allowed=True, limit=0, source="unlimited")
@@ -156,30 +166,54 @@ class QuotaChecker:
             count, source = self.current(user)
             return self._verdict(user, count, source, limit)
 
-        # 预占路径：把计数查询也放进锁内，避免并发下两个请求都看到旧值。
-        # 查询本身可能走网络（dashboard），因此锁只保护"读-判-占"这段临界区，
-        # 网络调用放在锁内是因为它正是"读计数"这一步——无法拆开。
-        with self._lock:
-            local = self._local.get(user, 0)
-            count, source = local, "local"
-            if self.admin_url:
+        with self._lock_for(user):
+            # 快路径：缓存命中（或纯本地模式）→ 不做任何网络调用。
+            with self._lock:
+                local = self._local.get(user, 0)
                 cached = self._cache.get(user)
-                if cached is not None and self._clock() - cached[0] <= self.cache_ttl:
-                    count, source = max(cached[1], local), cached[2]
-            if source == "local" and self.admin_url:
-                # 缓存未命中：锁内查一次（见上方说明）
-                try:
-                    fresh = self._query_dashboard(user)
-                except Exception:  # noqa: BLE001
-                    fresh = None
+            if cached is not None and self._clock() - cached[0] <= self.cache_ttl:
+                return self._settle(user, max(cached[1], local), cached[2], limit)
+            if not self.admin_url:
+                return self._settle(user, local, "local", limit)
+
+            # 慢路径：缓存未命中 → 查一次 dashboard。可能耗时（网络），
+            # 但只影响这个用户；查询期间的本地新增计数在 `_settle` 前重新读取。
+            fresh: int | None
+            try:
+                fresh = self._query_dashboard(user)
+            except Exception:  # noqa: BLE001 - 查不到不能变成"建不了代理"
+                fresh = None
+            with self._lock:
+                current_local = self._local.get(user, 0)
                 if fresh is not None:
                     self._cache[user] = (self._clock(), fresh, "dashboard")
-                    count, source = max(fresh, local), "dashboard"
-            verdict = self._verdict(user, count, source, limit)
-            if verdict.allowed:
-                self._local[user] = local + 1  # 预占名额
+                    count, source = max(fresh, current_local), "dashboard"
+                else:
+                    count, source = current_local, "local"
+            # `_settle` 自己会取全局锁，**必须**在离开上面的 with 之后调用
+            # （threading.Lock 不可重入，锁内取锁会自我死锁）。
+            return self._settle(user, count, source, limit)
+
+    def _lock_for(self, user: str) -> threading.Lock:
+        with self._lock:
+            lock = self._user_locks.get(user)
+            if lock is None:
+                lock = threading.Lock()
+                self._user_locks[user] = lock
+            return lock
+
+    def _settle(self, user: str, count: int, source: str, limit: int) -> QuotaResult:
+        """判定并按需预占一个名额（必须在用户锁内调用）。
+
+        预占用**增量**写法：`note_created` / `note_closed` 可能在两次持锁之间
+        修改过 `_local`（CloseProxy 回调不经过用户锁），直接赋值会覆盖它们。
+        """
+        verdict = self._verdict(user, count, source, limit)
+        if verdict.allowed:
+            with self._lock:
+                self._local[user] = self._local.get(user, 0) + 1
                 self._cache.pop(user, None)
-            return verdict
+        return verdict
 
     def _verdict(self, user: str, count: int, source: str, limit: int) -> QuotaResult:
         if count >= limit:

@@ -82,6 +82,8 @@ def apply_change(
     restart: bool = True,
     health_timeout: float = 10.0,
     restore_lifecycle: Lifecycle | None = None,
+    snapshot_action: str | None = None,
+    snapshot_detail: str | None = None,
 ) -> ChangeOutcome:
     """把一份候选配置落盘，并按需重启 + 回滚。
 
@@ -90,6 +92,10 @@ def apply_change(
 
     `restore_lifecycle` 仅在测试中注入：回滚后的重启应当用**同一套**生命周期
     配置（否则测试会用一个"必定成功"的替身掩盖回滚失败的真实行为）。
+
+    `snapshot_action` / `snapshot_detail` 覆盖快照的记账文案：`rollback_to`
+    复用同一个闭环，但它的"变更前备份"应当标注为 `rollback N` 而不是
+    `set (...)`。**快照只在锁内创建一次**，它同时承担"回滚恢复来源"。
     """
     # binary_version() 会执行 §3.6 的版本门槛校验（不达标即抛），
     # 因此即使返回值用不上也不能省——但确实不需要保留这个变量。
@@ -110,8 +116,13 @@ def apply_change(
         # （把 user 改成空串本身无害，加上 addr=0.0.0.0 才是缺口）。
         _reject_dangerous_combination(new_text)
 
-        # 6. 备份
-        snapshot = config_snapshot(inst, action=f"set {dotted}", detail=change_diff[:2000])
+        # 6. 备份。这是本次变更**唯一**的快照：它既是变更前的留档，也是第 8 步
+        #    失败回滚的恢复来源。动作名可由调用方覆盖（rollback 走同一闭环）。
+        snapshot = config_snapshot(
+            inst,
+            action=snapshot_action or f"set {dotted}",
+            detail=snapshot_detail if snapshot_detail is not None else change_diff[:2000],
+        )
         previous_text = inst.config.read_text("utf-8") if inst.config.exists() else None
 
         # 7. 原子替换
@@ -202,8 +213,10 @@ def rollback_to(
     current_text = inst.config.read_text("utf-8") if inst.config.exists() else ""
     diff = cfg.diff_texts(current_text, new_text, inst.config.name)
 
-    # 回滚前先把"当前"也存一份——否则回滚本身不可撤销
-    config_snapshot(inst, action=f"rollback {steps}", detail=f"目标快照 {target.parent.name}")
+    # "回滚前先把当前存一份"由 apply_change 在**实例锁内**完成（它本来就要备份
+    # 变更前的配置）。此前这里是单独一次 config_snapshot，导致一次回滚产生
+    # **两份内容完全相同**的快照：10 份历史实际只够 5 次操作，`rollback N`
+    # 的计数里一半是重复项；而且那次快照发生在锁外，并发下顺序不可靠。
     return apply_change(
         inst,
         dotted=f"(rollback {steps} → {target.parent.name})",
@@ -215,6 +228,8 @@ def rollback_to(
         restart=restart,
         health_timeout=health_timeout,
         restore_lifecycle=restore_lifecycle,
+        snapshot_action=f"rollback {steps}",
+        snapshot_detail=f"目标快照 {target.parent.name}",
     )
 
 

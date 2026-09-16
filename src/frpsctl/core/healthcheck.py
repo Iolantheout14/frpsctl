@@ -12,15 +12,61 @@
 
 from __future__ import annotations
 
+import ipaddress
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-__all__ = ["DashboardInfo", "PluginTarget", "parse_dashboard", "parse_plugin_targets"]
+__all__ = [
+    "DashboardInfo",
+    "ListenInfo",
+    "PluginTarget",
+    "is_loopback",
+    "parse_dashboard",
+    "parse_listen",
+    "parse_plugin_targets",
+]
+
+
+def is_loopback(addr: str) -> bool:
+    """地址是否指向回环。兼容裸 host、`host:port`、`[v6]:port` 三种写法。
+
+    **全项目共用一份判据**：schema 的"危险组合"拦截、doctor 的暴露面检查、
+    插件的绑回环硬约束都依赖它。各写一份迟早出现"一处放行、一处拒绝"的
+    安全缝隙（`127.0.0.2` 这类回环网段地址就是典型的分歧点）。
+    """
+    host = addr.strip()
+    if host.startswith("["):  # [::1]:7500 形式
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:  # host:port 形式（IPv6 冒号多于一个，不切）
+        host = host.rsplit(":", 1)[0]
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 #: frp 的 `WebServerConfig.Complete()` 兜底地址。
 DEFAULT_DASHBOARD_ADDR = "127.0.0.1"
+
+#: frp 的生效默认监听（附录 A）：bindAddr = 0.0.0.0、bindPort = 7000。
+DEFAULT_BIND_ADDR = "0.0.0.0"
+DEFAULT_BIND_PORT = 7000
+
+
+@dataclass(frozen=True)
+class ListenInfo:
+    """控制连接监听信息（`bindAddr:bindPort`）。"""
+
+    addr: str
+    port: int
+
+    @property
+    def display(self) -> str:
+        host = f"[{self.addr}]" if ":" in self.addr and not self.addr.startswith("[") else self.addr
+        return f"{host}:{self.port}"
 
 
 @dataclass(frozen=True)
@@ -85,6 +131,30 @@ def parse_dashboard(config_path: Path) -> DashboardInfo:
         user=str(section.get("user") or ""),
         password=str(section.get("password") or ""),
     )
+
+
+def parse_listen(config_path: Path) -> ListenInfo | None:
+    """解析控制端口监听（`bindAddr` / `bindPort`，附录 A 的生效默认值）。
+
+    返回 None 仅表示"配置不可读/不可解析"（文件缺失、语法错误）；**合法的
+    空配置**仍返回默认值 `0.0.0.0:7000`——那是 frp 的生效值，不是"无监听"。
+    `bindPort` <= 0 视为无意义（返回 None）。
+    """
+    try:
+        raw = config_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    addr = str(data.get("bindAddr") or DEFAULT_BIND_ADDR)
+    port = _as_int(data.get("bindPort"), DEFAULT_BIND_PORT)
+    if port <= 0:
+        return None
+    return ListenInfo(addr=addr, port=port)
 
 
 def parse_plugin_targets(config_path: Path) -> list[PluginTarget]:
