@@ -76,9 +76,16 @@ def warn(text: str) -> None:
     sys.stderr.write(text + "\n")
 
 
-def emit_json(payload: Any) -> None:
-    """机器可读输出。`default=str` 兜住 Path/Enum 之类，避免序列化失败。"""
-    sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
+def emit_json(payload: Any, *, compact: bool = False) -> None:
+    """机器可读输出。`default=str` 兜住 Path/Enum 之类，避免序列化失败。
+
+    `compact=True` 输出**单行** JSON（NDJSON）：`status --watch --json` 会连续
+    输出多个对象，多行缩进格式无法被 `jq -c` / 逐行消费工具处理。
+    """
+    if compact:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    else:
+        sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
 def human_bytes(count: int) -> str:

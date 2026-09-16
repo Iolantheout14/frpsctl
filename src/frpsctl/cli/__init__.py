@@ -12,7 +12,9 @@ import json
 import os
 import secrets
 import subprocess
+import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import typer
@@ -24,12 +26,19 @@ from ..core import healthcheck, release
 from ..core import platform as plat
 from ..core.admin import AdminClient, sum_proxy_types
 from ..core.instance import Instance
-from ..core.lifecycle import Lifecycle, State
-from ..core.systemd import Systemd
+from ..core.lifecycle import Lifecycle, StartReport, State
+from ..core.systemd import DEFAULT_SERVICE_USER, Systemd
 from ..core.transaction import apply_change, rollback_to
+from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
-from ..errors import AdminUnreachable, AlreadyRunning, ConfigError, FrpsctlError
+from ..errors import (
+    AdminUnreachable,
+    AlreadyRunning,
+    ConfigError,
+    FrpsctlError,
+    UnhealthyAfterStart,
+)
 from . import ui
 from .context import AppContext, build_context, run_cli
 
@@ -66,8 +75,21 @@ class _AnywhereGroup(typer.core.TyperGroup):
         hoisted: list[str] = []
         rest: list[str] = []
         index = 0
+        # `--` 之后的一切都是**位置参数**，绝不能再前移：用户显式声明了
+        # "后面的 --json 是值而不是选项"（例如 `config set k -- --json`）。
+        # 不遵守它会把值搬走，参数解析直接错位成 MissingParameter。
+        terminated = False
         while index < len(args):
             item = args[index]
+            if terminated:
+                rest.append(item)
+                index += 1
+                continue
+            if item == "--":
+                rest.append(item)
+                index += 1
+                terminated = True
+                continue
             if item in _GLOBAL_BOOL_FLAGS:
                 hoisted.append(item)
                 index += 1
@@ -91,7 +113,9 @@ class _AnywhereGroup(typer.core.TyperGroup):
 
 
 app = typer.Typer(
-    add_completion=False,
+    # 开启 shell 补全（`--install-completion` / `--show-completion`）。
+    # 关闭它会让 `frpsctl conf<TAB>` 这类日常操作永远不可用——没有理由关。
+    add_completion=True,
     # 关掉 Click 的自动帮助：缺子命令属于**用法错误**，应当走退出码 2（§7.3），
     # 而不是打印帮助后退出 0 —— 那会让脚本误判为成功。
     no_args_is_help=False,
@@ -190,7 +214,16 @@ def _admin(app_ctx: AppContext) -> AdminClient | None:
 @app.command()
 def install(
     ctx: typer.Context,
-    version: str = typer.Option("0.71.0", "--version", help="要安装的 frps 版本"),
+    version: str = typer.Option(
+        ".".join(map(str, RECKONED_VERSION)),
+        "--version",
+        help="要安装的 frps 版本（默认当前推荐版本）",
+    ),
+    mirror: list[str] = typer.Option(
+        None,
+        "--mirror",
+        help="下载源，可重复指定；默认内置源（也可用 FRPSCTL_MIRROR，逗号分隔）",
+    ),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     force: bool = typer.Option(False, "--force", help="已存在同版本时重新下载"),
     only_download: bool = typer.Option(False, "--only-download", help="只落盘，不切换软链（§8.6.1）"),
@@ -202,12 +235,14 @@ def install(
     """下载官方 frps 二进制并强校验 sha256。
 
     低于 0.70.0 的版本会被直接拒绝——它们没有 v2 Admin API（§3.6）。
+    镜像只影响可用性、不影响信任：信任锚始终是官方校验和文件。
     """
     app_ctx = _ctx(ctx).with_json(json_output)
     app_ctx.instance.ensure_dirs()
     result = release.install(
         bin_dir=app_ctx.instance.bin_dir,
         version=version,
+        mirrors=release.resolve_mirrors(mirror or ()),
         insecure=insecure,
         force=force,
         switch=not only_download,
@@ -304,6 +339,10 @@ def init(
         dash_password=dash_password,
         ranges=ranges,
     )
+    # 生成后先做一次语义自检（毫秒级）：init 是配置的源头，它的产物必须自身
+    # 合法。此前 `--bind-port 99999` 会先生成、等到 verify/start 才报错——
+    # 一个必然失败的配置本不该落盘。
+    cfg.validate_semantics(text)
     cfg.atomic_write(target, text, mode=0o600)
 
     if app_ctx.json:
@@ -477,10 +516,19 @@ def _config_uses_unsafe(text: str) -> bool:
 def start(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
-    foreground: bool = typer.Option(False, "--foreground", help="前台运行（不派生）"),
-    health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    foreground: bool = typer.Option(
+        False,
+        "--foreground",
+        help="前台运行（调试用：不写 state、脱离本工具的托管，stop 管不到它）",
+    ),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
 ) -> None:
-    """启动实例：verify → 加锁 → 派生 → 早退检测 → 写 state → 健康检查。"""
+    """启动实例：verify → 加锁 → 派生 → 早退检测 → 写 state → 健康检查。
+
+    健康 gate（L1 ∧ L2）未通过时退出码为 12，但进程仍被托管（`status`/`stop` 可用）。
+    """
     app_ctx = _ctx(ctx).with_json(json_output)
     lc = _lifecycle(app_ctx)
 
@@ -507,6 +555,7 @@ def start(
         ui.emit(f"已启动：pid {report.pid}，frps {report.version}")
         ui.emit(f"health   : {report.health.render()}")
     _emit_health_warnings(report.health)
+    _require_healthy(report)
 
 
 @app.command()
@@ -514,7 +563,7 @@ def stop(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     force: bool = typer.Option(False, "--force", help="直接 SIGKILL（不做 SIGTERM 等待）"),
-    timeout: float = typer.Option(10.0, "--timeout", help="SIGTERM 后等待秒数"),
+    timeout: float = typer.Option(10.0, "--timeout", min=0, help="SIGTERM 后等待秒数"),
 ) -> None:
     """停止实例。身份校验不通过时**拒绝**（退出码 11），绝不冒险 kill。"""
     app_ctx = _ctx(ctx).with_json(json_output)
@@ -529,8 +578,10 @@ def stop(
 def restart(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
-    timeout: float = typer.Option(10.0, "--timeout", help="停止等待秒数"),
-    health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    timeout: float = typer.Option(10.0, "--timeout", min=0, help="停止等待秒数"),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
 ) -> None:
     """重启实例（stop → start）。配置变更请用 `config set`，它会自动回滚。"""
     app_ctx = _ctx(ctx).with_json(json_output)
@@ -545,6 +596,7 @@ def restart(
         ui.emit(f"已重启：pid {report.pid}，frps {report.version}")
         ui.emit(f"health   : {report.health.render()}")
     _emit_health_warnings(report.health)
+    _require_healthy(report)
 
 
 def _start_payload(report) -> dict:
@@ -572,12 +624,34 @@ def _emit_health_warnings(health) -> None:
         ui.warn(f"⚠ {warning}")
 
 
+def _require_healthy(report: StartReport) -> None:
+    """健康 gate（L1 ∧ L2）未通过时以退出码 12 收场（§3.7）。
+
+    为什么必须非零：`start` 的语义是"服务可用"，而 gate 失败意味着控制面
+    （dashboard / Admin API）不可达——status 的统计、kick、以及依赖它的
+    运维动作全都取不到数。此前这条路径**完全静默**（退出码 0、stderr 无
+    告警），脚本会把"dashboard 起不来"当成成功；这正是"降级必须可见"要防的。
+
+    不适用于 L3：插件是独立进程、独立风险面，它的抖动不改变 gate 的定义，
+    由 `_emit_health_warnings` 单独告警。
+
+    进程**不会被清理**：未过 gate 的实例仍由本工具托管，`status` 可见、
+    `stop` 可停。错误信息由 `UnhealthyAfterStart.render()` 统一渲染（stderr），
+    stdout 的 --json 契约不受影响。
+    """
+    if report.healthy:
+        return
+    raise UnhealthyAfterStart(report.pid, report.health.render())
+
+
 @app.command()
 def status(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     watch: bool = typer.Option(False, "--watch", help="持续刷新"),
-    interval: float = typer.Option(2.0, "--interval", help="--watch 的刷新间隔秒数"),
+    # 负数会让 time.sleep 抛 ValueError → "未分类错误(1)"；0 则是忙循环。
+    # 用 Click 的数值范围校验把它归入**用法错误(2)**（脚本据此区分"参数写错"）。
+    interval: float = typer.Option(2.0, "--interval", min=0.1, help="--watch 的刷新间隔秒数"),
 ) -> None:
     """状态聚合：owner / 状态 / pid / 版本 / 运行时长 / 客户端 / 代理 / 流量 / 健康。"""
     app_ctx = _ctx(ctx).with_json(json_output)
@@ -591,15 +665,19 @@ def status(
     # 再打一次"），用户看到的是按了中断却又冒出一份状态。
     try:
         while True:
-            if not app_ctx.json:
+            # 清屏只对**终端**有意义：重定向到文件/管道时写 ANSI 转义码会污染
+            # 输出（`frpsctl status --watch > state.txt` 拿到一堆 \x1b[2J）。
+            if not app_ctx.json and sys.stdout.isatty():
                 ui.emit("\033[2J\033[H")
-            _print_status(app_ctx)
+            # --watch --json 用**单行** JSON（NDJSON）：多行缩进格式在连续
+            # 输出时无法被逐行消费（脚本会拿到一串无法解析的片段）。
+            _print_status(app_ctx, compact=app_ctx.json)
             time.sleep(interval)
     except KeyboardInterrupt:
         return
 
 
-def _print_status(app_ctx: AppContext) -> None:
+def _print_status(app_ctx: AppContext, *, compact: bool = False) -> None:
     lc = _lifecycle(app_ctx)
     report = lc.status()
 
@@ -634,6 +712,9 @@ def _print_status(app_ctx: AppContext) -> None:
                 "disk_version": report.disk_version,
                 "config": str(report.config) if report.config else None,
                 "config_mode": report.config_mode,
+                "listen": None
+                if report.listen is None
+                else {"addr": report.listen.addr, "port": report.listen.port},
                 "systemd_unit": report.systemd_unit,
                 "systemd_main_pid": report.systemd_main_pid,
                 "health": None
@@ -648,7 +729,8 @@ def _print_status(app_ctx: AppContext) -> None:
                 "proxy_type_counts": proxy_counts,
                 "proxy_total": sum_proxy_types(proxy_counts) if proxy_counts else None,
                 "version_hint": report.version_hint,
-            }
+            },
+            compact=compact,
         )
         return
 
@@ -674,6 +756,8 @@ def _print_status(app_ctx: AppContext) -> None:
         ui.emit(f"binary   : frps {shown}")
     if report.config:
         ui.emit(f"config   : {report.config} ({report.config_mode})")
+    if report.listen is not None:
+        ui.emit(f"listen   : {report.listen.display}")
 
     dash = healthcheck.parse_dashboard(app_ctx.config_path)
     if dash.enabled:
@@ -703,12 +787,15 @@ def _print_status(app_ctx: AppContext) -> None:
 def log(
     ctx: typer.Context,
     follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪"),
-    lines: int = typer.Option(100, "--lines", "-n", help="显示行数"),
+    lines: int = typer.Option(100, "--lines", "-n", min=0, help="显示行数（0 = 不显示历史）"),
 ) -> None:
     """看日志。优先 `log.to` 指向的文件；缺失时回退到 startup 日志（ADR-5）。
 
     **不提供 `--json`**：日志是流式文本，把它塞进 JSON 只会让 `-f` 失去意义。
     需要结构化日志请让 frp 自己输出（`log.to` 指向文件后用工具解析）。
+
+    实现是纯 Python 的 tail（不依赖外部 `tail` 命令）：最小化容器里可能没有
+    它，而缺失时的裸 `FileNotFoundError` 会被误报成"工具内部错误"。
     """
     app_ctx = _ctx(ctx)
     inst = app_ctx.instance
@@ -723,11 +810,60 @@ def log(
             hint=("该路径来自配置的 log.to；若实例在运行，检查 log.to 是否是绝对路径或相对于实例目录"),
         )
 
-    argv = ["tail", "-n", str(lines)]
-    if follow:
-        argv.append("-f")
-    argv.append(str(target))
-    raise typer.Exit(subprocess.call(argv))
+    _tail_file(target, lines=lines, follow=follow)
+
+
+#: `log --follow` 的轮询间隔（秒）。不用 inotify：那要引入额外依赖，收益仅是
+#: 延迟，而 0.3s 对"看日志"这个场景完全够用。
+FOLLOW_INTERVAL = 0.3
+
+
+def _tail_file(path: Path, *, lines: int, follow: bool) -> None:
+    """纯 Python 的 tail：显示文件尾部的 `lines` 行，可选持续跟踪。"""
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        if lines > 0:
+            ring: deque[str] = deque(maxlen=lines)
+            for line in handle:
+                ring.append(line)
+            sys.stdout.write("".join(ring))
+            sys.stdout.flush()
+        if not follow:
+            return
+        _follow_file(path, handle)
+
+
+def _follow_file(path: Path, initial) -> None:
+    """持续输出追加内容；文件被轮转（inode 变化）时自动重开。
+
+    frp 的日志按天轮转（rename + 新建），`tail -f` 的语义就是"跟住路径"，
+    而不是"跟住旧 inode"。这里用 stat 对比实现同样的语义。
+    """
+    handle = initial
+    try:
+        while True:
+            chunk = handle.readline()
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+                continue
+            time.sleep(FOLLOW_INTERVAL)
+            handle = _reopen_if_rotated(path, handle)
+    finally:
+        with contextlib.suppress(OSError):
+            handle.close()
+
+
+def _reopen_if_rotated(path: Path, handle):
+    """`path` 指向的 inode 与已打开的 handle 不一致时重开；否则原样返回。"""
+    try:
+        if path.stat().st_ino != os.fstat(handle.fileno()).st_ino:
+            with contextlib.suppress(OSError):
+                handle.close()
+            return open(path, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
+    except FileNotFoundError:
+        # 文件刚被移走、新的还没建：保持旧 handle，下一轮再试
+        pass
+    return handle
 
 
 def _resolve_log_target(inst: Instance, config_path: Path) -> Path:
@@ -781,7 +917,9 @@ def config_set(
     value: str = typer.Argument(..., help="新值"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     no_restart: bool = typer.Option(False, "--no-restart", help="只写不重启（变更尚未生效）"),
-    health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
 ) -> None:
     """写单个键，走 §9 事务闭环（校验 → 备份 → 原子替换 → 重启 → 失败回滚）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
@@ -831,7 +969,9 @@ def config_set(
 @config_app.command("edit")
 def config_edit(
     ctx: typer.Context,
-    health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过「应用以上改动并重启？」的确认"),
 ) -> None:
     """用 $EDITOR 编辑，保存后走完全相同的闭环（先展示 diff 让人确认）。
@@ -924,7 +1064,9 @@ def config_rollback(
     ctx: typer.Context,
     steps: int = typer.Argument(1, help="回滚到 N 份之前的快照"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
-    health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
 ) -> None:
     """回滚到 N 份之前。**复用同一闭环**，而不是简单 cp 覆盖。"""
     app_ctx = _ctx(ctx).with_json(json_output)
@@ -963,17 +1105,39 @@ def service_install(
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
     log_dir: Path = typer.Option(Path("/var/log/frps"), "--log-dir", help="unit 中 ReadWritePaths 的目录"),
+    user: str = typer.Option(
+        DEFAULT_SERVICE_USER, "--user", help="运行 frps 的系统用户（需已存在）"
+    ),
+    group: str = typer.Option(None, "--group", help="运行 frps 的系统组（默认与 --user 相同）"),
 ) -> None:
-    """安装 `frps@.service` 模板并 enable（需要 root）。"""
+    """安装 `frps@.service` 模板并 enable（需要 root）。
+
+    安装前会做三项体检：服务用户存在、二进制对服务用户可执行、日志目录可写。
+    任何一项不满足都会当场拒绝——unit 装上去起不来，等于没装。
+    """
     app_ctx = _ctx(ctx).with_json(json_output)
     lc = _lifecycle(app_ctx)
     systemd = Systemd(app_ctx.instance)
-    path = systemd.install_template(binary=lc.binary(), log_dir=log_dir, force=force)
+    path = systemd.install_template(
+        binary=lc.binary(),
+        log_dir=log_dir,
+        force=force,
+        user=user,
+        group=group,
+    )
     if app_ctx.json:
-        ui.emit_json({"unit": systemd.unit_name, "template": str(path), "owner": "systemd"})
+        ui.emit_json(
+            {
+                "unit": systemd.unit_name,
+                "template": str(path),
+                "owner": "systemd",
+                "user": user,
+                "group": group or user,
+            }
+        )
     else:
         ui.emit(f"已安装 {path}")
-        ui.emit(f"实例 unit：{systemd.unit_name}")
+        ui.emit(f"实例 unit：{systemd.unit_name}（User={user}, Group={group or user}）")
         ui.emit("")
         ui.emit("注意：unit 的 ExecStart 写的是**具体二进制路径**，")
         ui.emit("      因此 `frpsctl install` 换版本后需要 `systemctl restart` 才生效。")
@@ -1118,9 +1282,9 @@ def plugin_init(
             hint="确认要覆盖请加 --force",
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_render_policy_template(), "utf-8")
-    with contextlib.suppress(OSError):
-        path.chmod(0o600)  # 它描述了谁能用哪些端口，属于安全配置
+    # 原子写：策略文件描述"谁能用哪些端口"，写一半崩溃会留下无法解析的半截
+    # JSON；原先 write_text + chmod 还带一个"先落盘后收紧权限"的窗口。
+    cfg.atomic_write(path, _render_policy_template(), mode=0o600)
 
     if app_ctx.json:
         ui.emit_json({"policy": str(path), "mode": "0600"})
