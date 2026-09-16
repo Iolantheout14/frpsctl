@@ -36,6 +36,7 @@
 15. [风险登记表](#15-风险登记表)
 16. [设计评审变更记录](#16-设计评审变更记录问题-15-闭环)
 17. [实现验证记录](#17-实现验证记录m0m5-已落地)
+    - [17.6 第二轮全量 review](#176-第二轮全量-reviewm0m5--文档定稿--真-frpc-契约复核后)
 - [附录 A：frps 配置键速查表](#附录-afrps-配置键速查表)
 - [附录 B：事实复核清单](#附录-b事实复核清单)
   - [附录 B-2：§3.6 版本矩阵的复核命令](#附录-b-236-版本矩阵的复核命令)
@@ -171,6 +172,16 @@ if (authMid.user == "" && authMid.passwd == "") || (hasAuth && ...) { next.Serve
 ```
 
 - `webServer.user` 与 `webServer.password` **同时为空时完全不鉴权**——不是"弹窗要求登录"，是**任何人都能读全部状态、并下线任意代理**。这是本设计里最重要的安全事实。
+- **鉴权开关的判据是"任一非空"**：只要 `user` 或 `password` 有一个非空，Basic Auth 中间件就生效；而 **Basic Auth 里的空口令是"合法口令"**。实现期在真 frps 0.71.0 上逐项实测（复现命令见附录 B 第 12 条）：
+
+  | `webServer.user` | `webServer.password` | 无 `Authorization` 头 | `user:(空口令)` |
+  |---|---|---|---|
+  | `"admin"` | 未设/空 | **401** | **200** |
+  | 未设 | 未设 | **200** | 200（任意凭据均可） |
+  | `"admin"` | `"secret"` | 401 | 401（须 `admin:secret`） |
+  | 未设 | `"secret"` | 401 | 401（须 `:secret`） |
+
+  > **推论（本工具据此划边界）**：`check_dangerous_combination()` 只拒绝"**两者全空 + 绑非回环**"（那是真·无鉴权）；而"有 user、口令为空"属于**强度不足**——它毕竟启用了鉴权，属于用户的显式选择，因此由 `doctor` 以 **WARN** 告警（"等于只用用户名保护 dashboard"），不在 `config set` 层否决。
 - 默认绑定：`ServerConfig.Complete()` 先调 `WebServer.Complete()` 把 `addr` 兜底为 `127.0.0.1`，之后那个 `"0.0.0.0"` 分支因值已非空而永不生效。**因此默认只监听本机**——这是好消息，但不能依赖它，因为用户为了远程看 dashboard 常会手动改成 `0.0.0.0`。
 
 ### 3.4 平台语义：唯一目标平台是 Linux
@@ -236,11 +247,11 @@ frps 只部署在 Linux 服务器上，因此本工具**只面向 Linux**，不�
 
 **仍需显式传标志（而不是依赖默认值）**：
 
-`>= 0.70.0` 上 `--strict_config` 默认已是 `true`，但 `verify_flags()` **仍然显式传 `--strict_config=true`**。原因是这条护栏值一个字节的成本，而依赖"某个版本的默认值"是脆弱的——默认值在 v0.53 到 v0.66 之间就变过一次。同理 `--allow-unsafe TokenSourceExec` 按配置内容决定是否追加。
+`>= 0.70.0` 上 `--strict_config` 默认已是 `true`，但 `config_flags()` **仍然显式传 `--strict_config=true`**。原因是这条护栏值一个字节的成本，而依赖"某个版本的默认值"是脆弱的——默认值在 v0.53 到 v0.66 之间就变过一次。同理 `--allow-unsafe TokenSourceExec` 按配置内容决定是否追加。
 
 **版本解析**：正则提取 `(\d+)\.(\d+)\.(\d+)` 后转三元组，而不是对 `split(".")` 做 `int()`——后者对 `0.71.0-rc1`、`0.71.0+dev` 这类合法后缀不够稳健。解析失败按"不支持"处理（ADR-7）。
 
-**标志构造**集中在 `core/config.py` 的 `verify_flags()`（§8.4），`verify` 与 `start` 共用同一份逻辑——"两处调用、一处判定"，避免未来只修好其中一条路径。
+**标志构造**集中在 `core/config.py` 的 `config_flags()`（§8.4，**刻意不接收版本号**：门槛上收后版本分支已成死代码），`verify` 与 `start` 共用同一份逻辑——"两处调用、一处判定"，避免未来只修好其中一条路径。
 
 ### 3.7 健康语义：三层，且只有两层有回滚权
 
@@ -484,9 +495,18 @@ class Instance:
 --config PATH         直接指定配置文件（覆盖实例默认）
 --binary PATH         直接指定 frps 二进制
 --json                机器可读输出（所有查询类命令支持）
---yes                 跳过交互确认
--v, --verbose
+--admin-password       dashboard 口令（优先于配置文件；也可用 FRPSCTL_ADMIN_PASSWORD）
+--yes, -y             跳过交互确认
+--verbose, -v         详细输出（诊断只进 stderr）
+--version             frpsctl 版本
 ```
+
+**全局选项可写在子命令之后**（`frpsctl status --json` / `frpsctl verify --verbose`）。
+落地方式是 `cli._AnywhereGroup.parse_args` 在**解析之前**把散落在子命令后面的全局
+选项整体前移，而不是给每条子命令手工加同名选项——后者补了 19 处仍然漏掉了
+`--yes` / `--verbose`（详见 §17.6.6）。短名 `-v` **不参与**前移：它与 `log -n` /
+`status --interval` 之类的局部短选项挤在一起，盲目前移会把子命令自己的参数搬到
+错误位置。
 
 ### 7.2 命令表
 
@@ -693,14 +713,19 @@ class ProcessRef:
     config: str
 
     def is_ours(self) -> bool:
-        """三重校验：pid 存活 + 启动时刻一致 + 命令行匹配。"""
+        """三重校验：pid 存活 + 启动时刻一致 + 命令行匹配。
+
+        ⚠️ 设计初稿在这里写的是"`start_time` 为 None 就跳过这一维"——那是**错的**：
+        它让三重校验静默退化成两维，而 pid 复用恰恰靠启动时刻识别（§15.5.1 第 1 条，
+        R2 的真实事故）。现在**三个维度缺一即 False**（fail-closed）。
+        """
         if not pid_alive(self.pid):
             return False
-        if self.start_time is not None:
-            current = proc_start_time(self.pid)
-            if current is not None and current != self.start_time:
-                return False          # pid 被复用 → 不是我们的进程
-        return _cmdline_contains(self.pid, self.binary)
+        if self.start_time is None:
+            return False                  # 拿不到依据 → 按"不是我们的"处理（ADR-7）
+        if not same_process(self.pid, self.start_time):
+            return False                  # 要么已退出，要么 pid 被复用
+        return _cmdline_matches(proc_cmdline(self.pid), self.binary)
 ```
 
 **状态判定表**（`status` 的唯一真相来源）：
@@ -833,23 +858,29 @@ def atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
         raise
 
 
-def verify_flags(binary_version: tuple[int, int, int]) -> list[str]:
-    """按 §3.6 构造标志，必须放在子命令之前（Cobra 持久标志）。
+def config_flags(*, uses_exec_token_source: bool = False) -> list[str]:
+    """构造 frps 标志，**必须放在子命令之前**（Cobra 持久标志）。
 
-    `>= 0.70.0` 上 `--strict_config` 默认已是 true，这里仍**显式传**：
-    默认值在 v0.53→v0.66 之间变过一次，依赖默认值是脆弱的，显式传值只花一个字节。
+    **刻意不接收版本号**：门槛（§3.6）在 `install` 阶段就把 `< 0.70.0` 拒之门外，
+    运行时不存在"这个版本认不认这个标志"的分支。早先的设计里确有版本矩阵
+    （0.52–0.65 无 `--allow-unsafe`、strict 默认 false），但门槛上收之后那段
+    分支已成死代码——留一个被忽略的 `version` 参数只会让人以为这里还在按版本判断。
+
+    `--strict_config=true` 仍**显式传**：0.70+ 上它默认已是 true，但这个默认值在
+    v0.53→v0.66 之间变过一次（false→true）。依赖"某个版本的默认值"是脆弱的，
+    而显式传值只花一个字节。
     `--allow-unsafe` 仅在配置使用 auth.tokenSource 的 exec 源时追加。
     """
     flags: list[str] = ["--strict_config=true"]        # 显式开启，不依赖版本默认值
-    if _uses_exec_token_source():
+    if uses_exec_token_source:
         flags += ["--allow-unsafe", "TokenSourceExec"]  # StringSlice，不是布尔开关
     return flags
 
 
-def _verify_argv(self, config_file: Path) -> list[str]:
-    """verify 与 start 共用——避免只有一条路径被修好。"""
-    return [str(self.binary), *verify_flags(self.binary_version()),
-            "verify", "-c", str(config_file)]
+def validate_text(text: str, *, binary: Path, workdir: Path, uses_unsafe: bool = False) -> None:
+    """verify 与 start 共用同一份标志构造与调用——避免只有一条路径被修好。"""
+    validate_semantics(text)                            # 第一层：pydantic（快速失败、信息友好）
+    ...                                                 # 第二层：写临时副本 → frps verify（唯一权威）
 
 
 class ConfigService:
@@ -897,7 +928,7 @@ class ConfigService:
 
 **关键性质**：`plan_set` 只改目标键，其余字节原样保留。因此注释、键序、行内注释、空行在 `config set` 之后完全不变。
 
-**版本前置条件**：`install` 阶段已拒绝 `< 0.70.0`（§3.6），因此 `verify_flags()` 不需要任何版本分支——`--strict_config` 与 `--allow-unsafe` 在目标区间内必然可用。这条前置条件必须在 `install` 与 `--binary` 两条入口上**都**做检查：用户用 `--binary` 指向自编译版本时同样要过版本门槛，否则 §3.6 的保证会被绕过。
+**版本前置条件**：`install` 阶段已拒绝 `< 0.70.0`（§3.6），因此 `config_flags()` 不需要任何版本分支——`--strict_config` 与 `--allow-unsafe` 在目标区间内必然可用。这条前置条件必须在 `install` 与 `--binary` 两条入口上**都**做检查：用户用 `--binary` 指向自编译版本时同样要过版本门槛，否则 §3.6 的保证会被绕过。
 
 ### 8.5 `core/admin.py` —— Admin API 客户端
 
@@ -938,7 +969,7 @@ class AdminClient:
         return ServerInfo(
             version=data["version"],
             client_counts=status["clientCounts"],
-            proxy_type_counts=status["proxyCount"],       # map，不是总数
+            proxy_type_counts=status["proxyTypeCount"],    # map，不是总数
             cur_conns=status["curConns"],
             total_traffic_in=status["totalTrafficIn"],
             total_traffic_out=status["totalTrafficOut"],
@@ -1054,13 +1085,16 @@ def install(version: str, dest: Path, mirrors: list[str], *, insecure: bool = Fa
 | 配置可解析 + `frps verify` | ERROR | 双保险 |
 | 配置文件权限 | ERROR | 含 `auth.token` 却非 `0600`（组或其他可读） |
 | dashboard 暴露面 | ERROR | `webServer.addr` 非回环 **且** user/password 全空 = 完全无鉴权 |
-| dashboard 弱口令 | WARN | user/password 为空，或等于 `admin` |
+| dashboard 弱口令 | WARN | user/password 为空；**`password` 为空而 user 非空**（frp 把空口令当合法口令，等于只用用户名保护，§3.3）；或 user/password 等于 `admin`/`admin` |
 | `transport.tls.force` | WARN | false 时提示可接受明文 frpc 连接 |
 | `allowPorts` / `maxPortsPerClient` | WARN | 未设置时提示端口可被任意申请 |
 | 端口可绑定性 | ERROR | 对 `bindPort` / `kcpBindPort` / `quicBindPort` / `vhostHTTPPort` / `vhostHTTPSPort` / `webServer.port` 做 bind 探测 |
 | `< 1024` 端口 | INFO | 提示 systemd 需要 `CAP_NET_BIND_SERVICE` |
 | systemd 与 direct 冲突 | ERROR | 两种所有权同时成立 → 歧义 |
 | 插件可达性 | WARN | 配置了 `httpPlugins` 时逐 addr 做 **TCP 探测**；失败提示"客户端将无法登录"（§3.7、§11.2）。**仅告警，不影响退出码** |
+
+`doctor` **只报告，不修复**：每条发现都带"哪个事实导致这条检查存在"，因为一个
+说不出理由的检查项，用户只会选择忽略它。
 
 ---
 
@@ -1090,7 +1124,7 @@ frpsctl config set bindPort 8000
 | 步骤 | 为什么必须有 |
 |------|-------------|
 | 3 | pydantic 提供**更快、更好读**的错误信息（"bindPort 必须是 1..65535 的整数"），但不下最终结论 |
-| 5 | **唯一权威判定**。在动线上文件之前就把 `frps verify` 请出来，是整条链路上性价比最高的一步。标志由 `verify_flags()` 按版本构造（§3.6、§8.4） |
+| 5 | **唯一权威判定**。在动线上文件之前就把 `frps verify` 请出来，是整条链路上性价比最高的一步。标志由 `config_flags()` 单一构造（§3.6、§8.4） |
 | 6 | 回滚要有东西可回滚；快照附 `meta.json`（时间、操作者、diff、结果） |
 | 7 | 原子替换保证"断电/被杀也不会留下半截配置" |
 | 8 | 针对"verify 通过但真跑起来失败"的场景：端口被占、证书文件不存在、权限不足 |
@@ -1380,9 +1414,10 @@ WantedBy=multi-user.target
 
 | 层 | 目标 | 手段 |
 |----|------|------|
-| **单元** | 进程原语、锁、无损补丁、原子写、标志构造 | `pid_alive` 的 `PermissionError` 分支；`proc_start_time` 解析（含 comm 字段含括号的用例）；`_ensure_table` 幂等；`atomic_write` 在写入中途抛异常时验证原文件未被破坏；**`verify_flags()` 的版本矩阵**（见下）；`probe_plugins` 的 URL 解析（无端口 / https 缺省端口 / 多地址有一不可达） |
+| **单元** | 进程原语、锁、无损补丁、原子写、标志构造 | `pid_alive` 的 `PermissionError` 分支；`proc_start_time` 解析（含 comm 字段含括号的用例）；`_ensure_table` 幂等；`atomic_write` 在写入中途抛异常时验证原文件未被破坏；**`config_flags()` 的构造**（含 `auth.tokenSource` 的 exec 源分支）；`probe_plugins` 的 URL 解析（无端口 / https 缺省端口 / 多地址有一不可达） |
 | **契约** | **防止 frp 升级后字段漂移** | 用真实 frps 二进制在高位端口起服务，断言 §13.1 的**全部强制项**。**这是本文档所有"事实"的自动化守卫** |
 | **集成** | 生命周期与回滚 | 临时实例目录：init → start → status → config set（成功）→ config set 非法值（断言线上文件未变 + 退出码 3）→ config set 导致启动失败（断言自动回滚 + 退出码 9）→ stop；**外加升级语义**：install 新版 → 断言运行中进程未受影响且 `state.json.version` 未变 → restart → 断言版本已切换且 `is_ours()` 仍成立（§8.6.1 第 3 条的自伤 bug 守卫） |
+| **CLI** | 命令行契约 | `typer.testing` 之外自建 `_Cli` 复用 `map_exceptions()`，使测试断言的就是真实退出码；覆盖退出码表、`--json` 形态、机密不外泄、全局选项位置 |
 | **故障注入** | **异常路径的不变量** | monkeypatch 真实系统调用（`os.replace`/`fsync`/`mkdir`、`subprocess.*`、`httpx`、`platform.terminate`）使其单次失败，断言：契约内异常、无遗留进程、无半截/含机密的文件、锁已释放、机密不外泄。见 §13.2 |
 | **手工冒烟** | SSH 断开存活、systemd 委托、非 root 权限 | 脚本化 checklist，CI 不覆盖 |
 
@@ -1392,13 +1427,14 @@ WantedBy=multi-user.target
 
 | # | 断言 | 守住的事实 |
 |---|------|-----------|
-| C1 | `/api/v2/system/info` 的 `data.status.proxyCount` **是 `dict[str, int]` 而非 `int`**；`sum(...)` 等于 `GET /api/proxy/tcp` + `/api/proxy/http` + `/api/proxy/udp` 各列表长度之和 | §3.2 的字段陷阱（**问题 4 的核心**）。用 `isinstance(payload["proxyCount"], dict)` 直接断言，并做一次"求和 == 逐类型列表长度"的交叉验证——**光断言类型不够，还要证明求和口径正确** |
+| C1 | `/api/v2/system/info` 的 `data.status.proxyTypeCount` **是 `dict[str, int]` 而非 `int`**（真名不是 `proxyCount`）；`sum(...)` 等于 `GET /api/proxy/tcp` + `/api/proxy/http` + `/api/proxy/udp` 各列表长度之和 | §3.2 的字段陷阱（**问题 4 的核心**）。用 `isinstance(payload["proxyTypeCount"], dict)` 直接断言，并做一次"求和 == 逐类型列表长度"的交叉验证——**光断言类型不够，还要证明求和口径正确** |
 | C2 | `GET /api/serverinfo` 与 `GET /api/clients` 在目标版本上**仍存在但本工具不调用**：`AdminClient` 的源码扫描断言只出现 `/api/v2/` 前缀（防止有人把 v1 降级路径加回来） | ADR-3 的"只走 v2"决策。这是**反向断言**：不是测 frp，而是测我们没有偷偷用回 v1 |
 | C3 | `GET /healthz` **不带 Authorization 头**返回 200 | §3.2 免认证；也防止未来被挪进鉴权中间件后 `start` 的健康检查静默失效 |
 | C4 | v2 响应信封形状为 `{"code","msg","data"}`，业务字段在 `data` 下 | §8.5 解析路径 |
 | C5 | 在**未设置** `webServer.user`/`password` 时，`GET /api/v2/clients` 返回 200（而非 401） | §3.3 "双空 = 完全不鉴权"。**这是安全基线的事实依据**，必须自动化确认 |
 | C6 | `frps verify -c` 对非法配置退出码为 1，对合法配置打印 `syntax is ok` 且退出码 0 | §3.1 唯一权威判定的契约 |
 | C7 | 真实二进制满足 §3.6：`frps -v` 输出无 `v` 前缀；`frps --help` 含 `--strict_config` 与 `--allow-unsafe`；`/api/v2/system/info` 返回 200。**并断言 0.69.1 及更早版本被 `install` 拒绝** | §3.6 版本门槛的自动化守卫。做法：`frps --help` 抓标志集合 + 起服务探 v2；低版本断言用 `install --version 0.69.1` 的退出码，**不下载二进制时可 `pytest.mark.skip`，但保留为可执行断言** |
+| C8 | 在 `user = "admin"` + 口令为空时，无凭据请求得 **401**，而 `admin:`+空口令得 **200**；只设 `password` 时须用 `:secret` 才能进 | §3.3 的实测边界。它守的是 `check_dangerous_combination()` **只拒绝两者全空**这个判据分工：若哪天 frp 改成"口令非空才启用鉴权"，"有 user + 空口令"会**静默退化成完全不鉴权**，而校验仍会放行——安全缺口就此产生 |
 
 C7 是"问题 2 的长期解药"：版本矩阵一旦被 frp 改动，CI 先于用户发现，而不是等某个用户拿着 0.60 报告"启动失败但配置明明合法"。
 
@@ -1463,7 +1499,7 @@ CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13），容器内跑全部四层；**
 
 | # | 风险 | 影响 | 缓解 |
 |---|------|------|------|
-| R1 | frp 升级后 API 字段改名 | `status` 静默出错 | 契约测试作为升级门禁，**§13.1 C1/C2 专门断言 `proxyCount` 是 map 且求和口径正确**；`AdminClient` 对缺字段抛明确异常而非裸 `KeyError` |
+| R1 | frp 升级后 API 字段改名 | `status` 静默出错 | 契约测试作为升级门禁，**§13.1 C1/C2 专门断言 `proxyTypeCount` 是 map 且求和口径正确**；`AdminClient` 对缺字段抛明确异常而非裸 `KeyError` |
 | R2 | pid 复用导致误杀 | 杀掉无关进程 | 三重身份校验（pid + start_time + cmdline），不符即拒绝（退出码 11） |
 | R3 | systemd 与 direct 所有权混用 | 状态错乱、双实例 | ADR-1 显式化所有权 + `doctor` 冲突检测 |
 | R4 | 用户手写配置被改写 | 丢注释、丢安全设置 | ADR-2 无损补丁；首次接管前强制备份 |
@@ -1474,7 +1510,7 @@ CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13），容器内跑全部四层；**
 | R9 | 配置含 `{{` 被 frp 当模板渲染 | 配置语义被意外改写 | `plan_set` 拒绝含模板语法的字符串值 |
 | R10 | 运行 `<0.71` 版本 | 存在已知远程 DoS | 版本门槛 + `start` / `doctor` 输出 WARNING（§3.6） |
 | R11 | dashboard 暴露公网且无口令 | 状态泄露、代理被任意下线 | `init` 强制随机口令；`config set` 与 `doctor` 双重拦截危险组合 |
-| R12 | **无条件传 `--strict_config` / `--allow-unsafe` 到旧版本** | 未知标志 → frps 直接退出，表现为"配置合法却启动失败" | §3.6 标志兼容矩阵 + 单一构造点 `verify_flags()`（§8.4）+ §13.1 C7 断言 |
+| R12 | **无条件传 `--strict_config` / `--allow-unsafe` 到旧版本** | 未知标志 → frps 直接退出，表现为"配置合法却启动失败" | §3.6 标志兼容矩阵 + 单一构造点 `config_flags()`（§8.4）+ §13.1 C7 断言 |
 | R13 | **换软链后 `state.json.binary` 失配** | `is_ours()` 误判为 `FOREIGN` → 拒绝停止自家进程（退出码 11） | `active_binary()` 强制 `resolve()` 存真实路径；集成测试覆盖（§8.6.1、§13） |
 | R14 | 插件抖动被误判为配置故障 | 回滚掉恰好用于修复问题的配置 | 回滚判据固定为 L1 ∧ L2，L3 只告警不回滚（§3.7、§9） |
 
@@ -1581,7 +1617,7 @@ review 的结论是"异常路径是盲区"，因此补了**故障注入层**（�
 | 原子写 | `if hasattr(os, "fchmod")` 的兼容判断 | 直接 `os.fchmod`（Linux 必有） |
 | 新增 | — | `assert_supported()` + `UnsupportedPlatform`：`/proc` 不可用即拒绝 |
 
-**理由**：Windows 分支与"不承诺生产可用"自相矛盾——写了一套永远不会被验证的代码，却要为它的正确性背书。删掉后 §3.4 从"三个平台的矩阵"变成"一组必须满足的内核依赖"，可测试、可断言。同时新增 `proc_cmdline()`（读 `/proc/<pid>/cmdline`），让 §8.3 里 `_cmdline_contains` 这个引用有了确定的实现。
+**理由**：Windows 分支与"不承诺生产可用"自相矛盾——写了一套永远不会被验证的代码，却要为它的正确性背书。删掉后 §3.4 从"三个平台的矩阵"变成"一组必须满足的内核依赖"，可测试、可断言。同时新增 `proc_cmdline()`（读 `/proc/<pid>/cmdline`），让 §8.3 里 `_cmdline_matches` 这个引用有了确定的实现。
 
 ### 16.2 版本门槛重写（问题 2）
 
@@ -1598,7 +1634,7 @@ review 的结论是"异常路径是盲区"，因此补了**故障注入层**（�
 **三个直接后果**（均已写入设计）：
 
 1. `--strict_config=true` **必须显式传**——`0.53–0.65` 默认 false，不传等于护栏消失；
-2. 标志构造集中到 `verify_flags()`，`verify` 与 `start` 共用（"两处调用、一处判定"）；
+2. 标志构造集中到 `config_flags()`，`verify` 与 `start` 共用（"两处调用、一处判定"）；
 3. `auth.tokenSource` 的 exec 源在 `< 0.66.0` 上**拒绝**（退出码 3），而不是硬传一个未知标志。
 
 #### 16.2.1 追加决策：门槛上收到 0.70.0，删除 v1 降级（评审确认）
@@ -1674,11 +1710,13 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 
 | 项 | 状态 |
 |----|------|
-| 代码 | `src/frpsctl/`（core 15 模块 + `plugin/` 6 模块 + CLI 3 模块） |
-| 测试 | **164 个用例**；单元 / 集成 / CLI / 契约 / **故障注入** 五层 |
+| 代码 | `src/frpsctl/`（core 16 模块 + `plugin/` 6 模块 + CLI 3 模块） |
+| 测试 | **226 个用例**；单元 / 集成 / CLI / 契约 / **故障注入** 五层（§17.6 后，含 4 条真 frpc 契约） |
+| 覆盖率 | **81%**（`pytest --cov`；剩余未覆盖集中在渲染分支与需 root/网络的路径） |
 | 真机验证（M0–M4） | frps **0.71.0** 全链路冒烟通过：`init → verify → start → status → config set（自动重启）→ doctor → config rollback → stop` |
 | 真机验证（M5） | **真 frpc → 真 frps → 我们的插件**：授权用户建代理成功、未授权用户登录被拒、白名单外端口被拒且理由回到客户端 |
-| 契约层 | C1–C7 全绿（真二进制），CI 里作为升级门禁 |
+| 契约层 | C1–C8 全绿（真二进制），CI 里作为升级门禁 |
+| 插件真机契约 | 真 frpc → 真 frps → 我们的插件：4 条全绿（授权建代理成功、未授权登录被拒、白名单外端口被拒且理由回到客户端、审计留痕） |
 
 ### 17.2 实现期发现并修正的文档错误
 
@@ -1737,7 +1775,7 @@ frpc（`install --with-frpc`，与 frps 同一个资产、不额外下载），�
 
 三条设计决策在实现中被证明"正是关键"：
 
-1. **`verify_flags()` 单一构造点**（§8.4）：`verify` 与 `start` 共用，因此"标志是否正确"只需要在一处验证（§13.1 的 `test_our_flag_construction_is_accepted` 用的是真 frps）。
+1. **`config_flags()` 单一构造点**（§8.4）：`verify` 与 `start` 共用，因此"标志是否正确"只需要在一处验证（§13.1 的 `test_our_flag_construction_is_accepted` 用的是真 frps）。
 2. **回滚判据只有 L1 ∧ L2**（§3.7）：集成测试 `test_plugin_failure_does_not_break_gate` 直接断言"插件不可达时 `gate` 仍为真"，把这条边界钉成了可执行事实。
 3. **`state.json` 存 `resolve()` 后的真实路径**（§8.6.1）：升级语义测试在换软链后仍能通过三重校验——R13 那个"自伤 bug"被测试永久守住。
 
@@ -1747,6 +1785,218 @@ frpc（`install --with-frpc`，与 frps 同一个资产、不额外下载），�
 做成了**全局选项 + 每个子命令的选项**，两种位置都可用。原因：只提供全局选项时
 `frpsctl status --json` 会报 `No such option`，与文档写法及用户直觉都不符。
 行为对脚本完全兼容（`--json` 在前后都能用），因此不视为破坏性偏离。
+
+> **§17.6 已把这条偏离收回**：逐命令打补丁的做法被证明是治标的（见 §17.6.6），
+> 现在由 `_AnywhereGroup` 在解析前统一前移全局选项。各子命令上保留的 `--json`
+> 选项与 `with_json()` 仍在，属于冗余而非缺陷。
+
+---
+
+## 17.6 第二轮全量 review（M0–M5 + 文档定稿 + 真 frpc 契约复核后）
+
+第二轮 review 的方法与 §15.5 不同：**先把全部源码、测试与两篇文档读完，再逐条
+实测**（不是只读代码）。结论是上一轮的修复质量可信，但**"文档承诺 vs 实现"的
+缝隙仍在，且这一轮新发现的问题里有两条比第一轮更隐蔽**。
+
+统计：修复 **13 条**问题（见 §17.6.8 的逐条清单），新增 **62 个用例**（164 → 226），覆盖率 76% → **81%**，
+且盲区从"关键路径"退到"渲染与错误分支"：
+
+| 模块 | 之前 | 之后 | 补的是什么 |
+|------|-----|-----|-----------|
+| `core/systemd.py` | 52% | **98%** | unit 渲染、systemctl 委托、所有权探测（`is_active` / `same_config_active`） |
+| `core/release.py` | 58% | **83%** | 解包（含路径穿越）、`-v` 复验、原子就位、校验和顺序 |
+| `core/instance.py` | 86% | **89%** | 快照序号分配与耗尽 |
+| `core/version.py` | 95% | **96%** | 版本探测超时收口 |
+
+### 17.6.1 最重要的一条：空口令 ≠ 没有口令
+
+§3.3 原文只写了"两者全空 = 完全不鉴权"，实现也据此把
+`check_dangerous_combination()` 写成"两者全空才拒绝"。**判据本身是对的**（实测
+确认：`user="admin"` + 空口令时无凭据请求得 401，确实启用了鉴权），但**没人提示
+"有 user 但口令为空"这个等价于免口令的情形**：
+
+- `config set webServer.addr '"0.0.0.0"'` 在这个组合下**放行**（因为启用了鉴权）；
+- 而 `doctor` 一条提示都没有——实测确认，`(user="admin", password="")` 下
+  `doctor` 静默通过。
+
+于是出现一个真实的缺口：用户可以把 dashboard 暴露到公网，而唯一的防护是一个
+**已知用户名 + 空口令**。修复：
+
+| 位置 | 修复 |
+|------|------|
+| §3.3 | 补上"鉴权开关是**任一非空**、空口令是合法口令"的实测表（4 行配置 × 2 种请求） |
+| `healthcheck.DashboardInfo.auth_enabled` | docstring 写明它是"是否施加 Basic Auth"而非"口令是否够强" |
+| `doctor._check_dashboard` | 新增分支：`password` 为空而 `user` 非空 → **WARN**（"等于只用用户名保护 dashboard"） |
+| `test_facts.py::TestC8PasswordlessAuth` | 把这条事实做成契约断言（起真 frps 实测 401/200） |
+| `test_plugin.py::TestDoctorDashboardCredentials` | 6 条用例覆盖新分支及其边界（含"非回环 + 空口令仍只是 WARN"） |
+
+**判据边界是刻意保留的**：`config set` 仍只拒绝"两者全空 + 绑非回环"。"有 user、
+口令为空"启用了鉴权，属于强度不足而非缺口，是用户的显式选择——由 `doctor` 告警
+比否决写配置更合适。
+
+### 17.6.2 异常契约在三处漏出裸异常
+
+`release._verify_binary` 的 `subprocess.run(..., timeout=10)` **没有接住
+`TimeoutExpired`**：它既不是 `FrpsctlError` 也不是 `OSError`，冒到 CLI 就是
+"未分类错误(1)"——把"下载的二进制卡住"误报成"工具内部出错"，用户会去查 frpsctl
+的 bug。同类问题还有 `instance.next_history_slot` 耗尽重试时的裸 `RuntimeError`。
+
+两处都已收口为契约内异常（`BinaryError` / `FrpsctlError`），并补了断言退出码的用例。
+**教训与 §15.5.2 一致**：异常路径上的"降级"必须可见，而"异常类型"本身就是可见性
+的一部分。
+
+### 17.6.3 供应链关键路径零覆盖
+
+`release._place_binary`（解包 → `-v` 复验 → 原子就位）是"校验不通过绝不落盘"
+这条承诺的**最后一道门**，而它此前**一个用例都没有**——因为要造真实 tar 字节流。
+补上之后立刻证明了两条不变量：
+
+- 资产里的 `frps` 版本低于门槛（§3.6）时，**目标文件不出现、临时文件不残留**；
+- 复验超时 / `ENOEXEC` 都收口成退出码 4。
+
+`render_unit` 同理：它是纯函数、零成本可测，却决定了 systemd 托管下的全部行为。
+现在断言 `ExecStart` 是**具体版本路径而非软链**——这正是 §8.6.1 要求
+`install` 输出里显式提醒用户的那个差异。
+
+### 17.6.4 顺手修掉的一个实现缺陷
+
+`Systemd.install_template` 直接 `write_text(template_path)`，**没有先建
+`unit_dir`**。真实部署里 `/etc/systemd/system` 总是存在的，所以这不是线上 bug；
+但它是"依赖环境恰好满足"的写法，且让"渲染出的 unit 到底长什么样"这件事无法在
+测试里断言。测试逼出这个假设之后补上了 `mkdir(parents=True, exist_ok=True)`。
+
+### 17.6.5 `--verbose` 是个空选项（比没有更糟）
+
+`--verbose, -v` 出现在 README 的全局选项表与 §7.1 里，被 `build_context()` 解析进
+`AppContext`，然后**全仓库没有任何地方读过 `app_ctx.verbose`**。用户加上它以为能
+看到诊断，实际输出一字不差。
+
+修复方式是把它做成**真功能**而不是删掉：`ui.set_verbose()` 设一个进程级开关
+（`--verbose` 要影响的调用点在 `core/` 里，那些函数没有 CLI 上下文），
+`ui.trace()` 把诊断写进 **stderr**：
+
+```
+[trace] 读取二进制版本：…/frps-0.71.0 -v
+[trace] 执行权威校验：…/frps-0.71.0 --strict_config=true verify -c …/tmpXXXX.toml
+[trace] 派生进程：…/frps-0.71.0 -c …/frps.toml（stdout → …/startup/startup-….log）
+```
+
+**必须走 stderr**：`--json` 的 stdout 是机器可读契约，一行 trace 就能让 `jq` 解析
+失败。测试里专门有一条断言 `--verbose --json` 的 stdout 仍是纯 JSON。
+
+### 17.6.6 一处"文档 vs 实现"的广泛不一致：全局选项位置
+
+README 写着"全局选项（写在子命令前后都可以）"，§17.5 也把这当成已解决的偏离。
+实际上只有 `--json` 被**逐命令**打了补丁（19 处 `with_json()`），而：
+
+```console
+$ frpsctl config edit --yes
+Error: No such option: --yes
+$ frpsctl verify --verbose
+Error: No such option: --verbose
+```
+
+原因是 Typer/Click 原生只解析"子命令之前"的选项。**逐命令打补丁是治标的**：每加
+一条子命令、每加一个全局选项，都可能再漏一次（这次就漏了两个）。
+
+治本的修复是 `cli._AnywhereGroup.parse_args`：在解析**之前**把散落在子命令后面的
+全局选项整体前移到前面。一条规则覆盖全部命令与全部变体。三条必须守住的边界：
+
+| 边界 | 为什么 |
+|------|-------|
+| `--version` **不在**全局名单里 | 它是 `install` 的版本参数。误搬走会让 `install --version 0.69.1` 变成"打印 frpsctl 版本并退出 0"——一个**静默的错误成功** |
+| 短名 `-v` 不参与前移 | 与 `log -n` / `status --interval` 等局部短选项挤在一起，盲目前移会把子命令自己的参数搬到错误位置 |
+| 只搬"值紧随其后"或 `--name=value` | 避免把 `--config` 后面那个**位置参数**误当成它的值 |
+
+`config edit` 另外补了一个局部的 `--yes`（`init` 早就有），使
+`frpsctl config edit --yes` 与 `frpsctl --yes config edit` 都能用。
+
+### 17.6.7 测试脚手架的一个自身缺陷
+
+CLI 测试的 `_Cli.invoke` 把 stdout 与 stderr **合并**成一个字符串再断言。这在
+`--verbose` 出现之前是无害的，但它使"诊断只能进 stderr"这条契约**无法被断言**——
+第一版 `--verbose` 测试因此得到假结果。已改为同时保留 `stdout` / `stderr` 两个
+独立字段（`output` 仍保留为合并视图，既有断言不受影响）。
+
+**这与 §15.5.3 是同一类教训**：测试基础设施本身也会掩盖真相。合并输出流的脚手架
+让"stdout 是否干净"这件事永远测不出来。
+
+### 17.6.8 本轮修复清单（可逐条核对）
+
+| # | 问题 | 类型 | 落地 |
+|---|------|------|------|
+| 1 | `transaction._restore` 有**两段相邻 docstring**，后者是被遮蔽的死字符串，且两段描述了不同实现 | 文档 | 合并为一段（保留"取自快照"+"曾假回滚"两条信息） |
+| 2 | "有 user、口令为空" = 免口令 dashboard，`doctor` 完全静默 | **安全可见性** | `doctor` 新增 WARN 分支；§3.3 补实测表；新增 C8 契约断言 + 6 条 doctor 用例 |
+| 3 | `status --watch` 的 Ctrl-C 会多刷一屏（`except: return` 让循环后的调用变成"退出前再打一次"） | 行为 | 改为"不 watch 就渲染一次并返回；watch 只在循环内渲染" |
+| 4 | `_assert_v2_api` 末尾 `last` 变量赋值后从未被读 | 死代码 | 删除变量与末尾的 `_ = last` |
+| 5 | `release.install` 的 `--insecure` 判断发生在**下载之后** | 可读性/效率 | 校验和判定整体前移到下载之前 |
+| 6 | `release._verify_binary` 未接住 `TimeoutExpired`；`instance.next_history_slot` 耗尽时抛裸 `RuntimeError` | **异常契约** | 分别收口为 `BinaryError(4)` / `FrpsctlError(1)`，并加断言退出码的用例 |
+| 7 | `--verbose` 被文档承诺、被解析、**从未被读过** | 空功能 | 做成真功能：`ui.set_verbose()` + `ui.trace()`，诊断只进 stderr，覆盖 `verify` / 版本探测 / 派生进程 / 下载 |
+| 8 | 全局选项写在子命令之后报 `No such option`（README 却承诺两者皆可），`--yes`/`--verbose` 都中招 | **文档 vs 实现** | `_AnywhereGroup.parse_args` 统一前移；`config edit` 补局部 `--yes`；新增 5 条位置矩阵用例 |
+| 9 | `Systemd.install_template` 未先建 `unit_dir` | 环境假设 | 补 `mkdir(parents=True, exist_ok=True)` |
+| 10 | CLI 测试脚手架合并 stdout/stderr，使"诊断只进 stderr"无法被断言 | 测试基建 | 拆成独立字段（`output` 保留为合并视图） |
+| 11 | 设计文档 §8.3 的 `is_ours()` 仍在演示**已被判定为高危**的旧写法；`verify_flags` / `proxyCount` / `_cmdline_contains` 等命名与实现漂移；§8.4 还写着"按版本构造标志" | 文档 drift | 逐处修正为当前实现（含 §13.1 C1 的字段名、附录 B 第 4b 条） |
+| 12 | **`--with-frpc` 在"frps 已在盘上"时完全不可达**：`dest.exists()` 那条捷径直接 `return`，于是补装 frpc 永远装不上，而输出还报成功 | **功能失效（CI 掩盖）** | frps 与 frpc 的落盘判定解耦为 `place_frps` / `place_frpc`；新增 `TestWithFrpc` 4 条（含"已有 frps 时补装 frpc"这条回归） |
+| 13 | `InstallResult.switched` 把"frps 是否换链"与"是否要求换链"混为一谈，导致两个错误输出：已有 frps 时打印"未切换软链"，以及把"同版本已在盘上"误报成"已按 `--only-download`" | 输出误导 | 语义拆清：`switched` = 本次是否真的建立了指向；新增 `switched_frpc`；`--only-download` 与"同版本已就位"两种原因分开渲染 |
+
+### 17.6.9 装上真 frpc 之后的契约层复核（§17.6.8 第 12 条的由来）
+
+为了跑通那 4 条被 skip 的插件契约用例，执行了 `frpsctl install --with-frpc` —— 结果
+**frpc 没有出现**，而命令**报了成功**（`downloaded=False`、退出码 0）。这是一条真实
+的功能失效，也顺带解释了它为什么能活到现在：
+
+| 环节 | 为什么会漏 |
+|------|-----------|
+| `install` 的控制流 | `if dest.exists() and not force:` 里直接 `return`，**`with_frpc` 那段在它之后**，永远不可达 |
+| CI | CI 每次都是全新数据目录 → `dest` 不存在 → 必然走完整路径 → `with_frpc` 生效。**CI 从来没有覆盖过"机器上已有 frps"这个状态** |
+| 本地开发 | 本项目的开发机早就装过 frps，因此这条捷径**总是**被走到 —— 也就是说这个功能在本地从来就没成功过，只是没人注意（契约层只是 skip，不是 fail） |
+
+修复方式是把两者的落盘判定**解耦**：
+
+| 变量 | 含义 |
+|------|------|
+| `place_frps = force or not dest.exists()` | 本次是否需要写入 `frps-<version>` |
+| `place_frpc = with_frpc and (force or not frpc_dest.exists())` | 本次是否需要写入 `frpc-<version>` |
+
+两者都为假时才走"不碰网络"的捷径；只要有一个为真就下载**同一个资产**（frps 与 frpc
+在同一 tar 包里，因此仍只下载一次），各自独立就位。
+
+顺带暴露并修掉第二处**输出误导**：`InstallResult.switched` 原先同时承担"frps 软链
+本次是否被切换"与"用户是否要求切换"两个含义，于是
+
+- "已有 frps + 未加 `--only-download`" → 打印"已按 `--only-download` 落盘，未切换软链"（**用户根本没加那个参数**）；
+- 而"已有 frps + 未加 `--only-download`"时**确实应该**动链（幂等，且能修回被手工改歪的链）。
+
+现在语义拆清：`switched` = 本次是否真的建立了指向；新增 `switched_frpc`；CLI 把
+"`--only-download`"与"同版本已在盘上"两种原因**分开渲染**。验证矩阵：
+
+```console
+$ frpsctl install --version 0.71.0 --with-frpc         # 全新目录
+frps 0.71.0 → …/bin/frps-0.71.0
+当前版本软链 → …/bin/frps
+frpc 0.71.0 → …/bin/frpc-0.71.0
+      （供插件契约测试使用；软链已指向它）
+
+$ frpsctl install --version 0.71.0 --with-frpc         # 再跑一次（不碰网络）
+frps 0.71.0 → …/bin/frps-0.71.0
+当前版本软链 → …/bin/frps
+
+$ ln -sfn /nonexistent …/bin/frps && frpsctl install   # 手工改歪的链会被修回来
+$ frpsctl install --only-download                      # 显式不动链
+已按 --only-download 落盘，未切换软链。
+```
+
+装上真 frpc 之后，**全量 226 个用例 0 skipped**：契约层 C1–C8 与
+`TestRealFrpcContract` 的 4 条全部在真二进制上通过——包括最关键的那条
+"白名单外端口被拒、且**拒绝理由真的回到了客户端**"（`6000-6010` 出现在 frpc 输出里）。
+
+### 17.6.10 本轮**未**修的东西（明确记账）
+
+| 项 | 为什么不修 |
+|----|-----------|
+| `plugin serve --json` 之后仍阻塞 | 这是**设计意图**（它是前台服务），已在 `--help` 与 README 里写明"一次性状态、随后前台运行"；改成流式 JSON 反而让它无法被 systemd 正常托管 |
+| 各子命令上冗余的 `--json` 选项与 `with_json()` | 有了 `_AnywhereGroup` 之后确实冗余，但保留它们让**旧写法继续可用**，且删掉要动 19 处调用点——收益不足以承担回归风险 |
+| ~~4 条真机契约用例需要 `frpc`~~ | **已解决**：`frpsctl install --with-frpc` 装上真 frpc 后，`tests/test_plugin.py::TestRealFrpcContract` 4 条全部通过（见 §17.6.9）。没有 frpc 时它们会 skip 而不是 fail |
 
 ---
 
@@ -1861,6 +2111,14 @@ sed -n '25,50p' /tmp/frp/server/api_router.go
 # 4) user 与 password 双空 = 完全不鉴权
 sed -n '45,60p' /tmp/frp/pkg/util/net/http.go
 
+# 4b) 鉴权开关是"任一非空"（§3.3 的实测表）
+#     起三个 frps 分别配 user=admin(无口令) / 都不配 / admin+secret，
+#     然后观察无凭据请求与"空口令"请求的差异：
+#       curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<dash>/api/v2/clients
+#       curl -s -o /dev/null -w '%{http_code}\n' -u admin: http://127.0.0.1:<dash>/api/v2/clients
+#     结论：第一行 401 / 第二行 200 → 启用鉴权但空口令是合法口令。
+#     完整脚本见 tests/test_facts.py::TestC8PasswordlessAuth
+
 # 5) frps 没有任何信号处理器（只有 frpc 有）
 grep -rn 'signal.Notify' /tmp/frp --include=*.go
 
@@ -1920,6 +2178,6 @@ git ls-tree -r --name-only v0.52.0 | grep -E 'pkg/config/load.go|conf/frps.toml'
 
 三处**必须注意的复核纪律**：
 
-1. `-v` / `--version` 是**持久标志**（`PersistentFlags`），`verify` 子命令同样认识它们——所以 §8.4 的 `verify_flags()` 把标志放在子命令**之前**，两种位置虽然都能工作，但只沿用一种写法以免未来踩 Cobra 的解析顺序坑。
+1. `-v` / `--version` 是**持久标志**（`PersistentFlags`），`verify` 子命令同样认识它们——所以 §8.4 的 `config_flags()` 把标志放在子命令**之前**，两种位置虽然都能工作，但只沿用一种写法以免未来踩 Cobra 的解析顺序坑。
 2. `--allow-unsafe` 是 `StringSlice`，值为 `TokenSourceExec`（对应 `security.ServerUnsafeFeatures`），**不是布尔开关**。
 3. 版本矩阵会随 frp 发版变化，因此**它是 CI 断言（§13.1 C7），不是一次性结论**。本文档记录的是 v0.71.0 时点的观测值。
