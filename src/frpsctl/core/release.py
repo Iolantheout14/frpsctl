@@ -103,8 +103,13 @@ def asset_name(version: str) -> str:
 class InstallResult:
     version: str
     binary: Path
+    #: `bin/frps` 软链**本次是否真的被切换过**。
+    #: 它必须与"是否要求切换"（`switch` 参数）区分开：frps 已在盘上时切换是空操作，
+    #: 混为一谈会让 CLI 打印出"未切换软链"，而实际可能刚切了 frpc 的软链。
     switched: bool
     downloaded: bool
+    #: `bin/frpc` 软链本次是否被建立/切换（`--with-frpc` 才可能为真）。
+    switched_frpc: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -237,47 +242,75 @@ def install(
     软链）。它不服务于 frps 的日常运维，而是为了让**契约测试**能跑起来——
     插件（M5）的唯一真实调用方是 frpc，没有它就只能靠手工拼报文验证协议。
     由于 frpc 与 frps 在同一个发布资产里，这一步不产生额外下载。
+
+    `with_frpc` 与"frps 是否已在盘上"**相互独立**：此前 `dest.exists()` 那条捷径
+    直接 `return`，于是"机器上已有 frps、现在想补装 frpc"永远装不上（而输出还
+    报着成功）。CI 恰好掩盖了它——CI 每次都是全新数据目录，必然走完整路径。
     """
     ensure_supported(parse_version(version))  # 门槛 >= 0.70.0（§3.6）
     bin_dir.mkdir(parents=True, exist_ok=True)
     asset = asset_name(version)
     dest = bin_dir / f"frps-{version}"
+    frpc_dest = bin_dir / f"frpc-{version}"
 
-    if dest.exists() and not force:
+    place_frps = force or not dest.exists()
+    place_frpc = with_frpc and (force or not frpc_dest.exists())
+
+    if not place_frps and not place_frpc:
+        # 两边都已在盘上：不碰网络。但**换链仍要照做**——用户没加 `--only-download`
+        # 时，"让 bin/frps 指向这个版本"就是他要的结果（幂等，且修得回手工改歪的链）。
+        # `switched` 如实反映"这次是否真的建立了指向"。
+        switched = switch
         if switch:
             switch_symlink(bin_dir / "frps", dest)
-        return InstallResult(version=version, binary=dest, switched=switch, downloaded=False)
+        return InstallResult(version=version, binary=dest, switched=switched, downloaded=False)
 
-    # 1) 校验和：拿不到就拒绝（fail-closed，ADR-7）
+    from ..cli.ui import trace
+
+    trace(f"目标资产：{asset}（镜像数 {len(mirrors)}）")
+
+    # 1) 校验和：拿不到就拒绝（fail-closed，ADR-7）。
+    #    必须先于下载：否则会先花一次网络把二进制拉回来，再因为"没有校验和"
+    #    把它丢掉——既慢，又让 `--insecure` 的判断发生在下载之后，读起来像
+    #    "下载完了才发现不该装"。
     expected: str | None = None
     try:
         expected = expected_sha256(download_checksums(version, mirrors), asset)
     except BinaryError:
         if not insecure:
             raise ChecksumUnavailable(version) from None
+    if expected is None and not insecure:
+        raise ChecksumUnavailable(version)
 
-    # 2) 下载
+    # 2) 下载（frps 与 frpc 同一个资产，因此只下一次）
     blob = download(asset, version, mirrors)
 
     # 3) 强校验——不通过绝不落盘
     actual = hashlib.sha256(blob).hexdigest()
-    if expected is None and not insecure:
-        raise ChecksumUnavailable(version)
     if expected is not None and actual != expected:
         raise ChecksumMismatch(asset, expected, actual)
 
     # 4) 解包 → 先落到临时文件，复验通过后才原子就位
-    _place_binary(blob, member="frps", dest=dest)
+    if place_frps:
+        _place_binary(blob, member="frps", dest=dest)
 
-    # 4b) 可按需附带 frpc（供插件契约测试使用）
-    if with_frpc:
-        _place_binary(blob, member="frpc", dest=bin_dir / f"frpc-{version}")
-        switch_symlink(bin_dir / "frpc", bin_dir / f"frpc-{version}")
+    # 4b) 可按需附带 frpc（供插件契约测试使用）。它与 frps 的落盘判定互相独立，
+    #     因此"已有 frps"时也能补装。
+    if place_frpc:
+        _place_binary(blob, member="frpc", dest=frpc_dest)
+        switch_symlink(bin_dir / "frpc", frpc_dest)
 
-    # 5) 切换（不影响运行中的进程）
-    if switch:
+    # 5) 切换（不影响运行中的进程）。`--only-download` 时 place_frps 只由 force 决定，
+    #    此时不该动链，因此这里再判一次 switch。
+    if switch and place_frps:
         switch_symlink(bin_dir / "frps", dest)
-    return InstallResult(version=version, binary=dest, switched=switch, downloaded=True)
+    return InstallResult(
+        version=version,
+        binary=dest,
+        switched=switch and place_frps,
+        downloaded=True,
+        switched_frpc=place_frpc,
+    )
 
 
 def _place_binary(blob: bytes, *, member: str, dest: Path) -> None:
@@ -294,11 +327,33 @@ def _place_binary(blob: bytes, *, member: str, dest: Path) -> None:
 
 
 def _verify_binary(path: Path) -> None:
-    """`-v` 复验：确认这是能跑起来的 frps，且版本达标。"""
-    proc = subprocess.run([str(path), "-v"], capture_output=True, text=True, timeout=10)
+    """`-v` 复验：确认这是能跑起来的 frps，且版本达标。
+
+    三种失败都要收口成 `BinaryError`（退出码 4），不能漏出裸异常：
+
+    - 非零退出 → 架构不匹配之类的"能执行但不是我"；
+    - **超时** → 二进制卡住。这是最容易被漏掉的一条：`subprocess.run` 抛的是
+      `TimeoutExpired`，它既不是 `FrpsctlError` 也不是 `OSError`，冒到 CLI 会
+      变成"未分类错误(1)"，把"二进制有问题"误报成"工具内部出错"；
+    - `OSError` → 不可执行（EACCES/ENOEXEC）。
+    """
+    try:
+        proc = subprocess.run([str(path), "-v"], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise BinaryError(
+            f"复验超时：{path} -v 在 10 秒内没有返回",
+            hint="二进制可能卡住或依赖缺失的动态库；请手工运行它确认真实行为",
+        ) from None
+    except OSError as exc:
+        raise BinaryError(
+            f"无法执行下载的二进制 {path}：{exc}",
+            hint="架构可能不匹配（例如在 arm64 上取了 amd64 包），或文件系统不允许执行",
+        ) from None
     if proc.returncode != 0:
         raise BinaryError(
             f"下载的二进制无法执行：{(proc.stderr or proc.stdout).strip()[:200]}",
             hint="架构可能不匹配（例如在 arm64 上取了 amd64 包）",
         )
+    # 版本门槛（§3.6）：不达标即抛 UnsupportedVersion；解析不出即抛
+    # VersionParseError —— 两者都是 BinaryError 的子类，退出码 4。
     ensure_supported(parse_version(proc.stdout or proc.stderr))

@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -381,3 +383,302 @@ class TestGetValue:
         doc = cfg.load_config(path)
         assert cfg.get_value(doc, "transport.tls.force") is True
         assert cfg.get_value(doc, "webServer.port") == 7500
+
+
+# ---------------------------------------------------------------------------
+# core/release.py —— 解包、复验、原子就位（供应链关键路径）
+# ---------------------------------------------------------------------------
+
+
+def make_fake_asset(
+    tmp_path: Path,
+    *,
+    version: str = "0.71.0",
+    members: dict[str, bytes] | None = None,
+) -> Path:
+    """造一个与官方资产**同结构**的 tar.gz（含 frps / frpc / LICENSE）。
+
+    这一步不能省：`extract_frps` 的路径穿越防护、`_place_binary` 的
+    "临时文件 → 复验 → `os.replace`"顺序，都只有在真实 tar 字节流上才测得出来。
+    """
+    import io
+    import tarfile
+
+    payload = members or {
+        "frps": b"#!/bin/sh\necho " + version.encode() + b"\n",
+        "frpc": b"#!/bin/sh\necho " + version.encode() + b"\n",
+    }
+    blob = io.BytesIO()
+    with tarfile.open(fileobj=blob, mode="w:gz") as tar:
+        for name, content in payload.items():
+            info = tarfile.TarInfo(name=f"frp_{version}_linux_amd64/{name}")
+            info.size = len(content)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(content))
+    path = tmp_path / f"frp_{version}_linux_amd64.tar.gz"
+    path.write_bytes(blob.getvalue())
+    return path
+
+
+class TestExtractFrps:
+    def test_extracts_by_basename(self, tmp_path) -> None:
+        from frpsctl.core import release as rel
+
+        asset = make_fake_asset(tmp_path)
+        assert rel.extract_frps(asset.read_bytes()) == b"#!/bin/sh\necho 0.71.0\n"
+
+    def test_extracts_frpc_too(self, tmp_path) -> None:
+        from frpsctl.core import release as rel
+
+        asset = make_fake_asset(tmp_path)
+        assert rel.extract_frps(asset.read_bytes(), member_name="frpc").startswith(b"#!/bin/sh")
+
+    def test_missing_member_is_a_binary_error(self, tmp_path) -> None:
+        from frpsctl.core import release as rel
+        from frpsctl.errors import BinaryError
+
+        asset = make_fake_asset(tmp_path, members={"frps": b"x"})
+        with pytest.raises(BinaryError, match="找不到 frpc"):
+            rel.extract_frps(asset.read_bytes(), member_name="frpc")
+
+    def test_path_traversal_member_is_not_extracted(self, tmp_path) -> None:
+        """`../../bin/sh` 这类名字的 basename 不是 frps，必须被跳过（不是落盘）。"""
+        import io
+        import tarfile
+
+        from frpsctl.core import release as rel
+        from frpsctl.errors import BinaryError
+
+        blob = io.BytesIO()
+        with tarfile.open(fileobj=blob, mode="w:gz") as tar:
+            content = b"evil"
+            info = tarfile.TarInfo(name="../../bin/sh")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        with pytest.raises(BinaryError):
+            rel.extract_frps(blob.getvalue())
+
+    def test_directory_entry_is_skipped(self, tmp_path) -> None:
+        """只有普通文件才算数：同名目录项不得被当成二进制读出。"""
+        import io
+        import tarfile
+
+        from frpsctl.core import release as rel
+        from frpsctl.errors import BinaryError
+
+        blob = io.BytesIO()
+        with tarfile.open(fileobj=blob, mode="w:gz") as tar:
+            info = tarfile.TarInfo(name="pkg/frps")
+            info.type = tarfile.DIRTYPE
+            tar.addfile(info)
+        with pytest.raises(BinaryError):
+            rel.extract_frps(blob.getvalue())
+
+
+class TestPlaceBinary:
+    """`_place_binary` 是"下载→校验→就位"的最后一步，此前零覆盖。"""
+
+    def test_places_executable_atomically(self, tmp_path) -> None:
+        from frpsctl.core import release as rel
+
+        asset = make_fake_asset(tmp_path)
+        dest = tmp_path / "bin" / "frps-0.71.0"
+        dest.parent.mkdir()
+        rel._place_binary(asset.read_bytes(), member="frps", dest=dest)
+
+        assert dest.read_bytes().startswith(b"#!/bin/sh")
+        assert dest.stat().st_mode & 0o111, "落盘的二进制必须可执行"
+        # 不留下临时文件
+        assert not [p for p in dest.parent.iterdir() if p.name != dest.name]
+
+    def test_reverify_failure_leaves_nothing_behind(self, tmp_path) -> None:
+        """`-v` 复验失败（版本不达标）→ 目标文件不得出现，临时文件不得残留。
+
+        这是"**校验不通过绝不落盘**"在最后一步的守卫：资产里的 frps 版本低于
+        门槛（§3.6）时，必须在就位之前停下来。
+        """
+        from frpsctl.core import release as rel
+        from frpsctl.errors import UnsupportedVersion
+
+        asset = make_fake_asset(tmp_path, version="0.69.1")
+        dest = tmp_path / "bin" / "frps-0.69.1"
+        dest.parent.mkdir()
+
+        with pytest.raises(UnsupportedVersion):
+            rel._place_binary(asset.read_bytes(), member="frps", dest=dest)
+
+        assert not dest.exists(), "复验失败却把二进制就位了"
+        assert not list(dest.parent.iterdir()), "留下了临时文件"
+
+    def test_reverify_timeout_is_a_binary_error(self, tmp_path, monkeypatch) -> None:
+        """复验超时必须收口成 BinaryError(4)，不能漏出裸 TimeoutExpired。
+
+        漏出去的话，CLI 会把它当"未分类错误(1)"——把"二进制有问题"误报成
+        "工具内部出错"，用户据此会去查 frpsctl 的 bug 而不是那个二进制。
+        """
+        from frpsctl.core import release as rel
+        from frpsctl.errors import BinaryError
+
+        def boom(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="frps -v", timeout=10)
+
+        monkeypatch.setattr(rel.subprocess, "run", boom)
+        with pytest.raises(BinaryError) as excinfo:
+            rel._verify_binary(tmp_path / "frps-0.71.0")
+        assert int(excinfo.value.exit_code) == 4
+        assert "超时" in excinfo.value.message
+
+    def test_reverify_exec_failure_is_a_binary_error(self, tmp_path, monkeypatch) -> None:
+        """EACCES / ENOEXEC 同样必须是 BinaryError(4)。"""
+        from frpsctl.core import release as rel
+        from frpsctl.errors import BinaryError
+
+        def boom(*args, **kwargs):
+            raise OSError(errno.ENOEXEC, "Exec format error")
+
+        monkeypatch.setattr(rel.subprocess, "run", boom)
+        with pytest.raises(BinaryError) as excinfo:
+            rel._verify_binary(tmp_path / "frps-0.71.0")
+        assert int(excinfo.value.exit_code) == 4
+
+
+class TestInstallChecksumOrder:
+    def test_checksum_is_checked_before_download(self, tmp_path, monkeypatch) -> None:
+        """拿不到校验和时必须**在下载之前**拒绝。
+
+        顺序反了也能得到正确结论，但会白下载一次，而且让 `--insecure` 的判断
+        看起来发生在下载之后。
+        """
+        from frpsctl.core import release as rel
+        from frpsctl.errors import ChecksumUnavailable
+
+        downloads: list[str] = []
+
+        def no_checksums(version, mirrors=None):
+            raise rel.BinaryError("校验和文件取不到")
+
+        def spy_download(asset, version, mirrors=None):
+            downloads.append(asset)
+            return b"should not be reached"
+
+        monkeypatch.setattr(rel, "download_checksums", no_checksums)
+        monkeypatch.setattr(rel, "download", spy_download)
+
+        with pytest.raises(ChecksumUnavailable):
+            rel.install(bin_dir=tmp_path / "bin", version="0.71.0")
+        assert downloads == [], "校验和还没拿到就开始下载了"
+
+    def test_insecure_still_downloads(self, tmp_path, monkeypatch) -> None:
+        """`--insecure` 是显式跳过校验：此时必须继续走到下载。"""
+        import io
+        import tarfile
+
+        from frpsctl.core import release as rel
+
+        payload = b"#!/bin/sh\necho 0.71.0\n"
+        blob = io.BytesIO()
+        with tarfile.open(fileobj=blob, mode="w:gz") as tar:
+            info = tarfile.TarInfo(name="pkg/frps")
+            info.size = len(payload)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(payload))
+
+        monkeypatch.setattr(
+            rel, "download_checksums", lambda *_a, **_k: (_ for _ in ()).throw(rel.BinaryError("nope"))
+        )
+        monkeypatch.setattr(rel, "download", lambda *_a, **_k: blob.getvalue())
+
+        result = rel.install(bin_dir=tmp_path / "bin", version="0.71.0", insecure=True)
+        assert result.downloaded is True
+        assert result.binary.exists()
+
+
+class TestWithFrpc:
+    """`--with-frpc` 与"frps 是否已在盘上"必须**相互独立**。
+
+    回归：此前 `install` 在 `dest.exists()` 时直接 `return`，于是"机器上已有 frps、
+    现在想补装 frpc"永远装不上——而输出还报着成功（`downloaded=False`、退出码 0）。
+    CI 恰好掩盖了它：CI 每次都是全新数据目录，必然走完整路径。
+
+    与 `_place_binary` 的用例共用 `make_fake_asset`：这里把真实 tar 字节流喂给
+    `download`，让被测代码走的是**真实的解包与复验路径**。
+    """
+
+    @staticmethod
+    def _patch_download(monkeypatch, asset_path, rel) -> list[str]:
+        """把 download/checksum 换成固定资产，并记录 download 被调用了几次。"""
+        import hashlib
+
+        calls: list[str] = []
+
+        def fake_download(asset, version, mirrors=None):
+            calls.append(asset)
+            return asset_path.read_bytes()
+
+        digest = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+        monkeypatch.setattr(rel, "download", fake_download)
+        monkeypatch.setattr(rel, "download_checksums", lambda *_a, **_k: f"{digest}  {asset_path.name}\n")
+        return calls
+
+    def test_installs_frpc_when_frps_already_present(self, tmp_path, monkeypatch) -> None:
+        """**回归核心**：frps 已在盘上 → 仍必须取出 frpc。"""
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake = make_fake_asset(tmp_path)
+        (bin_dir / "frps-0.71.0").write_bytes(b"#!/bin/sh\necho 0.71.0\n")
+        calls = self._patch_download(monkeypatch, fake, rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True)
+
+        assert calls, "已有 frps 时也必须下载（frpc 在同一个资产里）"
+        assert (bin_dir / "frpc-0.71.0").exists(), "frps 已存在时 frpc 没有被安装"
+        assert (bin_dir / "frpc").is_symlink()
+        assert (bin_dir / "frpc").resolve().name == "frpc-0.71.0"
+        assert result.downloaded is True
+
+    def test_both_present_skips_network_entirely(self, tmp_path, monkeypatch) -> None:
+        """两边都在盘上 → 一次网络都不该发（`downloaded=False`）。"""
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "frps-0.71.0").write_bytes(b"x")
+        (bin_dir / "frpc-0.71.0").write_bytes(b"x")
+        calls = self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True)
+        assert calls == [], "两边都已就位却仍然下载了"
+        assert result.downloaded is False
+
+    def test_without_flag_does_not_install_frpc(self, tmp_path, monkeypatch) -> None:
+        """不带 `--with-frpc` 时不得顺手装 frpc（它是测试专用件，不是运维件）。"""
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        rel.install(bin_dir=bin_dir, version="0.71.0")
+        assert (bin_dir / "frps-0.71.0").exists()
+        assert not (bin_dir / "frpc-0.71.0").exists()
+
+    def test_force_reinstalls_frpc_alongside_frps(self, tmp_path, monkeypatch) -> None:
+        """`--force` 对两者同时生效：不能只重装 frps 而漏掉 frpc。"""
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "frps-0.71.0").write_bytes(b"old")
+        (bin_dir / "frpc-0.71.0").write_bytes(b"old")
+        self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True, force=True)
+        assert result.downloaded is True
+        assert (bin_dir / "frps-0.71.0").read_bytes().startswith(b"#!/bin/sh")
+        assert (bin_dir / "frpc-0.71.0").read_bytes().startswith(b"#!/bin/sh")
+
+
+# ---------------------------------------------------------------------------
+# core/instance.py —— 快照序号分配
+# ---------------------------------------------------------------------------

@@ -33,12 +33,70 @@ from ..errors import AdminUnreachable, AlreadyRunning, ConfigError, FrpsctlError
 from . import ui
 from .context import AppContext, build_context, run_cli
 
+#: 只接受值的全局选项（`--name value` 或 `--name=value`）。
+#: 刻意**不含 `-v`**：那个短选项与 `log`/`status` 的 `-n`/`--interval` 之类局部
+#: 选项挤在一起，盲目前移会把子命令自己的参数搬到错误的位置。长名 `--verbose`
+#: 不冲突，因此短写只支持写在子命令之前（与 frps 的 `-v` 是两回事）。
+_GLOBAL_VALUE_FLAGS = frozenset({"--instance", "-i", "--root", "--config", "--binary", "--admin-password"})
+#: 开关型全局选项（不带值）。
+_GLOBAL_BOOL_FLAGS = frozenset({"--json", "--yes", "-y", "--verbose"})
+
+
+class _AnywhereGroup(typer.core.TyperGroup):
+    """让**全局选项出现在子命令之后**也能被识别。
+
+    为什么必须做这件事：Typer/Click 原生只解析"子命令之前"的选项，而
+    `frpsctl status --json` 这种写法既符合 README 的命令表，也符合所有人的直觉。
+    早先的绕法是给**每一条**子命令手工加一个同名的 `--json` 选项再在 `with_json()`
+    里做 OR —— 补了 19 处，于是 `--yes` / `--verbose` 写在后面仍然报
+    `No such option: --yes`，而 README 却写着"全局选项写在子命令前后都可以"。
+    逐命令打补丁是治标的：每加一条子命令、每加一个全局选项，都可能再漏一次。
+
+    治本的做法是在**解析之前**把散落在子命令后面的全局选项整体搬到前面。这样只有
+    这一处需要维护，且与子命令自身选项的优先级关系保持直观：
+
+    - `frpsctl status --json` → `frpsctl --json status`
+    - `frpsctl --instance web start` 原样不动（已经在前面）
+    - 局部选项（`start --health-timeout 3`）不匹配全局名单，位置不变
+    - `frpsctl install --version 0.71.0`：`--version` 不在名单里，因此仍归 `install`，
+      不会被误当成根命令的 `--version`
+    """
+
+    def parse_args(self, ctx, args):  # noqa: ANN001, ANN201 - Click 的接口签名
+        hoisted: list[str] = []
+        rest: list[str] = []
+        index = 0
+        while index < len(args):
+            item = args[index]
+            if item in _GLOBAL_BOOL_FLAGS:
+                hoisted.append(item)
+                index += 1
+                continue
+            if item in _GLOBAL_VALUE_FLAGS:
+                # 值紧随其后时一起搬；`--name=value` 形式已在下一个分支处理
+                if index + 1 < len(args):
+                    hoisted.extend([item, args[index + 1]])
+                    index += 2
+                else:
+                    rest.append(item)
+                    index += 1
+                continue
+            if any(item.startswith(f"{flag}=") for flag in _GLOBAL_VALUE_FLAGS):
+                hoisted.append(item)
+                index += 1
+                continue
+            rest.append(item)
+            index += 1
+        return super().parse_args(ctx, hoisted + rest)
+
+
 app = typer.Typer(
     add_completion=False,
     # 关掉 Click 的自动帮助：缺子命令属于**用法错误**，应当走退出码 2（§7.3），
     # 而不是打印帮助后退出 0 —— 那会让脚本误判为成功。
     no_args_is_help=False,
     help="把 frp 服务端（frps）包装成命令行工具：配置翻译器 + 进程保镖 + 状态聚合器。",
+    cls=_AnywhereGroup,
 )
 config_app = typer.Typer(no_args_is_help=True, help="配置读写与变更闭环。")
 service_app = typer.Typer(no_args_is_help=True, help="systemd 集成。")
@@ -163,6 +221,7 @@ def install(
                 "binary": str(result.binary),
                 "downloaded": result.downloaded,
                 "switched": result.switched,
+                "switched_frpc": result.switched_frpc,
                 "active": str(app_ctx.instance.bin_link),
             }
         )
@@ -176,8 +235,16 @@ def install(
         ui.emit("      只影响下一次 start。运行 `frpsctl status` 可对比两个版本。")
         if Systemd(app_ctx.instance).is_active():
             ui.emit("      该实例由 systemd 托管：unit 的 ExecStart 写的是具体路径，需 systemctl restart。")
+    elif result.downloaded:
+        # 二进制刚落盘但软链没动：可能是 `--only-download`，也可能是**同版本已在盘上**
+        # （此时切换是空操作）。两种原因的处置完全不同，不能笼统说"未切换"。
+        ui.emit("软链未改动：该版本已就位，`frps` 仍指向它。")
     else:
         ui.emit("已按 --only-download 落盘，未切换软链。")
+
+    if result.switched_frpc:
+        ui.emit(f"frpc {result.version} → {app_ctx.instance.bin_dir / f'frpc-{result.version}'}")
+        ui.emit("      （供插件契约测试使用；软链已指向它）")
 
 
 @app.command()
@@ -514,16 +581,22 @@ def status(
 ) -> None:
     """状态聚合：owner / 状态 / pid / 版本 / 运行时长 / 客户端 / 代理 / 流量 / 健康。"""
     app_ctx = _ctx(ctx).with_json(json_output)
-    if watch:
-        try:
-            while True:
-                if not app_ctx.json:
-                    ui.emit("\033[2J\033[H")
-                _print_status(app_ctx)
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            return
-    _print_status(app_ctx)
+    if not watch:
+        _print_status(app_ctx)
+        return
+
+    # `--watch` 是**持续刷新**，Ctrl-C 是它的正常退出方式，不是错误。
+    # 这里刻意只在循环内渲染：以前写成"循环 + 循环后无条件再渲染一次"，于是
+    # Ctrl-C 会多刷一屏（`except` 分支里的 `return` 让循环后的调用变成"退出前
+    # 再打一次"），用户看到的是按了中断却又冒出一份状态。
+    try:
+        while True:
+            if not app_ctx.json:
+                ui.emit("\033[2J\033[H")
+            _print_status(app_ctx)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return
 
 
 def _print_status(app_ctx: AppContext) -> None:
@@ -759,11 +832,16 @@ def config_set(
 def config_edit(
     ctx: typer.Context,
     health_timeout: float = typer.Option(10.0, "--health-timeout", help="健康检查等待秒数"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过「应用以上改动并重启？」的确认"),
 ) -> None:
     """用 $EDITOR 编辑，保存后走完全相同的闭环（先展示 diff 让人确认）。
 
     **不提供 `--json`**：它要展示 diff 并等待人确认，没有"机器可读"的语义。
+
+    `--yes` 是**局部**选项（与全局同名）：`init` 早就有局部的 `--yes`，而这里此前
+    只能靠全局那个——于是 `frpsctl config edit --yes` 会报 `No such option`。
     """
+
     import tempfile
 
     app_ctx = _ctx(ctx)
@@ -794,7 +872,7 @@ def config_edit(
     diff = cfg.diff_texts(original, draft, app_ctx.config_path.name)
     ui.emit(cfg.mask_diff(diff).rstrip())
     ui.emit("")
-    if not app_ctx.yes and not typer.confirm("应用以上改动并重启？", default=True):
+    if not (yes or app_ctx.yes) and not typer.confirm("应用以上改动并重启？", default=True):
         ui.emit("已放弃")
         return
 
@@ -1202,12 +1280,16 @@ def plugin_serve(
     bind: str = typer.Option("127.0.0.1:8080", "--bind", help="绑定地址（必须回环）"),
     path: str = typer.Option("/handler", "--path", help="插件回调路径（需与 frps 的 httpPlugins.path 一致）"),
     access_log: bool = typer.Option(False, "--access-log", help="把每个请求打进 stderr"),
-    json_output: bool = typer.Option(False, "--json", help="启动后以 JSON 输出一次状态"),
+    json_output: bool = typer.Option(False, "--json", help="启动前以 JSON 输出一次状态（随后仍前台运行）"),
 ) -> None:
     """启动插件服务（前台）。
 
     ⚠️ 插件是**全部客户端登录的单点**且 fail-closed：它挂掉 = 所有人登录不了。
     生产环境请用 systemd 守护并设置 `Restart=always`。
+
+    `--json` 输出的是**启动前的一次性状态**，之后仍然是前台阻塞运行——它不是
+    "以 JSON 流式汇报"，脚本若需要探活请轮询 `GET /healthz`。
+    收到 SIGTERM（systemd stop）会优雅退出并先把审计缓冲刷盘。
     """
     app_ctx = _ctx(ctx).with_json(json_output)
     policy_file, loaded = _load_policy(app_ctx, policy)
@@ -1248,10 +1330,10 @@ def plugin_serve(
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        # `serve_forever` 已经把 SIGTERM 转成 KeyboardInterrupt，因此这条分支同时
+        # 覆盖 Ctrl-C 与 systemd stop；它自己负责 close()（含审计刷盘），此处不重复。
         ui.emit("")
         ui.emit(f"已停止。{server.audit.describe()}")
-    finally:
-        server.close()
 
 
 def main() -> None:
