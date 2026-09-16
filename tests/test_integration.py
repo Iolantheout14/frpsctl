@@ -180,6 +180,22 @@ class TestStartGuards:
         # 且不留下 state.json
         assert not inst.state.exists()
 
+    def test_process_dying_after_grace_is_startup_failure(self, inst, write_config):
+        """进程在早退检测窗口**之后**才死：仍是启动失败（退出码 10）。
+
+        这条路径此前会把一个已经死掉的进程当成"已启动"：state.json 已写、
+        早退检测已过，之后没有任何地方重新确认 L1。现在健康等待阶段发现
+        L1 失败会立即收尾并清理状态，避免留下假 RUNNING。
+        """
+        write_config(BASIC_CONFIG)
+        fake = make_fake_frps(inst.bin_dir, mode="exit_after")
+        lc = make_lifecycle(inst, fake)
+
+        with pytest.raises(StartupFailed):
+            lc.start(health_timeout=10)
+        assert not inst.state.exists(), "进程已死却留下 state.json → 假 RUNNING"
+        assert lc.state()[0] is State.STOPPED
+
     def test_double_start_is_rejected(self, running):
         lc, report, _ = running
         from frpsctl.errors import AlreadyRunning
@@ -403,6 +419,30 @@ class TestRollback:
         lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
         with pytest.raises(ConfigError):
             rollback_to(inst, steps=1, lifecycle=lc, restart=False)
+
+    def test_rollback_creates_exactly_one_snapshot(self, inst, write_config):
+        """一次回滚只消耗 1 份快照，且动作被正确记账。
+
+        回归：`rollback_to` 与 `apply_change` 此前各自 `config_snapshot` 一次，
+        两份内容完全相同——"保留 10 份"实际只够 5 次操作，`rollback N` 的
+        计数里一半是重复项。修复后快照只在 apply_change 的锁内创建一次。
+        """
+        import json as _json
+
+        from frpsctl.core.transaction import config_snapshot
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        config_snapshot(inst, action="baseline")
+        before = len(inst.history_entries())
+
+        rollback_to(inst, steps=1, lifecycle=lc, restart=False)
+
+        entries = inst.history_entries()
+        assert len(entries) == before + 1, f"一次回滚新增了 {len(entries) - before} 份快照"
+        meta = _json.loads((entries[0] / "meta.json").read_text("utf-8"))
+        assert meta["action"] == "rollback 1", meta
 
     def test_history_keeps_only_ten(self, inst, write_config):
         """§9 第 6 步：保留最近 10 份。"""

@@ -666,6 +666,18 @@ class TestDoctorDashboardCredentials:
         assert not self._weak(findings)
         assert not [f for f in findings if f.check == "dashboard 暴露面"]
 
+    def test_loopback_network_address_is_not_flagged_as_exposure(self, tmp_path: Path) -> None:
+        """`127.0.0.2`（回环网段）不是"非回环暴露面"。
+
+        回归：doctor 此前用 `addr in ("127.0.0.1", "::1", "localhost")` 判回环，
+        而 schema 的"危险组合"拦截用 ipaddress 判据——`127.0.0.2` 上两套标准
+        结论相反（doctor 误报、schema 放行）。现已统一到 `is_loopback`。
+        """
+        findings = self._findings(
+            tmp_path, 'addr = "127.0.0.2"\nport = 17500\nuser = ""\npassword = ""\n'
+        )
+        assert not [f for f in findings if f.check == "dashboard 暴露面"]
+
 
 # ---------------------------------------------------------------------------
 # 配额（max_proxies）
@@ -769,10 +781,95 @@ class TestQuota:
         assert result.allowed is False
         assert "dashboard" in result.reason
 
+    def test_slow_dashboard_query_does_not_block_other_users(self, monkeypatch) -> None:
+        """一个用户的 dashboard 查询不得阻塞其他用户。
+
+        回归：预占路径此前持**全局**锁做网络调用，而 frp 侧对插件 HTTP
+        客户端没有超时（§11.2）——一个用户的慢查询会串行挂住所有用户的
+        登录链路。重构后每个用户一把锁，网络调用不碰全局锁。
+        """
+        import threading
+
+        from frpsctl.plugin.quota import QuotaChecker
+
+        checker = QuotaChecker(admin_url="http://example.invalid:7500", timeout=2.0)
+        alice_querying = threading.Event()
+        release_alice = threading.Event()
+
+        def fake_query(user: str) -> int:
+            if user == "alice":
+                alice_querying.set()
+                release_alice.wait(5)
+            return 0
+
+        monkeypatch.setattr(checker, "_query_dashboard", fake_query)
+
+        thread = threading.Thread(target=lambda: checker.check("alice", 5, reserve=True))
+        thread.start()
+        try:
+            assert alice_querying.wait(2.0), "alice 的查询没有开始"
+            started = time.monotonic()
+            result = checker.check("bob", 5, reserve=True)
+            elapsed = time.monotonic() - started
+        finally:
+            release_alice.set()
+            thread.join(timeout=5)
+
+        assert result.allowed is True
+        assert elapsed < 0.5, f"bob 被 alice 的网络查询阻塞了 {elapsed:.2f}s"
+
+    def test_concurrent_reserve_does_not_exceed_limit(self) -> None:
+        """同一用户的并发预占不得突破上限（"读-判-占"必须原子）。"""
+        import threading
+
+        from frpsctl.plugin.quota import QuotaChecker
+
+        checker = QuotaChecker()  # 本地模式：不涉及网络
+        results: list[bool] = []
+        guard = threading.Lock()
+
+        def worker() -> None:
+            verdict = checker.check("alice", 3, reserve=True)
+            with guard:
+                results.append(verdict.allowed)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for item in threads:
+            item.start()
+        for item in threads:
+            item.join()
+
+        assert sum(results) == 3, f"并发预占突破了上限：{sum(results)} 个通过"
+
 
 # ---------------------------------------------------------------------------
 # 进程级生命周期：SIGTERM 必须优雅退出并刷盘（systemd stop 的真实路径）
 # ---------------------------------------------------------------------------
+
+
+def _wait_sigterm_handled(pid: int, *, timeout: float = 5.0) -> bool:
+    """等待子进程**真正捕获** SIGTERM（读 `/proc/<pid>/status` 的 `SigCgt` 掩码）。
+
+    为什么不能"起了就发信号"：`serve_forever()` 内部先安装 handler 再阻塞，
+    抢在安装之前发 SIGTERM 会直接杀死进程（审计不落盘）——这是该用例偶发
+    失败的真因。用内核记录的事实做就绪判定，比定时猜测可靠。
+    """
+    import signal as _signal
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            return False
+        for line in status.splitlines():
+            if line.startswith("SigCgt:"):
+                mask = int(line.split(":", 1)[1].strip(), 16)
+                if mask & (1 << (_signal.SIGTERM - 1)):
+                    return True
+                break
+        time.sleep(0.02)
+    return False
 
 
 class TestServeForeverLifecycle:
@@ -825,6 +922,9 @@ class TestServeForeverLifecycle:
         try:
             port = int((proc.stdout.readline() or "0").strip())
             assert port > 0, proc.stderr.read()[:400]
+            # 必须等 handler **真正装好**再发信号：serve_forever() 里
+            # "安装 handler" 与 "开始阻塞" 之间存在窗口，抢跑会直接杀死进程。
+            assert _wait_sigterm_handled(proc.pid), "子进程未安装 SIGTERM 处理器"
             # 记录此刻只在内存里
             audit_file = tmp_path / "audit.jsonl"
             assert not audit_file.exists() or audit_file.read_text("utf-8") == ""

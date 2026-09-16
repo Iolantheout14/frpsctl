@@ -8,6 +8,7 @@
 | `FRPS_FAKE_VERSION` | 如 `0.71.0` | `-v` 输出（**无 `v` 前缀**，与真 frps 一致） |
 | `FRPS_FAKE_MODE` | `ok` | 起一个最小 HTTP 服务并响应 `/healthz` |
 | | `exit` | 打印一行错误后立即退出（模拟端口被占/证书缺失） |
+| | `exit_after` | 存活 2 秒后退出（在早退检测窗口**之后**崩溃） |
 | | `hang` | 忽略 SIGTERM，只能被 SIGKILL 干掉（模拟卡死） |
 | | `slow` | 延迟 3 秒后再响应 `/healthz`（模拟健康检查超时） |
 
@@ -189,6 +190,14 @@ def main() -> int:
     # 3) 启动
     if MODE == "exit":
         print("frps: listen tcp :17000: bind: address already in use")
+        return 1
+
+    if MODE == "exit_after":
+        # 在早退检测窗口（STARTUP_GRACE = 1.5s）**之后**才退出：模拟"启动看起来
+        # 成功、随后崩溃"的场景——只有健康等待阶段才能发现它。
+        time.sleep(2.0)
+        print("frps: exited during health wait")
+        sys.stdout.flush()
         return 1
 
     if MODE == "hang":

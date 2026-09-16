@@ -360,6 +360,49 @@ class TestAtomicWrite:
         cfg.atomic_write(path, "b = 2\n")
         assert path.read_text("utf-8") == "b = 2\n"
 
+    def test_preserves_existing_owner(self, tmp_path, monkeypatch) -> None:
+        """重建文件必须保留原属主。
+
+        回归：systemd 部署会把配置/目录**移交**给服务用户（§12.2），而
+        `config set` 走 atomic_write 重建文件——若属主被换回安装者（root），
+        frps 用户下次启动就读不到配置，unit 直接失败，且报错现场离本次
+        操作很远。
+        """
+        path = tmp_path / "frps.toml"
+        path.write_text("a = 1\n", "utf-8")
+        expected = os.stat(path)
+
+        recorded: list[tuple[int, int]] = []
+        real_fchown = os.fchown
+
+        def spy(fd, uid, gid):
+            recorded.append((uid, gid))
+            return real_fchown(fd, uid, gid)
+
+        monkeypatch.setattr(os, "fchown", spy)
+        cfg.atomic_write(path, "b = 2\n")
+
+        assert recorded == [(expected.st_uid, expected.st_gid)]
+        assert path.read_text("utf-8") == "b = 2\n"
+
+    def test_fchown_failure_does_not_break_write(self, tmp_path, monkeypatch) -> None:
+        """非 root / 不支持 chown 的文件系统上，写盘不能被属主保留拖垮。"""
+        path = tmp_path / "frps.toml"
+        path.write_text("a = 1\n", "utf-8")
+
+        def boom(*args, **kwargs):
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(os, "fchown", boom)
+        cfg.atomic_write(path, "b = 2\n")
+        assert path.read_text("utf-8") == "b = 2\n"
+
+    def test_new_file_has_no_owner_to_preserve(self, tmp_path) -> None:
+        """目标不存在时正常落盘（fchown 那条路径不得反过来破坏写入）。"""
+        path = tmp_path / "fresh.toml"
+        cfg.atomic_write(path, "a = 1\n")
+        assert path.read_text("utf-8") == "a = 1\n"
+
 
 class TestSecrets:
     def test_secret_detection(self) -> None:
@@ -367,6 +410,109 @@ class TestSecrets:
         assert cfg.is_secret_key("auth.token") is True
         assert cfg.is_secret_key("bindPort") is False
         assert cfg.is_secret_key("auth.oidc.clientSecret") is True
+
+
+class TestMaskDiff:
+    """`mask_diff` 是 diff 输出（config set / edit / diff / rollback）的最后一道闸门。
+
+    回归：它此前只识别逐行赋值（`token = "..."`），而 **TOML 内联表**会把机密
+    藏进值里（`auth = { token = "..." }`）——实测确认原文会被打印出来，
+    等于给 §10 硬约束 2 开了一个出口。
+    """
+
+    SECRET = "SUPERSECRET123456"
+
+    def test_masks_plain_assignment(self) -> None:
+        diff = '+[auth]\n+token = "SUPERSECRET123456"\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out
+        assert "***" in out
+
+    def test_masks_inline_table(self) -> None:
+        diff = f'+auth = {{ token = "{self.SECRET}", method = "token" }}\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"内联表机密泄露：{out}"
+        # 非敏感键必须保留（打码不能把有用信息一起抹掉）
+        assert "method" in out
+
+    def test_masks_nested_inline_table(self) -> None:
+        diff = f'+webServer = {{ addr = "127.0.0.1", creds = {{ password = "{self.SECRET}" }} }}\n'
+        assert self.SECRET not in cfg.mask_diff(diff)
+
+    def test_masks_inline_table_under_a_table_header(self) -> None:
+        diff = f'+[auth]\n+oidc = {{ clientSecret = "{self.SECRET}" }}\n'
+        assert self.SECRET not in cfg.mask_diff(diff)
+
+    def test_keeps_non_secret_inline_values_untouched(self) -> None:
+        diff = '+allowPorts = [{ start = 6000, end = 6100 }]\n'
+        assert cfg.mask_diff(diff) == diff
+
+    def test_masks_array_of_inline_tables_with_secret(self) -> None:
+        diff = f'+[[httpPlugins]]\n+name = "x"\n+metadata = [{{ token = "{self.SECRET}" }}]\n'
+        assert self.SECRET not in cfg.mask_diff(diff)
+
+    def test_array_table_header_does_not_corrupt_table_tracking(self) -> None:
+        """`[[httpPlugins]]` 的表名解析必须正确（此前正则会把 `[` 带进表名）。"""
+        diff = '+[[httpPlugins]]\n+token = "SUPERSECRET123456"\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"数组表下的敏感键未被识别：{out}"
+
+    def test_unparsable_value_with_secret_like_content_is_masked_conservatively(self) -> None:
+        """值解析失败但形似含机密时，**保守打码**而不是原样输出。"""
+        diff = '+auth = { token = "SUPERSECRET123456"\n'  # 缺右括号，解析必失败
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"不可解析行未保守打码：{out}"
+
+    def test_masks_multiline_double_quoted_string(self) -> None:
+        """三引号多行字符串：值本体与内容行都必须打码。
+
+        回归：状态机之前只处理单行，`token = \"\"\"` 之后的内容行原样打印。
+        """
+        diff = f'+token = """\n+{self.SECRET}\n+"""\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"多行字符串泄露：{out}"
+
+    def test_masks_multiline_literal_string(self) -> None:
+        diff = f"+token = '''\n+{self.SECRET}\n+'''\n"
+        assert self.SECRET not in cfg.mask_diff(diff)
+
+    def test_masks_inline_table_split_across_lines(self) -> None:
+        """内联表被拆成多行书写：起始行打码，续行定点打码。"""
+        diff = f'+auth = {{\n+  token = "{self.SECRET}",\n+}}\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"多行内联表泄露：{out}"
+
+    def test_masks_secret_nested_in_multiline_array(self) -> None:
+        """非敏感键的多行数组里内嵌敏感内联表片段。"""
+        diff = f'+foo = [\n+  {{ token = "{self.SECRET}" }},\n+]\n'
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out, f"多行数组内嵌机密泄露：{out}"
+
+    def test_masks_secret_in_unclosed_start_line(self) -> None:
+        """非敏感键的未闭合起始行里已经写着敏感片段。"""
+        diff = f'+foo = {{ token = "{self.SECRET}"\n'
+        assert self.SECRET not in cfg.mask_diff(diff)
+
+    def test_recovers_after_multiline_structure(self) -> None:
+        """跨行结构闭合后，后续行必须恢复常规处理（状态机不能卡死）。"""
+        diff = (
+            f'+auth = {{\n+  token = "{self.SECRET}",\n+}}\n'
+            "+bindPort = 7000\n"
+            f'+token = "{self.SECRET}_B"\n'
+        )
+        out = cfg.mask_diff(diff)
+        assert self.SECRET not in out
+        assert "bindPort = 7000" in out
+
+    def test_non_secret_multiline_array_is_untouched(self) -> None:
+        """无敏感内容的多行数组必须原样保留（打码不能牺牲可读性）。"""
+        diff = "+allowPorts = [\n+  { start = 6000, end = 6100 },\n+]\n"
+        assert cfg.mask_diff(diff) == diff
+
+    def test_bare_key_is_treated_as_secret(self) -> None:
+        """裸 `token = "..."`（无表头）也必须打码（防御性判定）。"""
+        diff = f'+token = "{self.SECRET}"\n'
+        assert self.SECRET not in cfg.mask_diff(diff)
 
 
 class TestGetValue:
@@ -593,6 +739,38 @@ class TestInstallChecksumOrder:
         assert result.binary.exists()
 
 
+class TestResolveMirrors:
+    """镜像解析优先级：CLI 参数 > FRPSCTL_MIRROR > 内置。
+
+    此前 DEFAULT_MIRRORS 硬编码在代码里，文档却写着"下载地址可被镜像替换"——
+    用户拿到一个无法兑现的承诺。
+    """
+
+    def test_cli_wins_over_env(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.setenv("FRPSCTL_MIRROR", "https://env.example")
+        assert rel.resolve_mirrors(["https://cli.example/"]) == ("https://cli.example",)
+
+    def test_env_used_when_no_cli(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.setenv("FRPSCTL_MIRROR", "https://a.example, https://b.example/")
+        assert rel.resolve_mirrors() == ("https://a.example", "https://b.example")
+
+    def test_defaults_when_nothing_set(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.delenv("FRPSCTL_MIRROR", raising=False)
+        assert rel.resolve_mirrors() == rel.DEFAULT_MIRRORS
+
+    def test_empty_items_are_ignored(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.delenv("FRPSCTL_MIRROR", raising=False)
+        assert rel.resolve_mirrors(["", "  "]) == rel.DEFAULT_MIRRORS
+
+
 class TestWithFrpc:
     """`--with-frpc` 与"frps 是否已在盘上"必须**相互独立**。
 
@@ -678,6 +856,64 @@ class TestWithFrpc:
         assert (bin_dir / "frps-0.71.0").read_bytes().startswith(b"#!/bin/sh")
         assert (bin_dir / "frpc-0.71.0").read_bytes().startswith(b"#!/bin/sh")
 
+    def test_only_download_does_not_touch_either_symlink(self, tmp_path, monkeypatch) -> None:
+        """`--only-download` 对 frps 与 frpc 一视同仁：都只落盘、不切链。
+
+        回归：frpc 软链此前**无条件**切换，同一个参数出现两套语义——"先把
+        二进制备到多台机器、再统一切换"的运维节奏会被悄悄破坏。
+        """
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True, switch=False)
+
+        assert (bin_dir / "frps-0.71.0").exists()
+        assert (bin_dir / "frpc-0.71.0").exists()
+        assert not (bin_dir / "frps").exists(), "frps 软链被切换了"
+        assert not (bin_dir / "frpc").exists(), "frpc 软链被切换了"
+        assert result.switched is False
+        assert result.switched_frpc is False
+
+    def test_both_present_repairs_frpc_symlink(self, tmp_path, monkeypatch) -> None:
+        """两边都在盘上时，缺失的 frpc 软链会被幂等校正（与 frps 行为一致）。
+
+        此前这条捷径只碰 frps 的链，`--with-frpc` 时手工删掉的 frpc 链
+        永远修不回来。
+        """
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "frps-0.71.0").write_bytes(b"x")
+        (bin_dir / "frpc-0.71.0").write_bytes(b"x")
+        calls = self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True)
+
+        assert calls == [], "已在盘上却下载了"
+        assert (bin_dir / "frps").is_symlink()
+        assert (bin_dir / "frpc").is_symlink()
+        assert result.switched is True
+        assert result.switched_frpc is True
+
+    def test_both_present_only_download_keeps_symlinks_absent(self, tmp_path, monkeypatch) -> None:
+        """两边在盘上 + `--only-download`：不建立任何软链。"""
+        from frpsctl.core import release as rel
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "frps-0.71.0").write_bytes(b"x")
+        (bin_dir / "frpc-0.71.0").write_bytes(b"x")
+        self._patch_download(monkeypatch, make_fake_asset(tmp_path), rel)
+
+        result = rel.install(bin_dir=bin_dir, version="0.71.0", with_frpc=True, switch=False)
+        assert not (bin_dir / "frps").exists()
+        assert not (bin_dir / "frpc").exists()
+        assert result.switched is False
+        assert result.switched_frpc is False
+
 
 # ---------------------------------------------------------------------------
 # core/instance.py —— 快照序号分配
@@ -734,6 +970,135 @@ class TestHistorySlot:
 
 
 # ---------------------------------------------------------------------------
+# cli —— 日志 tail 轮转检测与 NDJSON 输出
+# ---------------------------------------------------------------------------
+
+
+class TestLogTail:
+    def test_reopen_if_rotated_detects_new_inode(self, tmp_path) -> None:
+        """日志轮转（rename + 新建）后必须重开新文件——跟路径，不跟旧 inode。"""
+        from frpsctl.cli import _reopen_if_rotated
+
+        path = tmp_path / "frps.log"
+        path.write_text("old\n", "utf-8")
+        handle = path.open("r", encoding="utf-8")
+        try:
+            assert _reopen_if_rotated(path, handle) is handle  # 未轮转：原样返回
+
+            path.rename(tmp_path / "frps.log.1")
+            path.write_text("new\n", "utf-8")
+
+            reopened = _reopen_if_rotated(path, handle)
+            assert reopened is not handle, "轮转后没有重开新文件"
+            assert reopened.readline() == "new\n"
+            reopened.close()
+        finally:
+            handle.close()
+
+    def test_reopen_if_rotated_survives_missing_file(self, tmp_path) -> None:
+        """文件被移走、新文件还没建的窗口里不能抛异常（等待下一轮即可）。"""
+        from frpsctl.cli import _reopen_if_rotated
+
+        path = tmp_path / "frps.log"
+        path.write_text("x\n", "utf-8")
+        handle = path.open("r", encoding="utf-8")
+        try:
+            path.unlink()
+            assert _reopen_if_rotated(path, handle) is handle
+        finally:
+            handle.close()
+
+
+class TestParseListen:
+    """`status` 的 listen 行来自这里（此前完全没有展示控制端口）。"""
+
+    def test_reads_explicit_values(self, tmp_path) -> None:
+        from frpsctl.core.healthcheck import parse_listen
+
+        config = tmp_path / "frps.toml"
+        config.write_text('bindAddr = "127.0.0.1"\nbindPort = 17000\n', "utf-8")
+        info = parse_listen(config)
+        assert info is not None
+        assert (info.addr, info.port) == ("127.0.0.1", 17000)
+        assert info.display == "127.0.0.1:17000"
+
+    def test_defaults_when_keys_missing(self, tmp_path) -> None:
+        """合法空配置的生效值是 frp 的默认 0.0.0.0:7000（附录 A）。"""
+        from frpsctl.core.healthcheck import parse_listen
+
+        config = tmp_path / "frps.toml"
+        config.write_text("# 空配置\n", "utf-8")
+        info = parse_listen(config)
+        assert info is not None
+        assert (info.addr, info.port) == ("0.0.0.0", 7000)
+
+    def test_missing_file_returns_none(self, tmp_path) -> None:
+        from frpsctl.core.healthcheck import parse_listen
+
+        assert parse_listen(tmp_path / "nope.toml") is None
+
+    def test_broken_file_returns_none(self, tmp_path) -> None:
+        from frpsctl.core.healthcheck import parse_listen
+
+        config = tmp_path / "frps.toml"
+        config.write_text("bindPort = = =", "utf-8")
+        assert parse_listen(config) is None
+
+    def test_ipv6_display_is_bracketed(self, tmp_path) -> None:
+        from frpsctl.core.healthcheck import parse_listen
+
+        config = tmp_path / "frps.toml"
+        config.write_text('bindAddr = "::"\nbindPort = 7000\n', "utf-8")
+        info = parse_listen(config)
+        assert info is not None
+        assert info.display == "[::]:7000"
+
+
+class TestIsLoopback:
+    """全项目共用的回环判据（schema / doctor / plugin 都指向它）。"""
+
+    def test_loopback_forms(self) -> None:
+        from frpsctl.core.healthcheck import is_loopback
+
+        for addr in ("127.0.0.1", "127.0.0.2", "localhost", "localhost:7500", "::1", "[::1]:7500"):
+            assert is_loopback(addr) is True, addr
+
+    def test_non_loopback_forms(self) -> None:
+        from frpsctl.core.healthcheck import is_loopback
+
+        for addr in ("0.0.0.0", "192.168.1.10", "example.com:7500", "::", "[::]:8080"):
+            assert is_loopback(addr) is False, addr
+
+    def test_dangerous_combination_ignores_loopback_network(self) -> None:
+        """`127.0.0.2` 属于回环网段：不该被当成"对外暴露"。
+
+        回归：doctor 与 schema 各有一套判据，`127.0.0.2` 会在 doctor 侧
+        被误报为"监听非回环"。
+        """
+        from frpsctl.core.schema import check_dangerous_combination
+
+        assert check_dangerous_combination({"webServer": {"addr": "127.0.0.2", "port": 7500}}) is None
+
+
+class TestEmitJsonCompact:
+    def test_compact_is_single_line(self, capsys) -> None:
+        """`--watch --json` 用 NDJSON：每行一个完整对象，可被逐行消费。"""
+        from frpsctl.cli import ui
+
+        ui.emit_json({"a": 1, "nested": {"b": 2}}, compact=True)
+        out = capsys.readouterr().out
+        assert out == '{"a": 1, "nested": {"b": 2}}\n'
+
+    def test_non_compact_is_pretty(self, capsys) -> None:
+        from frpsctl.cli import ui
+
+        ui.emit_json({"a": 1})
+        out = capsys.readouterr().out
+        assert "\n  " in out, "默认输出应当是缩进格式"
+        assert out.endswith("\n")
+
+
+# ---------------------------------------------------------------------------
 # core/systemd.py —— unit 渲染与 systemctl 委托
 # ---------------------------------------------------------------------------
 
@@ -752,7 +1117,9 @@ class TestRenderUnit:
         )
         assert "ExecStart=/opt/frps/frps-0.71.0 -c /etc/frps/instances/%i/frps.toml" in text
         assert "WorkingDirectory=/etc/frps/instances/%i" in text
-        assert "ReadWritePaths=/var/log/frps" in text
+        # ReadWritePaths 必须同时包含日志目录与**实例目录**：ProtectSystem=strict
+        # 下其余路径只读，而 frp 默认要往实例目录写 ./frps.log。
+        assert "ReadWritePaths=/var/log/frps /etc/frps/instances/%i" in text
         # 实例名走 systemd 自己的说明符，不在渲染期展开
         assert "%i" in text
         assert "{exec_start}" not in text and "{config_dir}" not in text, "有占位符没被替换"
@@ -779,6 +1146,32 @@ class TestRenderUnit:
 
         assert Systemd(inst).unit_name == "frps@test.service"
 
+    def test_renders_custom_user_and_group(self) -> None:
+        """服务用户可配置（`--user`/`--group`）：模板不得把它们写死。"""
+        from frpsctl.core.systemd import render_unit
+
+        text = render_unit(
+            binary="/opt/frps/frps-0.71.0",
+            config_dir=Path("/etc/frps/instances"),
+            log_dir=Path("/var/log/frps"),
+            user="svc-frps",
+            group="svc-frps",
+        )
+        assert "User=svc-frps" in text
+        assert "Group=svc-frps" in text
+
+    def test_group_defaults_to_user(self) -> None:
+        from frpsctl.core.systemd import render_unit
+
+        text = render_unit(
+            binary="/opt/frps/frps-0.71.0",
+            config_dir=Path("/etc/frps/instances"),
+            log_dir=Path("/var/log/frps"),
+            user="alice",
+        )
+        assert "User=alice" in text
+        assert "Group=alice" in text
+
 
 class TestSystemdDelegation:
     """委托路径此前零覆盖，而它正是 §15.5.4 里"文档承诺了、代码没做到"的那一处。"""
@@ -787,6 +1180,8 @@ class TestSystemdDelegation:
     def systemd(self, inst, tmp_path):
         from frpsctl.core.systemd import Systemd
 
+        # unit 的 ExecStart 固定使用实例目录内的 frps.toml：部署体检要求它存在
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
         return Systemd(inst, unit_dir=tmp_path / "systemd")
 
     @pytest.fixture
@@ -810,6 +1205,30 @@ class TestSystemdDelegation:
         """
         monkeypatch.setattr(os, "geteuid", lambda: 0)
 
+    @pytest.fixture
+    def fake_accounts(self, monkeypatch):
+        """把部署体检指向**当前进程的真实账户**。
+
+        测试环境不能依赖系统里恰好有 `frps` 用户；返回真实 uid/gid 后，
+        chown 是 no-op、权限位检查也符合预期。
+        """
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._account_ids",
+            lambda *_: (os.getuid(), os.getgid()),
+        )
+
+    @pytest.fixture
+    def foreign_accounts(self, monkeypatch):
+        """假装服务用户是"另一个账户"（uid/gid 偏移）。
+
+        用于覆盖"目录/文件对服务用户不可达"的分支：0700 的目录对偏移后的
+        身份就是不可进入的。
+        """
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._account_ids",
+            lambda *_: (os.getuid() + 12345, os.getgid() + 12345),
+        )
+
     def test_start_stop_restart_delegate_to_systemctl(self, systemd, recorded, as_root) -> None:
         systemd.start()
         systemd.stop()
@@ -820,14 +1239,20 @@ class TestSystemdDelegation:
             ["systemctl", "restart", "frps@test.service"],
         ]
 
-    def test_install_template_writes_unit_and_enables(self, systemd, recorded, tmp_path, as_root) -> None:
-        path = systemd.install_template(
-            binary=Path("/opt/frps/frps-0.71.0"),
-            log_dir=Path("/var/log/frps"),
-        )
+    def test_install_template_writes_unit_and_enables(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        log_dir = tmp_path / "logs"
+
+        path = systemd.install_template(binary=binary, log_dir=log_dir)
         assert path == systemd.template_path
         assert path.exists()
-        assert "ExecStart=/opt/frps/frps-0.71.0" in path.read_text("utf-8")
+        assert f"ExecStart={binary}" in path.read_text("utf-8")
+        assert "User=frps" in path.read_text("utf-8")
+        assert log_dir.is_dir(), "ReadWritePaths 的目录必须存在，否则 unit 起不来"
         assert path.stat().st_mode & 0o777 == 0o644
         assert ["systemctl", "daemon-reload"] in recorded
         assert ["systemctl", "enable", "frps@test.service"] in recorded
@@ -842,15 +1267,169 @@ class TestSystemdDelegation:
             systemd.install_template(binary=Path("/opt/frps"), log_dir=Path("/var/log/frps"))
         assert systemd.template_path.read_text("utf-8") == "手写的 unit", "未经 --force 就覆盖了"
 
-    def test_install_template_force_overwrites(self, systemd, recorded, as_root) -> None:
+    def test_install_template_force_overwrites(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
         systemd.template_path.parent.mkdir(parents=True, exist_ok=True)
         systemd.template_path.write_text("旧的", "utf-8")
-        systemd.install_template(
-            binary=Path("/opt/frps/frps-0.71.0"),
-            log_dir=Path("/var/log/frps"),
-            force=True,
-        )
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+
+        systemd.install_template(binary=binary, log_dir=tmp_path / "logs", force=True)
         assert "ExecStart=" in systemd.template_path.read_text("utf-8")
+
+    def test_install_template_rejects_missing_service_user(self, systemd, recorded, as_root) -> None:
+        """账户不存在必须在**渲染之前**拒绝：unit 装上了也起不来。
+
+        此前模板硬编码 `User=frps` 而安装流程完全不检查——用户按文档
+        `sudo frpsctl service install` 成功，`systemctl start` 才报
+        "Failed to determine user credentials"，两个动作相隔很远。
+        """
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError, match="不存在"):
+            systemd.install_template(
+                binary=Path("/bin/true"),
+                log_dir=Path("/tmp"),
+                user="definitely-no-such-user-frpsctl",
+            )
+        assert not systemd.template_path.exists(), "体检未过却写了 unit"
+        assert recorded == [], "体检未过却调用了 systemctl"
+
+    def test_install_template_rejects_unreachable_binary(
+        self, systemd, recorded, tmp_path, as_root, foreign_accounts
+    ) -> None:
+        """二进制对服务用户不可达（如 /root/...）必须拒绝。
+
+        这是最隐蔽的一类部署失败：`sudo frpsctl install` 把二进制放进
+        `/root/.local/share`（0700），安装 unit 成功、`systemctl start` 才炸。
+        """
+        from frpsctl.errors import UsageError
+
+        private_dir = tmp_path / "private"
+        private_dir.mkdir()
+        private_dir.chmod(0o700)
+        binary = private_dir / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+
+        with pytest.raises(UsageError, match="无法执行"):
+            systemd.install_template(binary=binary, log_dir=tmp_path / "logs")
+        assert not systemd.template_path.exists(), "体检未过却写了 unit"
+        assert recorded == [], "体检未过却调用了 systemctl"
+
+    def test_install_template_rejects_unwritable_log_dir(
+        self, systemd, recorded, tmp_path, as_root, foreign_accounts
+    ) -> None:
+        """日志目录不可写必须拒绝（ProtectSystem=strict 下 frp 会写不进日志）。
+
+        用 /tmp 下的独立目录而不是 `tmp_path`：pytest 的临时目录是 0700，
+        目标服务用户（uid 偏移后的替身）会先在二进制可达性上失败，测不到
+        本用例要覆盖的 log_dir 分支。
+        """
+        import shutil
+        import tempfile
+
+        from frpsctl.errors import UsageError
+
+        base = Path(tempfile.mkdtemp(prefix="frpsctl-uid-test-"))
+        try:
+            base.chmod(0o755)
+            binary = base / "frps-0.71.0"
+            binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+            binary.chmod(0o755)
+            readonly = base / "readonly"
+            readonly.mkdir()
+            readonly.chmod(0o555)
+
+            with pytest.raises(UsageError, match="不可写"):
+                systemd.install_template(binary=binary, log_dir=readonly)
+            assert recorded == [], "体检未过却调用了 systemctl"
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_install_template_requires_instance_config(self, inst, tmp_path, as_root, fake_accounts) -> None:
+        """unit 的 ExecStart 固定使用实例内的 frps.toml——缺失时必须当场拒绝。
+
+        用户用 `--config` 指向别处时尤其容易踩：装出来的 unit 不会用那个文件，
+        启动必然失败。
+        """
+        from frpsctl.core.systemd import Systemd
+        from frpsctl.errors import UsageError
+
+        inst.config.unlink(missing_ok=True)
+        fresh = Systemd(inst, unit_dir=tmp_path / "systemd-fresh")
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+
+        with pytest.raises(UsageError, match="配置文件不存在"):
+            fresh.install_template(binary=binary, log_dir=tmp_path / "logs")
+        assert not fresh.template_path.exists(), "体检未过却写了 unit"
+
+    def test_install_template_rejects_home_instance_dir(
+        self, tmp_path, as_root, fake_accounts
+    ) -> None:
+        """家目录下的实例会被 ProtectHome=true 挡住：必须提前拒绝。
+
+        这是挂载隔离（权限位检查看不出来），漏掉的后果同样是
+        `systemctl start` 才失败。这里不真创建目录——`_protect_home_conflict`
+        在配置存在性检查**之前**触发。
+        """
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.systemd import Systemd
+        from frpsctl.errors import UsageError
+
+        home_inst = Instance(
+            name="t",
+            instances_root=Path("/home/someone/.local/share/frpsctl/instances"),
+            data_home=tmp_path / "data",
+        )
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        systemd_home = Systemd(home_inst, unit_dir=tmp_path / "systemd-home")
+
+        with pytest.raises(UsageError, match="ProtectHome"):
+            systemd_home.install_template(binary=binary, log_dir=tmp_path / "logs")
+        assert not systemd_home.template_path.exists()
+
+    def test_protect_home_conflict_detection(self) -> None:
+        from frpsctl.core.systemd import _protect_home_conflict
+
+        assert _protect_home_conflict(Path("/home/u/frps")) == "/home/"
+        assert _protect_home_conflict(Path("/root/.local/share/frpsctl")) == "/root/"
+        assert _protect_home_conflict(Path("/run/user/1000/frps")) == "/run/user/"
+        assert _protect_home_conflict(Path("/opt/frpsctl")) is None
+        assert _protect_home_conflict(Path("/etc/frps/instances")) is None
+
+    def test_install_template_hands_instance_to_service_user(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts, monkeypatch
+    ) -> None:
+        """实例目录必须移交给服务用户（否则 frps 读不到 0700 目录里的配置）。
+
+        这是 systemd 部署闭环的最后一环：实例目录由 root 创建、权限 0700，
+        服务用户不是属主时连 `frps.toml` 都读不到，unit 必然起不来。
+        """
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        systemd.inst.config.write_text("bindPort = 7000\n", "utf-8")
+
+        chowned: list[tuple[str, int, int]] = []
+        real_chown = os.chown
+
+        def spy(path, uid, gid):
+            chowned.append((str(path), uid, gid))
+            return real_chown(path, uid, gid)
+
+        monkeypatch.setattr(os, "chown", spy)
+        systemd.install_template(binary=binary, log_dir=tmp_path / "logs")
+
+        targets = {item[0] for item in chowned}
+        assert str(systemd.inst.dir) in targets, "实例目录没有移交给服务用户"
+        assert str(systemd.inst.config) in targets, "配置文件没有移交给服务用户"
 
     def test_uninstall_disables_and_removes_template(self, systemd, recorded, as_root) -> None:
         systemd.template_path.parent.mkdir(parents=True, exist_ok=True)

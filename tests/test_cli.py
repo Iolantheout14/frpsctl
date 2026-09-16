@@ -151,6 +151,51 @@ class TestJsonOutput:
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["state"] == "STOPPED"
 
+    def test_watch_json_emits_ndjson(self, cli_env, monkeypatch) -> None:
+        """`status --watch --json` 必须逐行输出完整 JSON（NDJSON）。
+
+        多行缩进格式在连续输出时会变成一串无法逐行解析的片段——脚本拿到
+        只能干瞪眼。这里用 monkeypatch 让第二次 sleep 抛 KeyboardInterrupt
+        （watch 的正常退出方式），从而在测试里截获两行输出。
+        """
+        import json
+        import time
+
+        runner.invoke(app, ["init", "--no-input"])
+        real_sleep = time.sleep
+        calls = {"n": 0}
+
+        def fake_sleep(seconds):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt
+            real_sleep(0)
+
+        monkeypatch.setattr("frpsctl.cli.time.sleep", fake_sleep)
+        result = runner.invoke(app, ["status", "--watch", "--json"])
+        assert result.exit_code == 0, result.output
+
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) >= 2, f"NDJSON 行数不足：{lines}"
+        for line in lines:
+            payload = json.loads(line)  # 任何一行混入缩进就会在这里炸
+            assert payload["instance"] == "default"
+
+    def test_watch_does_not_emit_ansi_when_not_a_tty(self, cli_env, monkeypatch) -> None:
+        """非终端（重定向/管道）不得写 ANSI 清屏码——会污染输出文件。
+
+        测试里 stdout 是 StringIO（isatty() 为 False），正好覆盖这条路径。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+
+        def fake_sleep(seconds):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("frpsctl.cli.time.sleep", fake_sleep)
+        result = runner.invoke(app, ["status", "--watch"])
+        assert result.exit_code == 0, result.output
+        assert "\033[2J" not in result.stdout, "非终端输出混入了清屏转义码"
+
     def test_config_get_masks_secret_by_default(self, cli_env) -> None:
         """§10 硬约束 2：机密绝不进 `--json`，除非显式 --reveal。
 
@@ -209,6 +254,32 @@ class TestJsonOutput:
         assert token not in result.output, "config diff --json 泄露了 token"
 
 
+class TestNumericOptionValidation:
+    """数值选项的非法值必须归入**用法错误(2)**，而不是"未分类错误(1)"或危险行为。
+
+    回归：`status --watch --interval -1` 会让 `time.sleep` 抛 ValueError →
+    "未分类错误(1)"；`stop --timeout -1` 更糟——它跳过等待直接升级 SIGKILL，
+    一个参数笔误造成了不可逆动作。
+    """
+
+    def test_negative_interval_is_usage_error(self, cli_env) -> None:
+        result = runner.invoke(app, ["status", "--watch", "--interval", "-1"])
+        assert result.exit_code == 2, result.output
+
+    def test_negative_lines_is_usage_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["log", "-n", "-5"])
+        assert result.exit_code == 2, result.output
+
+    def test_negative_stop_timeout_is_usage_error(self, cli_env) -> None:
+        result = runner.invoke(app, ["stop", "--timeout", "-1"])
+        assert result.exit_code == 2, result.output
+
+    def test_negative_health_timeout_is_usage_error(self, cli_env) -> None:
+        result = runner.invoke(app, ["start", "--health-timeout", "-1"])
+        assert result.exit_code == 2, result.output
+
+
 class TestInitConfig:
     """来自真机事故的回归组：顶层键的位置。"""
 
@@ -258,11 +329,28 @@ class TestInitConfig:
         result = runner.invoke(app, ["init", "--no-input", "--allow-ports", "6100-6000"])
         assert result.exit_code == 3, result.output
 
+    def test_init_validates_generated_config(self, cli_env) -> None:
+        """生成即自检：非法端口必须在 init 阶段失败，且**不落盘**。
+
+        回归：`init --bind-port 99999` 此前会成功生成一份必然被 verify 拒绝的
+        配置，把问题推迟到 start 才暴露。
+        """
+        result = runner.invoke(app, ["init", "--no-input", "--bind-port", "99999"])
+        assert result.exit_code == 3, result.output
+        assert "bindPort" in result.output
+        assert not (cli_env / "instances" / "default" / "frps.toml").exists()
+
     def test_second_init_requires_force(self, cli_env) -> None:
         runner.invoke(app, ["init", "--no-input"])
         result = runner.invoke(app, ["init", "--no-input"])
         assert result.exit_code == 3
         assert "--force" in result.output
+
+    def test_shell_completion_is_available(self, cli_env) -> None:
+        """补全选项必须存在（此前 `add_completion=False` 把它整个关掉了）。"""
+        result = runner.invoke(app, ["--show-completion"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout.strip(), "--show-completion 没有输出补全脚本"
 
 
 class TestConfigSetValidation:
@@ -311,21 +399,45 @@ class TestCommandsThatWereBroken:
         assert result.exit_code == 3, result.output
         assert "日志文件不存在" in result.output
 
-    def test_log_tails_an_existing_file(self, cli_env, capfd) -> None:
-        """`log` 把文件交给 `tail` 子进程（流式输出），因此要断言**真实** stdout。
-
-        用 `capfd`（捕获文件描述符）而不是 `capsys`/CliRunner：子进程直接继承
-        父进程的 fd，只有 fd 级捕获才看得到它写的内容。
-        """
+    def test_log_tails_an_existing_file(self, cli_env) -> None:
+        """`log` 输出文件尾部（纯 Python tail，写回 CLI 的 stdout）。"""
         runner.invoke(app, ["init", "--no-input"])
         log_file = cli_env / "instances" / "default" / "frps.log"
         log_file.write_text("第一行\n第二行\n", "utf-8")
 
         result = runner.invoke(app, ["log", "-n", "5"])
         assert result.exit_code == 0, result.output
+        assert "第二行" in result.stdout
 
-        captured = capfd.readouterr()
-        assert "第二行" in captured.out
+    def test_log_limits_lines(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        log_file = cli_env / "instances" / "default" / "frps.log"
+        log_file.write_text("1\n2\n3\n4\n5\n", "utf-8")
+
+        result = runner.invoke(app, ["log", "-n", "2"])
+        assert result.exit_code == 0, result.output
+        assert result.stdout == "4\n5\n"
+
+    def test_log_does_not_depend_on_tail(self, cli_env, monkeypatch) -> None:
+        """`log` 不得依赖外部 `tail`（最小化镜像里可能没有它）。
+
+        回归：此前用 `subprocess.call(["tail", ...])`，缺失时的裸
+        `FileNotFoundError` 会被映射成"未分类错误(1)"——把环境缺命令
+        误报成工具内部错误。
+        """
+        import subprocess
+
+        runner.invoke(app, ["init", "--no-input"])
+        log_file = cli_env / "instances" / "default" / "frps.log"
+        log_file.write_text("hello-line\n", "utf-8")
+
+        def boom(*args, **kwargs):
+            raise AssertionError("log 不应调用外部命令")
+
+        monkeypatch.setattr(subprocess, "call", boom)
+        result = runner.invoke(app, ["log", "-n", "5"])
+        assert result.exit_code == 0, result.output
+        assert "hello-line" in result.stdout
 
     def test_config_edit_reports_no_change(self, cli_env, monkeypatch) -> None:
         """`EDITOR=true` 不修改文件 → 应当报告"没有改动"而不是崩掉。"""
@@ -363,6 +475,123 @@ class TestCommandsThatWereBroken:
             assert "NameError" not in result.output, f"{args} 触发 NameError"
             assert "TypeError" not in result.output, f"{args} 触发 TypeError"
             assert "UnboundLocalError" not in result.output, f"{args} 触发 UnboundLocalError"
+
+
+class TestHealthGate:
+    """健康 gate（L1 ∧ L2）失败必须可见（退出码 12，§3.7）。
+
+    回归：`start` 此前在 L2 失败时**完全静默**——退出码 0、stderr 一行都没有，
+    脚本会把"dashboard 起不来"当成成功。gate 是 start 的语义，失败必须以
+    非零退出码收场；同时进程仍被托管（status 可见 RUNNING、stop 停得掉），
+    所以不能用"启动失败(10)"来混淆两种情形。
+    """
+
+    def test_l2_failure_exits_12_and_keeps_process_managed(self, cli_env) -> None:
+        import socket
+
+        from .conftest import free_ports
+
+        install_fake_binary(cli_env)
+        # 占住 dashboard 端口：假 frps 绑定失败（进程仍存活）→ L2 必然失败
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        dash_port = blocker.getsockname()[1]
+        bind_port = free_ports(1)[0]
+        try:
+            init = runner.invoke(
+                app,
+                [
+                    "init",
+                    "--no-input",
+                    "--bind-port",
+                    str(bind_port),
+                    "--dashboard-port",
+                    str(dash_port),
+                ],
+            )
+            assert init.exit_code == 0, init.output
+            result = runner.invoke(app, ["start", "--health-timeout", "1"])
+        finally:
+            blocker.close()
+
+        try:
+            assert result.exit_code == 12, result.output
+            assert "健康检查未通过" in result.stderr, result.stderr
+
+            status = runner.invoke(app, ["status", "--json"])
+            import json
+
+            payload = json.loads(status.stdout)
+            assert payload["state"] == "RUNNING", payload
+            assert payload["health"]["l2_control"] == "fail", payload
+        finally:
+            stop = runner.invoke(app, ["stop"])
+            assert stop.exit_code == 0, stop.output
+
+
+class TestStatusListen:
+    """`status` 必须展示控制端口（设计文档 §7.4 的 listen 行）。"""
+
+    def test_status_line_shows_listen(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input", "--bind-port", "17000", "--dashboard-port", "17500"])
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0, result.output
+        assert "listen   : 0.0.0.0:17000" in result.stdout
+
+    def test_status_json_exposes_listen(self, cli_env) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input", "--bind-port", "17000"])
+        result = runner.invoke(app, ["status", "--json"])
+        payload = json.loads(result.stdout)
+        assert payload["listen"] == {"addr": "0.0.0.0", "port": 17000}
+
+
+class TestInstallMirrorOption:
+    """`install --mirror` / `FRPSCTL_MIRROR` 必须真的传到 release.install。"""
+
+    @staticmethod
+    def _capture(monkeypatch) -> dict:
+        captured: dict = {}
+
+        def fake_install(**kwargs):
+            captured.update(kwargs)
+            from pathlib import Path
+
+            from frpsctl.core import release
+
+            return release.InstallResult(
+                version=str(kwargs["version"]),
+                binary=Path("/tmp/frps-0.71.0"),
+                switched=False,
+                downloaded=False,
+            )
+
+        monkeypatch.setattr("frpsctl.core.release.install", fake_install)
+        return captured
+
+    def test_cli_mirror_is_passed_through(self, cli_env, monkeypatch) -> None:
+        captured = self._capture(monkeypatch)
+        result = runner.invoke(app, ["install", "--mirror", "https://example.com/dl/"])
+        assert result.exit_code == 0, result.output
+        assert captured["mirrors"] == ("https://example.com/dl",)
+
+    def test_env_mirror_is_used_when_no_flag(self, cli_env, monkeypatch) -> None:
+        monkeypatch.setenv("FRPSCTL_MIRROR", "https://a.example, https://b.example")
+        captured = self._capture(monkeypatch)
+        result = runner.invoke(app, ["install"])
+        assert result.exit_code == 0, result.output
+        assert captured["mirrors"] == ("https://a.example", "https://b.example")
+
+    def test_default_version_comes_from_single_source(self, cli_env, monkeypatch) -> None:
+        """`install` 的默认版本来自 `RECKONED_VERSION`，不再两处硬编码。"""
+        from frpsctl.core.version import RECKONED_VERSION
+
+        captured = self._capture(monkeypatch)
+        result = runner.invoke(app, ["install"])
+        assert result.exit_code == 0, result.output
+        assert captured["version"] == ".".join(map(str, RECKONED_VERSION))
 
 
 class TestConfigEdit:
@@ -529,3 +758,30 @@ class TestGlobalOptionPlacement:
         result = runner.invoke(app, ["config", "edit", "--yes"])
         assert result.exit_code == 0, result.output
         assert "没有改动" in result.output
+
+    def test_double_dash_stops_hoisting(self, cli_env) -> None:
+        """`--` 之后的值必须原样保留——哪怕它长得像全局选项。
+
+        回归：`frpsctl config set subDomainHost -- --json` 曾把 `--json` 搬到
+        命令最前面，于是 value 丢失（MissingParameter），用户无法写入任何
+        以 `--` 开头的字符串值。
+        """
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "set", "subDomainHost", "--", "--json"])
+        assert result.exit_code == 0, result.output
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert 'subDomainHost = "--json"' in config.read_text("utf-8")
+
+    def test_double_dash_with_global_option_value(self, cli_env) -> None:
+        """`--` 之前的全局选项仍要正常前移（终止符不能把功能整体关掉）。"""
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["status", "-i", "default", "--", "--json"])
+        # `--json` 在终止符之后 → 属于多余位置参数，按用法错误收场；
+        # 但 `-i default` 必须已经被正确解析（否则会报实例名相关错误）。
+        assert result.exit_code == 2, result.output
+        assert "No such option" not in result.output
+        status = runner.invoke(app, ["--json", "status"])
+        assert json.loads(status.stdout)["state"] == "STOPPED"
