@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -583,6 +584,90 @@ ops = ["Login"]
 
 
 # ---------------------------------------------------------------------------
+# doctor 的 dashboard 口令强度检查（§3.3 的实测边界）
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorDashboardCredentials:
+    """`doctor` 必须把"口令为空但 user 非空"报出来。
+
+    这一条来自实现期的实测（真 frps 0.71.0，见 `test_facts.py::TestC8PasswordlessAuth`）：
+    frp 的鉴权开关是"**任一非空即启用**"，而 **Basic Auth 的空口令是合法口令**——
+    `user = "admin"` + 空口令时无凭据请求得 401，但 `admin:` + 空口令得 200。
+
+    因此 `check_dangerous_combination()` 放行它是对的（确实启用了鉴权），但**不能不
+    提示**：此时用户名是唯一防护，而它通常就是 `admin`。修复前这条路径完全静默。
+    """
+
+    def _findings(self, tmp_path: Path, web_block: str) -> list:
+        from frpsctl.core.doctor import run_doctor
+        from frpsctl.core.instance import Instance
+
+        inst = Instance(name="t", instances_root=tmp_path / "instances", data_home=tmp_path / "data")
+        inst.ensure_dirs()
+        inst.config.write_text(
+            f'bindPort = 17000\n[auth]\ntoken = "x"\n[webServer]\n{web_block}',
+            "utf-8",
+        )
+        inst.config.chmod(0o600)
+        return run_doctor(inst).findings
+
+    @staticmethod
+    def _weak(findings: list) -> list:
+        return [f for f in findings if f.check == "dashboard 弱口令"]
+
+    def test_empty_password_with_user_is_flagged(self, tmp_path: Path) -> None:
+        findings = self._findings(
+            tmp_path, 'addr = "127.0.0.1"\nport = 17500\nuser = "admin"\npassword = ""\n'
+        )
+        weak = self._weak(findings)
+        assert weak, [f.check for f in findings]
+        assert weak[0].severity.value == "WARN"
+        assert "空口令" in weak[0].message
+        assert "admin" in weak[0].message
+
+    def test_missing_password_key_is_flagged(self, tmp_path: Path) -> None:
+        """口令键**缺失**（而不是显式空串）的语义完全相同，必须同样报出。"""
+        findings = self._findings(tmp_path, 'addr = "127.0.0.1"\nport = 17500\nuser = "admin"\n')
+        assert self._weak(findings), [f.check for f in findings]
+
+    def test_empty_password_on_non_loopback_is_still_only_a_warning(self, tmp_path: Path) -> None:
+        """非回环 + 有 user + 空口令 → 仍然是 WARN，不是 ERROR。
+
+        判据边界是刻意的：它**启用了鉴权**，属于强度不足；ERROR 留给"两者全空"
+        那种真·完全无鉴权（见 `test_empty_credentials_on_non_loopback_is_an_error`）。
+        """
+        findings = self._findings(tmp_path, 'addr = "0.0.0.0"\nport = 17500\nuser = "admin"\npassword = ""\n')
+        assert not [f for f in findings if f.check == "dashboard 暴露面"]
+        assert self._weak(findings)
+
+    def test_empty_credentials_on_non_loopback_is_an_error(self, tmp_path: Path) -> None:
+        """对照：两者全空 + 非回环 = 完全不鉴权 → ERROR。"""
+        findings = self._findings(tmp_path, 'addr = "0.0.0.0"\nport = 17500\n')
+        exposure = [f for f in findings if f.check == "dashboard 暴露面"]
+        assert exposure and exposure[0].severity.value == "ERROR"
+
+    def test_strong_credentials_are_not_flagged(self, tmp_path: Path) -> None:
+        findings = self._findings(
+            tmp_path, 'addr = "0.0.0.0"\nport = 17500\nuser = "admin"\npassword = "s3cret"\n'
+        )
+        assert not self._weak(findings), [f.message for f in self._weak(findings)]
+
+    def test_admin_admin_is_still_flagged(self, tmp_path: Path) -> None:
+        findings = self._findings(
+            tmp_path, 'addr = "127.0.0.1"\nport = 17500\nuser = "admin"\npassword = "admin"\n'
+        )
+        weak = self._weak(findings)
+        assert weak and "admin/admin" in weak[0].message
+
+    def test_disabled_dashboard_is_not_flagged(self, tmp_path: Path) -> None:
+        """`port = 0` = 不启动 dashboard，不存在暴露面（口令为空也无所谓）。"""
+        findings = self._findings(tmp_path, 'addr = "0.0.0.0"\nport = 0\nuser = "admin"\npassword = ""\n')
+        assert not self._weak(findings)
+        assert not [f for f in findings if f.check == "dashboard 暴露面"]
+
+
+# ---------------------------------------------------------------------------
 # 配额（max_proxies）
 # ---------------------------------------------------------------------------
 
@@ -683,3 +768,76 @@ class TestQuota:
         result = checker.check("alice", 7)
         assert result.allowed is False
         assert "dashboard" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# 进程级生命周期：SIGTERM 必须优雅退出并刷盘（systemd stop 的真实路径）
+# ---------------------------------------------------------------------------
+
+
+class TestServeForeverLifecycle:
+    """`plugin serve` 的部署要求是"由 systemd 守护"（§11.2），而 **systemd 停止
+    服务时发的是 SIGTERM**。默认处置下进程立即死亡：`finally` 不执行、审计缓冲里
+    未刷盘的记录全部丢失——而审计正是"谁在什么时候申请了什么端口"的唯一记录，
+    停机时丢掉它是最不该丢的时候。
+
+    这条不变量（"SIGTERM 也要落盘"）只有在**真正独立的进程**里才测得出来：
+    同进程内发信号只会打断主线程，走不到"进程被终止"这条路径。
+    """
+
+    def test_sigterm_flushes_audit_and_exits_cleanly(self, tmp_path: Path) -> None:
+        policy_file = tmp_path / "plugin-policy.json"
+        policy_file.write_text(
+            json.dumps(
+                {
+                    "users": {"alice": {"allowed_ports": ["6000-6010"]}},
+                    "audit": {"path": str(tmp_path / "audit.jsonl"), "flush_interval": 999},
+                }
+            ),
+            "utf-8",
+        )
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from frpsctl.plugin.policy import PluginPolicy\n"
+            "from frpsctl.plugin.server import PluginServer, ServerSettings\n"
+            "from frpsctl.plugin.types import PluginRequest\n"
+            "policy = PluginPolicy.load(Path(sys.argv[1]))\n"
+            "server = PluginServer(policy, ServerSettings(bind='127.0.0.1:0', path='/handler'))\n"
+            "server.start()\n"
+            "print(server.address[1], flush=True)\n"
+            # 积压一条记录但**不刷盘**（flush_interval=999），随后前台阻塞
+            "server.engine.handle(\n"
+            "    PluginRequest.from_payload(\n"
+            "        op='Login', version='0.1.0',\n"
+            "        body={'content': {'user': 'alice', 'metas': {'client_id': 'alice'}}},\n"
+            "    )\n"
+            ")\n"
+            "server.serve_forever()\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(policy_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent / "src")},
+        )
+        try:
+            port = int((proc.stdout.readline() or "0").strip())
+            assert port > 0, proc.stderr.read()[:400]
+            # 记录此刻只在内存里
+            audit_file = tmp_path / "audit.jsonl"
+            assert not audit_file.exists() or audit_file.read_text("utf-8") == ""
+
+            proc.terminate()  # SIGTERM：systemd stop 的真实信号
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+        assert audit_file.exists(), "SIGTERM 后审计记录没有落盘（进程被直接杀死）"
+        lines = [line for line in audit_file.read_text("utf-8").splitlines() if line.strip()]
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["op"] == "Login" and record["user"] == "alice"

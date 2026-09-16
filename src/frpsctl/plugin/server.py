@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import socket
 import threading
 import time
@@ -247,13 +248,30 @@ class PluginServer:
         self._thread.start()
 
     def serve_forever(self) -> None:
-        """前台阻塞运行（CLI 用）。Ctrl-C 由上层捕获。"""
+        """前台阻塞运行（CLI 用）。
+
+        **SIGTERM 被转成 KeyboardInterrupt**：部署要求（§11.2）是"由 systemd 守护
+        并 `Restart=always`"，而 systemd 停止服务时发的是 SIGTERM。默认处置下
+        进程会**立即死亡**——`finally` 不执行、审计缓冲里未刷盘的记录直接丢失。
+        审计恰恰是"谁在什么时候申请了什么端口"的唯一记录，停机时丢掉它是最不该
+        丢的时候。转成 KeyboardInterrupt 后走的是同一条优雅退出路径。
+
+        退出语义：**先 `close()`（含审计刷盘），再把 `KeyboardInterrupt` 放出去**，
+        由调用方决定怎么收尾（CLI 打印审计摘要，`serve()` 直接冒到顶层）。
+        """
         if self._httpd is None:
             self.start()
         assert self._httpd is not None
+
+        previous = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
         try:
             self._httpd.serve_forever()
         finally:
+            # 关闭只在这里发生（CLI 不再重复 close）。关完再把 KeyboardInterrupt
+            # 放出去，让上层能打印审计摘要——若在这里 `except ...: pass`，上层那条
+            # 分支就变成不可达代码。
+            signal.signal(signal.SIGTERM, previous)
             self.close()
 
     def stop(self) -> None:
@@ -290,15 +308,23 @@ class PluginServer:
         return f"http://{host}:{port}{self.settings.path}"
 
 
+def _raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
+    """把 SIGTERM 转成 `KeyboardInterrupt`（见 `PluginServer.serve_forever`）。
+
+    只有在主线程能收到信号时才会被安装——非主线程里 `signal.signal` 会抛
+    `ValueError`，因此调用方需要判断；这里用最小的可调用体，不做任何多余动作。
+    """
+    raise KeyboardInterrupt
+
+
 def serve(policy: PluginPolicy, settings: ServerSettings) -> None:
-    """CLI 入口：前台运行直到中断。"""
-    server = PluginServer(policy, settings)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.close()
+    """CLI 入口：前台运行直到中断。
+
+    运行期**不再** `try/except KeyboardInterrupt` + `finally: close()`：那与
+    `PluginServer.serve_forever()` 内部的 `finally: self.close()` 重复关闭，
+    真实行为依赖 `AuditLog.close()` 的 `_closed` 标志兜底。关闭只留一处。
+    """
+    PluginServer(policy, settings).serve_forever()
 
 
 def wait_ready(host: str, port: int, *, timeout: float = 5.0) -> bool:
