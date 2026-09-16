@@ -281,7 +281,7 @@ L3 仅展示，不回滚             ← 插件挂掉不是这份配置的错
 
 | 命令 | L1 | L2 | L3 | 说明 |
 |------|----|----|----|------|
-| `start` / `restart` 的健康等待 | ✔（早退检测） | ✔（`--health-timeout`，默认 10s） | ✘ | `webServer.port = 0` 时 L2 自动跳过，退化为 L1 |
+| `start` / `restart` 的健康等待 | ✔（早退检测） | ✔（`--health-timeout`，默认 10s） | ✘ | `webServer.port = 0` 时 L2 自动跳过，退化为 L1。**gate 未过 → 退出码 12**，进程保留（`status`/`stop` 可用）——v0.2.0 起生效，此前该路径完全静默 |
 | 回滚判据 | ✔ | ✔ | ✘ | 见上 |
 | `status` | ✔ | ✔ | ✔ | 三层全部展示（§7.4） |
 | `doctor` | ✔ | ✔ | ✔ | L3 由"插件可达性"检查项承担（§8.7） |
@@ -547,6 +547,7 @@ class Instance:
 | 9 | 变更已自动回滚 | 配置写入后启动失败，已恢复上一版 |
 | 10 | 启动即失败 | 附 frp 原始错误输出 |
 | 11 | 进程所有权冲突 | 身份校验不通过 / systemd 与 direct 混用 |
+| 12 | 已启动但健康检查未通过 | L1 进程在、L2 控制面不可达（v0.2.0 新增；进程保留，`status`/`stop` 可用，见 §3.7） |
 
 ### 7.4 输出示例
 
@@ -1398,13 +1399,32 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/log/frps
+ReadWritePaths=/var/log/frps /etc/frps/instances/%i
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 以 `frps@.service` 模板形式安装，多实例即多 unit，与 §6 的实例模型天然对齐。安装后 `owner` 变为 `systemd`，CLI 的 `start/stop/restart/status` 全部委托 `systemctl`（ADR-1）。
+
+**部署前置（v0.2.0 起在安装前强制体检）**：unit 能起来取决于三项环境事实，
+任何一项不满足 `service install` 会当场拒绝——它们过去都只在 `systemctl start`
+时才暴露，错误现场与安装动作相隔很远：
+
+| 事实 | 失败表现 | 实现 |
+|------|---------|------|
+| 服务账户存在（默认 `frps`，可 `--user`/`--group`） | `Failed to determine user credentials` | `_account_ids()` |
+| 二进制对服务用户可执行 | `Permission denied`（典型：`sudo frpsctl install` 落在 0700 的 `/root` 下） | `_access_problem()` 逐级检查 x 位 |
+| 日志目录存在且可写 | `Failed to set up mount namespacing`（`ProtectSystem=strict` 下 ReadWritePaths 必须存在） | `_ensure_log_dir()` 创建并 chown |
+| 二进制与实例目录不在家目录下 | unit 看不到路径（`ProtectHome=true` 是挂载隔离，权限位检查看不出） | `_protect_home_conflict()` 识别 `/home`、`/root`、`/run/user` |
+
+另外 unit 的 `ReadWritePaths` 同时包含日志目录与**实例目录**：`ProtectSystem=strict`
+下其余路径只读，而 frp 默认要往实例目录写 `./frps.log`（v0.2.0 review 发现的
+原设计遗留缺陷）。
+
+安装时还会把实例目录（0700）的属主**移交**给服务用户：unit 以它运行，必须读得到
+`frps.toml`（内含 token）。安全性不降级——同机其他用户依然读不到；root 不受权限位
+限制，后续运维照常。因此 systemd 模式下应统一以 root 执行 frpsctl。
 
 ---
 
@@ -1711,7 +1731,7 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 | 项 | 状态 |
 |----|------|
 | 代码 | `src/frpsctl/`（core 16 模块 + `plugin/` 6 模块 + CLI 3 模块） |
-| 测试 | **226 个用例**；单元 / 集成 / CLI / 契约 / **故障注入** 五层（§17.6 后，含 4 条真 frpc 契约） |
+| 测试 | **226 个用例**；单元 / 集成 / CLI / 契约 / **故障注入** 五层（§17.6 后，含 4 条真 frpc 契约）。最新一轮的数字（277 条）见 §17.7 |
 | 覆盖率 | **81%**（`pytest --cov`；剩余未覆盖集中在渲染分支与需 root/网络的路径） |
 | 真机验证（M0–M4） | frps **0.71.0** 全链路冒烟通过：`init → verify → start → status → config set（自动重启）→ doctor → config rollback → stop` |
 | 真机验证（M5） | **真 frpc → 真 frps → 我们的插件**：授权用户建代理成功、未授权用户登录被拒、白名单外端口被拒且理由回到客户端 |
@@ -1997,6 +2017,131 @@ $ frpsctl install --only-download                      # 显式不动链
 | `plugin serve --json` 之后仍阻塞 | 这是**设计意图**（它是前台服务），已在 `--help` 与 README 里写明"一次性状态、随后前台运行"；改成流式 JSON 反而让它无法被 systemd 正常托管 |
 | 各子命令上冗余的 `--json` 选项与 `with_json()` | 有了 `_AnywhereGroup` 之后确实冗余，但保留它们让**旧写法继续可用**，且删掉要动 19 处调用点——收益不足以承担回归风险 |
 | ~~4 条真机契约用例需要 `frpc`~~ | **已解决**：`frpsctl install --with-frpc` 装上真 frpc 后，`tests/test_plugin.py::TestRealFrpcContract` 4 条全部通过（见 §17.6.9）。没有 frpc 时它们会 skip 而不是 fail |
+
+---
+
+## 17.7 第三轮全量迭代（v0.2.0：安全缺口、部署闭环与发布链路）
+
+第三轮以**便捷性、易用性、稳定性、可靠性**为目标做全量复核，方法与历次一致：
+先把全部源码、测试与两篇文档读完，再逐条实测（不只看代码）。统计：修复 **15 条**
+问题（含 1 条安全缺口、3 条正确性缺陷），新增 **51 个用例**（226 → 277），
+覆盖率维持 81%；CI 新增 ruff、覆盖率门禁与 frp **0.70.0 下界契约矩阵**。
+
+### 17.7.1 安全缺口：内联表机密从 diff 泄露（实测复现）
+
+`mask_diff` 只识别逐行赋值，而 TOML 的内联表会把机密藏进"值"里：
+
+```console
++auth = { token = "SUPERSECRET123456" }     ← 修复前原样打印
+```
+
+修复：`_mask_inline_value` 把值解析出来后复用 `mask_tree` 的完整点分路径匹配
+（任意深度都能覆盖），并对"解析失败但形似含机密"的行**保守整体打码**。同时修掉
+`[[数组表]]` 的表名解析（旧正则把 `[` 混进表名，使该表下的敏感键路径失配）。
+
+### 17.7.2 正确性：三条
+
+| # | 问题 | 实测证据 | 修复 |
+|---|------|---------|------|
+| 1 | `start` 在 L2 失败时**退出码 0 且 stderr 静默** | 占住 dashboard 端口后 start：`L2 control fail`、退出码 0 | 新增退出码 **12**（§7.3），CLI 统一检查 `StartReport.healthy`；进程保留，`status`/`stop` 可用 |
+| 2 | 一次 `config rollback` 产生**两份内容相同的快照** | 快照 0001 → 回滚后出现 0002/0003 | 快照只在 `apply_change` 的**实例锁内**创建一次；`snapshot_action` 保留 `rollback N` 记账 |
+| 3 | 进程在早退窗口之后死亡会留下假 RUNNING | `exit_after` 假件（grace 后退出）实测 | `_await_health` 发现 L1 失败立即返回；`start` 清理 state 并按启动失败(10)收尾 |
+
+### 17.7.3 稳定性：六条
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | 配额预占在**全局锁内**做 dashboard 查询（timeout 2s），一个用户的慢查询挂住所有人（frp 侧对插件无超时） | 按用户拆锁；网络调用不持全局锁（新增事件驱动的并发回归测试） |
+| 2 | `plugin serve` 的 SIGTERM handler 安装不在 `try` 内——安装瞬间收到信号会绕过审计刷盘 | 纳入 `try`；测试改用 `/proc/<pid>/status` 的 `SigCgt` 掩码做就绪判定，消除 flaky |
+| 3 | `--with-frpc --only-download` 仍会切换 frpc 软链（同一参数两套语义） | 两条链统一遵守 `switch`；两边在盘上时幂等校正 frpc 链 |
+| 4 | `log` 依赖外部 `tail`，缺失时报"未分类错误(1)" | 纯 Python tail（含轮转后按 inode 重开），零外部命令 |
+| 5 | `status --watch --json` 输出多行缩进串，无法逐行消费 | NDJSON（单行） |
+| 6 | `plugin init` 用 `write_text` 落盘策略文件（半截文件 + 权限窗口） | 改 `atomic_write` |
+
+### 17.7.4 部署闭环：systemd 三查一移交
+
+按既有文档部署 systemd **必然踩坑**（`sudo frpsctl install` 把二进制放进 0700 的
+`/root`，unit 以 `frps` 运行读不到；模板硬编码 `User=frps` 却不检查账户存在），
+且错误现场与操作动作相隔很远。现在 `service install` 在安装前完成三项体检
+（账户存在、二进制逐级可达、日志目录可写），安装时把实例目录属主移交给服务用户。
+详见 §12.2。
+
+### 17.7.5 便捷性与发布
+
+- `install --mirror`（可重复）/ `FRPSCTL_MIRROR`：镜像可配置（此前文档承诺
+  "可被镜像替换"但实现硬编码）；默认版本改由 `RECKONED_VERSION` 单一来源生成。
+- `status` 补 `listen` 行与 JSON 字段（对齐 §7.4）；`--watch --json` 为 NDJSON。
+- `init` 生成后立即语义自检（非法端口不再落盘）；回环判断统一为
+  `healthcheck.is_loopback`（修掉 `127.0.0.2` 上 doctor 与 schema 的判据分歧）。
+- shell 补全启用（`--install-completion`）；`start --foreground` 在帮助里明确
+  "不写 state、stop 管不到它"。
+- 发布链路：版本号单一来源（hatchling 读 `__init__.py`）、CHANGELOG、release
+  workflow（tag 与版本一致性校验 → GitHub Release → PyPI Trusted Publishing
+  由仓库变量 `PYPI_PUBLISH` 开关）、`py.typed`。
+
+### 17.7.6 未做与代价（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| `self update` | 不做：需要探测 pip / pipx / venv 安装形态，收益低而风险高；升级路径由重跑 `install.sh` 与 `pipx upgrade frpsctl` 覆盖 |
+| `restart --no-rollback` | 维持原边界（§2.2、§7.2） |
+| 契约层固定 `0.71.0` | 已扩展为 0.70.0（下界）+ 0.71.0（目标）双版本矩阵，下界本地实测 21/21 通过 |
+
+---
+
+## 17.8 第三轮回归 review（v0.2.0 发布前）
+
+方法与前两轮一致：**完整 diff 逐行审查 + 对抗性实测 + 文档-代码交叉核对**。
+本轮在 §17.7 的修复之上又发现 **5 个真实缺陷**——全部位于"异常/边缘路径"或
+"部署链路的下游"，新增 **19 个回归用例**（277 → 296），覆盖率 81% → 82%。
+
+### 17.8.1 机密打码的跨行盲区（实测复现）
+
+§17.7 的打码修复只覆盖单行形态，review 用四组对抗用例证明多行结构仍会泄露：
+
+```console
++token = """            ← 多行字符串：内容行原样打印
++SECRET
++"""
+
++auth = {                ← 内联表跨多行
++  token = "SECRET",
++}
+```
+
+修复：`mask_diff` 重写为**跨行状态机**——三引号 / 未闭合括号开启遮蔽状态，
+逐行定点打码（`_mask_fragment` 处理内联片段与裸赋值续行），闭合后恢复常规处理；
+非敏感多行数组（`allowPorts`）原样保留。另有两处加固：裸键名
+（`token`/`password`/`clientSecret`）纳入敏感判定；非敏感键的**未闭合起始行**
+也走定点打码（`foo = { token = "x"` 这种半行）。
+
+### 17.8.2 systemd 部署链路的三个下游缺陷
+
+| # | 缺陷 | 后果 | 修复 |
+|---|------|------|------|
+| 1 | `config set` 重建配置时**夺回属主**（root） | 上一轮刚移交给服务用户的配置，下一次改配置后 frps 就读不到了 | `atomic_write` 保留已存在文件的 uid/gid（fchown 失败不阻断写入） |
+| 2 | `ReadWritePaths` 只放行日志目录 | `ProtectSystem=strict` 下实例目录只读，而 frp 默认要写 `./frps.log` → unit 启动即失败 | unit 的 ReadWritePaths 加上实例目录（`{config_dir}/%i`） |
+| 3 | 家目录下的路径被 `ProtectHome=true` 挡住，且**权限位检查看不出来**（挂载隔离≠文件模式） | `~/.local` 默认路径部署装完后启动失败 | `_protect_home_conflict()` 识别 `/home`、`/root`、`/run/user` 并提前拒绝 |
+
+另补：unit 需要的实例内 `frps.toml` 缺失时提前拒绝（`--config` 指向外部路径的
+用户尤其容易踩——unit 不会使用那个文件）。
+
+### 17.8.3 边缘路径的两处收口
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | 负数数值选项行为诡异：`--interval -1` 产生"未分类错误(1)"；`--timeout -1` 跳过等待直接 SIGKILL（参数笔误造成不可逆动作） | 全部数值选项加 `min` 约束 → 用法错误(2) |
+| 2 | `status --watch` 重定向到文件时写入 ANSI 清屏码污染输出 | 仅在 `stdout.isatty()` 时清屏 |
+
+### 17.8.4 交叉核对与最终验收
+
+- GitHub Actions 两份 workflow 经 YAML 解析验证；wheel 构建自检（含 `py.typed`）。
+- 文档-代码交叉核对修 3 处 drift（CHANGELOG 用例数、README 版本示例、测试文件
+  "五层/第五层"措辞）。
+- 对抗性实测记录：`mask_diff` 16 组边界（含真实 `config edit` 端到端）、`--` 三组、
+  tail 空文件/无尾换行/百万行（1.12s、47MB）、负数选项 4 组、systemd 体检 7 组。
+- **最终验收：296 用例 0 skipped**（含真 frps 0.71.0 + 真 frpc 端到端契约），
+  ruff 全绿，覆盖率 82%，非契约层 271 条。
 
 ---
 

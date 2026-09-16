@@ -78,7 +78,8 @@
 
 ```bash
 # 1) 装 Python 侧
-pipx install frpsctl          # 推荐；或 pip install frpsctl
+pipx install frpsctl          # 已发布到 PyPI；尚未发布时可先走下面的源码安装
+# 或：pip install frpsctl / pip install -U frpsctl（升级）
 
 # 2) 装 frps 二进制（从官方发布页下载，sha256 强校验）
 frpsctl install
@@ -99,6 +100,16 @@ frps 0.71.0 → /home/u/.local/share/frpsctl/bin/frps-0.71.0
 ```
 
 - 下载地址可被镜像替换，但**信任锚是官方校验和文件**（`frp_sha256_checksums.txt`）。
+  内置了官方源与 ghproxy；需要其他镜像时：
+
+  ```bash
+  frpsctl install --mirror https://my-mirror.example/frp/releases/download
+  # 或
+  FRPSCTL_MIRROR=https://a.example,https://b.example frpsctl install
+  ```
+
+  命令行给的镜像会**替换**（而不是追加）内置源——指定镜像通常意味着"内置源
+  在我这里不通"。
 - **拿不到校验和就拒绝安装**（fail-closed）。确有需要可 `--insecure` 跳过，风险自负。
 - 低于 0.70.0 的版本直接拒绝——装了也用不了。
 - **幂等**：同版本已在盘上时不重复下载，但**仍会校正 `bin/frps` 软链**——手工改歪的
@@ -144,7 +155,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.1.0
+ ✓ 命令可用：frpsctl 0.2.0
 
 frpsctl 安装完成
 ```
@@ -158,7 +169,10 @@ frpsctl 安装完成
 | `--no-verify` | 跳过安装后自检 |
 
 **反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
-源码无需重装，命令立即生效。
+源码无需重装，命令立即生效。发布到 PyPI 后，用 pipx / pip 安装的版本可分别用
+`pipx upgrade frpsctl` / `pip install -U frpsctl` 升级。
+
+建议开启 shell 补全（`frpsctl --install-completion`，支持 bash/zsh/fish）。
 
 > 脚本**不下载 frps 二进制**——那是 `frpsctl install` 的职责（需要网络与校验和，
 > 且要写入用户数据目录）。安装器只负责让 `frpsctl` 这个命令可用。
@@ -213,6 +227,7 @@ instance : default            owner : direct
 state    : RUNNING (pid 179841, up 1s)
 binary   : frps 0.71.0
 config   : /home/u/.local/share/frpsctl/instances/default/frps.toml (0600)
+listen   : 0.0.0.0:7000
 dashboard: 127.0.0.1:7500 (auth: on)
 health   : L1 process ok  L2 control ok  L3 plugin skipped
 clients  : 0 online
@@ -290,6 +305,7 @@ remotePort = 6000        # 必须落在 allowPorts 范围内
 frpsctl status              # 人读
 frpsctl status --json       # 机器可读（前后位置都行：status --json / --json status）
 frpsctl status --watch      # 持续刷新
+frpsctl status --watch --json   # 持续输出单行 JSON（NDJSON），可逐行消费
 ```
 
 `status` **永远以退出码 0 结束**（除非参数写错）——它的职责是回答"现在什么情况"，
@@ -300,6 +316,7 @@ $ frpsctl status            # 实例没在跑
 instance : default            owner : none
 state    : STOPPED
 config   : /home/u/.local/share/frpsctl/instances/default/frps.toml (0600)
+listen   : 0.0.0.0:7000
 dashboard: 127.0.0.1:7500 (auth: on)
 ```
 
@@ -314,6 +331,10 @@ $ frpsctl status --json
   "binary_version": "0.71.0",
   "disk_version": "0.71.0",
   "config_mode": "0600",
+  "listen": {
+    "addr": "0.0.0.0",
+    "port": 7000
+  },
   "health": {
     "l1_process": "ok",
     "l2_control": "ok",
@@ -334,6 +355,10 @@ $ frpsctl status --json
 | L2 控制面 | `GET /healthz`（免认证） | frp 的 HTTP 服务在正常应答（`webServer.port = 0` 时为 `skipped`） |
 | L3 插件面 | 对 `httpPlugins[].addr` 做 TCP 探测 | 登录链路是否可能成功（未配插件时为 `skipped`） |
 
+> **`start` / `restart` 的成功判据是 L1 ∧ L2（gate）**。gate 未通过时退出码为
+> **12**，同时向 stderr 告警——但进程**不会被清理**：它仍由本工具托管，
+> `status` 看得见、`stop` 停得掉。直接重试 `start` 只会得到"已在运行(6)"。
+>
 > L3 失败**不改变退出码**，但会显著告警——因为插件是 fail-closed 的：插件不可达
 > 意味着**所有客户端都无法登录**。
 
@@ -639,6 +664,36 @@ sudo frpsctl service uninstall    # 解除托管
 安装后 `owner` 变为 `systemd`，`start` / `stop` / `restart` 全部**委托 systemctl**，
 pid 文件不再参与任何判定。
 
+### 部署前置（`service install` 会在安装前检查）
+
+unit 只是第一步——下面三项不满足时 `systemctl start` 必然失败。`service install`
+会在**安装之前**逐项检查并当场拒绝，而不是让你事后去 systemctl 的报错里找原因：
+
+| 检查 | 不满足时的典型表现 | 处置 |
+|------|------------------|------|
+| 服务用户存在（默认 `frps`） | `Failed to determine user credentials` | `sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps`，或用 `--user`/`--group` 指定已有账户 |
+| 二进制对服务用户可执行 | `Permission denied` | `sudo frpsctl install` 默认装在 `/root/.local/share`（`/root` 是 0700，frps 用户读不到）。改用共享目录：`sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl install` |
+| 日志目录可写（默认 `/var/log/frps`） | `Failed to set up mount namespacing` | `service install` 会自动创建并 chown；无法写入时会被拒绝，可用 `--log-dir` 换位置 |
+| 二进制与实例目录**不在家目录下** | unit 看不到路径（`ProtectHome=true` 的挂载隔离） | 用 `/opt`、`/etc`、`/srv` 等系统路径，别用 `~/.local` |
+
+`service install` 还会把**实例目录移交给服务用户**（权限仍是 0700，只是属主从
+root 换成服务用户）——否则 frps 进程读不到目录里的 `frps.toml`。安全性不降级：
+同机其他用户依然读不到。因此 systemd 模式下请统一用 root 执行 frpsctl
+（systemctl 委托本来也需要 root）。
+
+完整流程：
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
+export D=/opt/frpsctl
+
+sudo FRPSCTL_DATA_HOME=$D frpsctl install          # 下载二进制（可加 --mirror）
+sudo FRPSCTL_DATA_HOME=$D frpsctl init --no-input  # 生成配置（会打印 token 与口令）
+sudo FRPSCTL_DATA_HOME=$D frpsctl service install  # 体检 → 渲染 unit → enable
+sudo FRPSCTL_DATA_HOME=$D frpsctl start            # 委托 systemctl
+sudo FRPSCTL_DATA_HOME=$D frpsctl status
+```
+
 渲染出的 unit（`/etc/systemd/system/frps@.service`）：
 
 ```ini
@@ -666,7 +721,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/log/frps
+# 实例目录也在列：ProtectSystem=strict 下其余路径只读，
+# 而 frp 默认要往实例目录写 ./frps.log
+ReadWritePaths=/var/log/frps /etc/frps/instances/%i
 
 [Install]
 WantedBy=multi-user.target
@@ -684,6 +741,7 @@ WantedBy=multi-user.target
 ```bash
 frpsctl install --version 0.72.0                    # 下载 + 校验 + 落盘 + 换软链
 frpsctl install --version 0.72.0 --only-download    # 只落盘，稍后统一切换
+frpsctl install --version 0.72.0 --mirror URL       # 指定镜像源（也可用 FRPSCTL_MIRROR）
 frpsctl install --force                             # 同版本重新下载
 ```
 
@@ -718,6 +776,7 @@ frpsctl install --version 0.71.0 && frpsctl restart
 | 9 | 变更已自动回滚 | 配置写入后启动/健康检查失败，已恢复上一版 |
 | 10 | 启动失败 / 进程停不下来 | 启动即退出（附 frp 原始报错）；SIGKILL 后仍存在 |
 | 11 | 进程所有权冲突 | 身份校验不通过；systemd 与 direct 混用；锁被占用 |
+| 12 | 已启动但健康检查未通过 | L1 进程在、L2 控制面不可达（进程仍被托管，见健康分层） |
 
 脚本里应当据此分支：
 
@@ -728,6 +787,7 @@ case $? in
   6)  echo "已在运行，跳过" ;;
   4)  echo "需要先 frpsctl install" >&2; exit 4 ;;
   10) echo "启动失败，查看 frpsctl log" >&2; exit 10 ;;
+  12) echo "进程已启动但控制面异常，查看 frpsctl status" >&2; exit 12 ;;
   *)  exit 1 ;;
 esac
 ```
@@ -743,6 +803,7 @@ esac
 | `FRPSCTL_DATA_HOME` | 数据根目录（默认 `$XDG_DATA_HOME/frpsctl`） |
 | `FRPSCTL_ADMIN_PASSWORD` | dashboard 口令（优先于配置文件） |
 | `FRPSCTL_PLUGIN_POLICY` | 插件策略文件路径 |
+| `FRPSCTL_MIRROR` | frps 下载镜像（逗号分隔；`install --mirror` 优先于它） |
 | `FRPSCTL_TRACEBACK` | 设为 `1` 时打印完整回溯（排查未分类错误用） |
 
 全局选项（写在子命令前后都可以）：
@@ -978,16 +1039,20 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归
+.venv/bin/pytest                       # 全部 296 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（271 条）
+.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 82%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
 
-### 测试分五层
+CI（Linux，Python 3.11/3.12/3.13）还包含：ruff、覆盖率门禁、真 frp 0.71.0 契约层、
+**真 frp 0.70.0 下界契约矩阵**、无二进制降级路径、端到端冒烟。
+
+### 测试分六层
 
 | 层 | 文件 | 目标 |
 |----|------|------|
-| 单元 | `tests/test_units.py` | 进程原语、锁、原子写、无损补丁、标志构造、**二进制解包与复验**、**systemd unit 渲染与委托** |
+| 单元 | `tests/test_units.py` | 进程原语、锁、原子写、无损补丁、标志构造、机密打码、**二进制解包与复验**、**systemd unit 渲染与部署体检** |
 | 集成 | `tests/test_integration.py` | 生命周期与回滚（假 frps 驱动确定性故障） |
 | CLI | `tests/test_cli.py` | 退出码契约、`--json` 形态、机密不外泄、全局选项位置、`config edit` 闭环 |
 | 契约 | `tests/test_facts.py` | **设计文档事实基线的自动化守卫**（需真 frps） |
@@ -1026,6 +1091,7 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **只支持 Linux** | macOS / Windows 直接拒绝启动，不提供降级 |
 | **只支持 frps ≥ 0.70.0** | 因为只用 v2 Admin API，不做 v1 降级 |
 | **`restart` 没有 `--no-rollback`** | 重启不读配置，不存在"新旧版本"可比；自动回滚只属于配置变更路径 |
+| **`start --foreground` 不写 state** | 前台模式只用于调试：进程不进入本工具的托管视图，`stop` 管不到它（`--help` 里已警示） |
 | **不做并发连接上限** | 它只能在 `NewUserConn` 上实施，而那落在每次用户连接的关键路径上、错误只以 info 级记录、且回调内容里没有连接 id。需要真并发限制请在 frpc 侧用连接池与限流 |
 | **`max_proxies` 计数需配 `admin_url`** | 不配时只在插件进程内计数（重启归零、多实例各算各的），`plugin check` 会告警 |
 | **frps 没有热重载** | 改配置必然重启，因此 `config set` 的设计目标就是"失败了要能退回去" |
