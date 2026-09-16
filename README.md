@@ -77,9 +77,8 @@
 ## 安装
 
 ```bash
-# 1) 装 Python 侧
-pipx install frpsctl          # 已发布到 PyPI；尚未发布时可先走下面的源码安装
-# 或：pip install frpsctl / pip install -U frpsctl（升级）
+# 1) 装 Python 侧（已发布到 PyPI）
+pipx install frpsctl          # 或：pip install frpsctl；升级：pip install -U frpsctl
 
 # 2) 装 frps 二进制（从官方发布页下载，sha256 强校验）
 frpsctl install
@@ -169,7 +168,7 @@ frpsctl 安装完成
 | `--no-verify` | 跳过安装后自检 |
 
 **反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
-源码无需重装，命令立即生效。发布到 PyPI 后，用 pipx / pip 安装的版本可分别用
+源码无需重装，命令立即生效。用 pipx / pip 安装的版本可分别用
 `pipx upgrade frpsctl` / `pip install -U frpsctl` 升级。
 
 建议开启 shell 补全（`frpsctl --install-completion`，支持 bash/zsh/fish）。
