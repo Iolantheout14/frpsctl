@@ -81,6 +81,9 @@ def build_context(
         data_home=resolve_data_home(),
         config_override=config.expanduser() if config else None,
     )
+    # `--verbose` 是进程级诊断开关：它要影响的调用点在 core/ 里（下载与 verify 的
+    # 子进程），那些函数没有 CLI 上下文。见 `ui.set_verbose` 的说明。
+    ui.set_verbose(verbose)
     return AppContext(
         instance=inst,
         binary=binary.expanduser() if binary else None,

@@ -101,6 +101,22 @@ frps 0.71.0 → /home/u/.local/share/frpsctl/bin/frps-0.71.0
 - 下载地址可被镜像替换，但**信任锚是官方校验和文件**（`frp_sha256_checksums.txt`）。
 - **拿不到校验和就拒绝安装**（fail-closed）。确有需要可 `--insecure` 跳过，风险自负。
 - 低于 0.70.0 的版本直接拒绝——装了也用不了。
+- **幂等**：同版本已在盘上时不重复下载，但**仍会校正 `bin/frps` 软链**——手工改歪的
+  链会被修回来。想"只落盘、不动链"请显式加 `--only-download`。
+
+#### `frpc` 是测试专用件，不是运维件
+
+`--with-frpc` 会从**同一个 tar 包**里额外取出 `frpc`（`bin/frpc-<version>` + 软链），
+不产生额外下载：
+
+```bash
+frpsctl install --with-frpc        # frps + frpc
+```
+
+它不服务于 frps 的日常运维，只为了让**插件契约测试**能跑起来——插件（`Login` /
+`NewProxy` 回调）的唯一真实调用方是 frpc，没有它就只能靠手工拼报文验证协议。
+`frps` 与 `frpc` 的落盘判定**互相独立**，因此"机器上已有 frps，现在想补装 frpc"
+也能装上。
 
 ### 从源码安装（一键脚本）
 
@@ -444,8 +460,8 @@ $ frpsctl doctor
 | 二进制存在 / 可执行 / 版本 | ERROR | `< 0.70.0` 拒绝；`0.70.x` 提示缺 DoS 修复 |
 | 配置可解析 + `frps verify` | ERROR | 双保险 |
 | 配置文件权限 | ERROR / WARN | 含 token 却非 0600 → ERROR |
-| dashboard 暴露面 | ERROR | 绑非回环 **且** 口令为空 = 完全不鉴权 |
-| dashboard 弱口令 | WARN | 口令为空，或 admin/admin |
+| dashboard 暴露面 | ERROR | 绑非回环 **且** user/password 全空 = 完全不鉴权 |
+| dashboard 弱口令 | WARN | user/password 全空；**password 为空而 user 非空**（frp 把空口令当合法口令）；或 admin/admin |
 | `transport.tls.force` | WARN | 未开启时可接受明文 frpc |
 | `allowPorts` / `maxPortsPerClient` | WARN | 未设置时端口可被任意申请 |
 | 端口可绑定性 | ERROR | 探测各监听端口；自己占着会识别为"正常" |
@@ -603,6 +619,13 @@ $ tail -1 plugin-audit.jsonl
 > 2. **frp 的插件协议没有任何认证**（配置项只有 `name/addr/path/ops/tlsVerify`），
 >    所以插件只允许绑回环。指向非回环会被 `plugin serve` 拒绝，`doctor` 也报 ERROR。
 
+`plugin serve` 收到 **SIGTERM**（`systemctl stop` 发的就是它）会**优雅退出**：先停
+服务、再把审计缓冲刷盘，然后才退出。默认处置下进程会立即死亡，缓冲里未落盘的裁决
+记录会一起丢掉——那恰恰是最不该丢的时候。
+
+`plugin serve --json` 输出的是**启动前的一次性状态**，之后仍然是前台阻塞运行；
+它不提供 JSON 流。需要探活请轮询 `GET /healthz`（免认证）。
+
 ---
 
 ## 用 systemd 托管
@@ -732,9 +755,29 @@ esac
 --json                 机器可读输出
 --admin-password       dashboard 口令
 --yes, -y              跳过交互确认
---verbose, -v          详细输出
+--verbose, -v          详细输出（把外部命令与判定过程打进 stderr）
 --version              frpsctl 版本
 ```
+
+> **长名可以写在任意位置，短名 `-v` 只能写在子命令之前**。`frpsctl status --json`、
+> `frpsctl config get bindPort -i web`、`frpsctl verify --verbose` 都可用；但 `-v`
+> 与子命令自己的短选项（`-n` / `-f`）挤在一起，盲目前移会把子命令的参数搬到错误
+> 位置，因此短写不做重排。`frpsctl --verbose status` 与 `frpsctl status --verbose`
+> 完全等价。
+
+`--verbose` 输出的是**诊断**，只进 stderr（例如实际执行的 `frps verify` 命令、
+读到的二进制版本、派生的进程与落盘的启动日志路径）：
+
+```console
+$ frpsctl verify --verbose
+[trace] 读取二进制版本：~/.local/share/frpsctl/bin/frps-0.71.0 -v
+[trace] 二进制版本：0.71.0（退出码 0）
+[trace] 执行权威校验：~/.local/share/frpsctl/bin/frps-0.71.0 --strict_config=true verify -c …/tmpXXXX.toml
+[trace] verify 退出码 0
+…/instances/default/frps.toml 校验通过（frps 0.71.0，标志：--strict_config=true）
+```
+
+因为只进 stderr，`--verbose --json` 的 stdout 仍是干净的 JSON，可以直接管道给 `jq`。
 
 凭据优先级：`--admin-password` > `FRPSCTL_ADMIN_PASSWORD` > 配置文件里的
 `webServer.password`。
@@ -887,6 +930,37 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 | `auth.token` | 随机 32 字符 | 无 token 等于无客户端鉴权 |
 | 配置文件权限 | `0600` | 内含 token 与口令；原子写落地，无权限窗口 |
 
+### dashboard 鉴权的真实语义（实测）
+
+上面那条"两者全空 = 完全不鉴权"容易让人以为"只要填了 user 就安全了"。真机上
+逐项实测（frps 0.71.0）后，完整语义是这样的：
+
+| `webServer.user` | `webServer.password` | 无 `Authorization` 头 | `user:(空口令)` |
+|---|---|---|---|
+| `"admin"` | 未设 / 空 | **401** | **200** |
+| 未设 | 未设 | **200** | 200（任意凭据均可） |
+| `"admin"` | `"secret"` | 401 | 401（须 `admin:secret`） |
+| 未设 | `"secret"` | 401 | 401（须 `:secret`） |
+
+两条推论：
+
+1. **鉴权开关是"任一非空即启用"**。因此 `frpsctl` 只拒绝"两者全空 + 绑非回环"
+   ——那是真·完全不鉴权；而"有 user、口令为空"属于**强度不足**（毕竟启用了鉴权），
+   是用户的显式选择，所以由 `doctor` 报 **WARN** 而不是否决写配置。
+2. **Basic Auth 里的空口令是合法口令**。`user = "admin"` 而 `password = ""` 时，
+   任何人用 `admin` + 空口令就能进 dashboard——等于只用用户名保护。`doctor`
+   会明确报出来：
+
+   ```console
+   $ frpsctl config set webServer.password '""' && frpsctl doctor
+   [WARN ] dashboard 弱口令: password 为空（user = 'admin'）—— frp 把空口令当作合法口令，
+           等于只用用户名保护 dashboard
+           ↳ 设置一个随机口令：`frpsctl config set webServer.password '"..."'`
+   ```
+
+   只设 password 不设 user 也启用鉴权，但调用方要发**空用户名**的 Basic Auth
+   （`frpsctl` 自己发请求时已按此处理）。
+
 其他保证：
 
 1. **拒绝危险组合**：`config set` 与 `doctor` 双重拦截"dashboard 绑非回环 + 口令为空"。
@@ -913,9 +987,9 @@ uv venv && uv pip install -e ".[dev]"
 
 | 层 | 文件 | 目标 |
 |----|------|------|
-| 单元 | `tests/test_units.py` | 进程原语、锁、原子写、无损补丁、标志构造 |
+| 单元 | `tests/test_units.py` | 进程原语、锁、原子写、无损补丁、标志构造、**二进制解包与复验**、**systemd unit 渲染与委托** |
 | 集成 | `tests/test_integration.py` | 生命周期与回滚（假 frps 驱动确定性故障） |
-| CLI | `tests/test_cli.py` | 退出码契约、`--json` 形态、机密不外泄 |
+| CLI | `tests/test_cli.py` | 退出码契约、`--json` 形态、机密不外泄、全局选项位置、`config edit` 闭环 |
 | 契约 | `tests/test_facts.py` | **设计文档事实基线的自动化守卫**（需真 frps） |
 | 故障注入 | `tests/test_faults.py` | 注入系统调用失败，验证异常路径的五项不变量 |
 | 插件 | `tests/test_plugin.py` | 协议报文、裁决、审计、配额；含真 frpc 端到端契约 |
@@ -923,11 +997,14 @@ uv venv && uv pip install -e ".[dev]"
 让契约层跑起来（需要真实二进制）：
 
 ```bash
-frpsctl install --with-frpc
+frpsctl install --with-frpc        # 一次下载，同时得到 frps 与 frpc
 export FRPSCTL_TEST_BINARY=~/.local/share/frpsctl/bin/frps-0.71.0
 export FRPSCTL_TEST_FRPC=~/.local/share/frpsctl/bin/frpc-0.71.0
 .venv/bin/pytest tests/test_facts.py tests/test_plugin.py -m contract
 ```
+
+没有 frpc 时，`tests/test_plugin.py::TestRealFrpcContract` 的 4 条会 **skip**（不是
+fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此宁可跳过也不删掉。
 
 > **契约层为什么重要**：它断言的是 frp 的**行为事实**（字段名、形状、退出码、
 > 标志可用性）。frp 一旦改动这些，CI 会先于用户发现——而不是等某个用户报告

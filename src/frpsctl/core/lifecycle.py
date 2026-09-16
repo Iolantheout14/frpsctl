@@ -410,7 +410,6 @@ class Lifecycle:
         from ..errors import ApiVersionMismatch, AdminUnreachable
 
         deadline = time.monotonic() + timeout
-        last: Exception | None = None
         while True:
             try:
                 with AdminClient(dash.base_url, dash.user, dash.password, timeout=2.0) as client:
@@ -418,16 +417,14 @@ class Lifecycle:
                 return
             except ApiVersionMismatch:
                 raise  # 版本不符：重试没有意义
-            except AdminUnreachable as exc:
-                last = exc
+            except AdminUnreachable:
                 if time.monotonic() >= deadline:
                     # 服务本身已通过健康检查；统计暂时取不到不该拦下启动
                     return
                 time.sleep(0.2)
-            except FrpsctlError as exc:  # 其它业务异常同样不阻断启动
-                last = exc
+            except FrpsctlError:
+                # 其它业务异常同样不阻断启动：v2 探针是"确认能力"，不是"健康判据"
                 return
-        _ = last
 
     def _reap_after_failure(self, pid: int) -> None:
         """启动流程中途失败时收拾掉自己刚派生的进程。
@@ -452,6 +449,9 @@ class Lifecycle:
         # 交给 with 会在 Popen 之前就关掉，子进程拿到的是已关闭的 fd。
         handle = open(log_path, "ab", buffering=0)  # noqa: SIM115
         try:
+            from ..cli.ui import trace
+
+            trace(f"派生进程：{binary} -c {self.inst.config}（stdout → {log_path}）")
             proc = subprocess.Popen(
                 [str(binary), "-c", str(self.inst.config)],
                 cwd=self.inst.dir,  # 让配置里的相对路径可预期

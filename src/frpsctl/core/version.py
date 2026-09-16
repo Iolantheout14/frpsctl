@@ -70,6 +70,9 @@ def read_binary_version(binary: Path, *, timeout: float = 5.0) -> Version:
     但这里只用最朴素的 `-v` 形式。
     """
     try:
+        from ..cli.ui import trace
+
+        trace(f"读取二进制版本：{binary} -v")
         proc = subprocess.run(
             [str(binary), "-v"],
             capture_output=True,
@@ -80,7 +83,11 @@ def read_binary_version(binary: Path, *, timeout: float = 5.0) -> Version:
         raise VersionParseError(f"{binary} 不存在或不可执行") from None
     except subprocess.TimeoutExpired:
         raise VersionParseError(f"{binary} -v 超时未返回") from None
-    return parse_version(proc.stdout or proc.stderr)
+    version = parse_version(proc.stdout or proc.stderr)
+    from ..cli.ui import trace
+
+    trace(f"二进制版本：{version}（退出码 {proc.returncode}）")
+    return version
 
 
 def ensure_supported(version: Version | tuple[int, int, int]) -> None:

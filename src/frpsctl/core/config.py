@@ -409,19 +409,24 @@ def validate_text(
         with handle:
             handle.write(text)
         try:
+            argv = [
+                str(binary),
+                *config_flags(uses_exec_token_source=uses_unsafe),
+                "verify",
+                "-c",
+                str(candidate),
+            ]
+            from ..cli.ui import trace
+
+            trace(f"执行权威校验：{' '.join(argv)}")
             proc = subprocess.run(
-                [
-                    str(binary),
-                    *config_flags(uses_exec_token_source=uses_unsafe),
-                    "verify",
-                    "-c",
-                    str(candidate),
-                ],
+                argv,
                 cwd=workdir,
                 capture_output=True,
                 text=True,
                 timeout=VERIFY_TIMEOUT,
             )
+            trace(f"verify 退出码 {proc.returncode}")
         except subprocess.TimeoutExpired:
             # 必须接住：让它冒出去只会变成"未分类错误"，而真正该说的是
             # "校验没能在 N 秒内完成"——用户据此判断是二进制卡住了还是机器太慢。
