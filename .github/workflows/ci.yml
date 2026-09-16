@@ -32,6 +32,9 @@ jobs:
           uv venv --python ${{ matrix.python-version }}
           uv pip install --python .venv/bin/python -e ".[dev]"
 
+      - name: 静态分析
+        run: .venv/bin/ruff check src/ tests/
+
       - name: 拉取真实 frps + frpc（契约层用）
         run: |
           # 用我们自己的 install 下载 + sha256 强校验 —— 顺带验证 §8.6 的信任模型。
@@ -44,8 +47,12 @@ jobs:
           "$BIN/frps-${FRPS_VERSION}" -v
           "$BIN/frpc-${FRPS_VERSION}" -v
 
-      - name: 单元 + 集成 + CLI 层
-        run: .venv/bin/pytest tests/ -q -m "not contract"
+      - name: 单元 + 集成 + CLI 层（覆盖率门禁）
+        run: |
+          # 覆盖率门禁：非契约层的基线是 81%，低于 80% 视为回归（新增代码
+          # 不应把已有覆盖挤掉）。契约层需要真二进制，单独跑、不进覆盖率。
+          .venv/bin/pytest tests/ -q -m "not contract" \
+            --cov=frpsctl --cov-report=term --cov-fail-under=80
 
       - name: 契约层（设计文档事实基线的自动化守卫）
         run: .venv/bin/pytest tests/test_facts.py -q
@@ -90,3 +97,22 @@ jobs:
           uv pip install --python .venv/bin/python -e ".[dev]"
       - name: 契约层必须整体 skip 而不是失败
         run: .venv/bin/pytest tests/test_facts.py -q -rs
+
+  contract-070:
+    name: 契约层（frp 0.70.0 下界）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: 安装依赖
+        run: |
+          uv venv --python 3.13
+          uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: 版本门槛下界的契约验证
+        run: |
+          # 支持范围的下界必须与上界一样可信：§3.6 的门槛是 0.70.0，
+          # 契约层就在这里把它变成可执行断言（本机已实测 21/21 通过）。
+          export FRPSCTL_DATA_HOME="$RUNNER_TEMP/data070"
+          .venv/bin/frpsctl install --version 0.70.0
+          FRPSCTL_TEST_BINARY="$RUNNER_TEMP/data070/bin/frps-0.70.0" \
+            .venv/bin/pytest tests/test_facts.py -q

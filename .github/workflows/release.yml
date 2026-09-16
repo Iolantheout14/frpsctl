@@ -1,0 +1,102 @@
+name: Release
+
+# 发布流程（打 tag 触发）：
+#   1. 修改 src/frpsctl/__init__.py 的 __version__
+#   2. 更新 CHANGELOG.md
+#   3. git tag v<version> && git push origin v<version>
+#
+# 版本一致性由本流程强校验：tag 与 __version__ 不一致直接失败——防止发布物
+# 与代码里的版本号漂移。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 sdist 与 wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: 校验 tag 与 __version__ 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'EOF'
+          import os, pathlib, re, sys
+
+          text = pathlib.Path("src/frpsctl/__init__.py").read_text(encoding="utf-8")
+          version = re.search(r'__version__ = "([^"]+)"', text).group(1)
+          tag = os.environ["TAG"]
+          if f"v{version}" != tag:
+              sys.exit(f"tag {tag} 与 __version__ {version} 不一致——先改版本号再打 tag")
+          print(f"版本一致：{tag}")
+          EOF
+
+      - name: 构建
+        run: uv build
+
+      - name: 构建产物自检（wheel 必须包含 py.typed 与全部模块）
+        run: |
+          python3 - <<'EOF'
+          import pathlib, zipfile
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          names = set(zipfile.ZipFile(wheel).namelist())
+          required = {"frpsctl/py.typed", "frpsctl/cli/__init__.py", "frpsctl/core/lifecycle.py"}
+          missing = required - names
+          if missing:
+              raise SystemExit(f"wheel 缺少文件：{sorted(missing)}")
+          print(f"{wheel.name} 自检通过（{len(names)} 个条目）")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  github-release:
+    name: 创建 GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  pypi:
+    name: 发布到 PyPI（Trusted Publishing）
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # 前置配置（一次性，在 PyPI 网页端）：
+      #   Publishing → Add a new pending publisher
+      #   - Owner: <your-github-user>  Repository: frpsctl
+      #   - Workflow: release.yml      Environment: pypi
+      # 然后在仓库 Settings → Variables 添加 PYPI_PUBLISH=true 启用本 job。
+      # 未配置时本 job 整体跳过，不会把 release 流程染红。
+      - uses: pypa/gh-action-pypi-publish@release/v1
