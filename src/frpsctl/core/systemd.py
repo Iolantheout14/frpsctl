@@ -160,6 +160,9 @@ class Systemd:
             config_dir=self.inst.instances_root,
             log_dir=log_dir,
         )
+        # 先建目录：`unit_dir` 可被注入（测试）或指向一个尚未存在的自定义位置；
+        # 真实部署里 /etc/systemd/system 通常存在，但没有理由依赖这一点。
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
         self.template_path.write_text(content, "utf-8")
         self.template_path.chmod(0o644)
         self._run_checked("daemon-reload")

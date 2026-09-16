@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..errors import BinaryNotFound, ConfigError, UsageError
+from ..errors import BinaryNotFound, ConfigError, FrpsctlError, UsageError
 
 __all__ = [
     "Instance",
@@ -289,7 +289,12 @@ class Instance:
                 seq += 1  # 被别人抢了，换下一个序号
                 continue
             return candidate
-        raise RuntimeError(f"无法在 {self.history_dir} 分配快照序号（连续冲突过多）")
+        # 用契约内异常而不是裸 RuntimeError：CLI 只映射 FrpsctlError，
+        # 裸异常会变成"未分类错误(1)"，把"快照目录异常"误报成"工具内部出错"。
+        raise FrpsctlError(
+            f"无法在 {self.history_dir} 分配快照序号（连续 {1000} 次冲突）",
+            hint="该目录可能被并发写满或权限异常；检查目录内容后重试",
+        )
 
     def history_entries(self) -> list[Path]:
         """所有快照，**从新到旧**（便于 rollback [N] 取第 N 个）。"""
