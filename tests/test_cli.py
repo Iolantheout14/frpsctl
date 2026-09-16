@@ -19,12 +19,27 @@ from frpsctl.cli.context import map_exceptions
 
 
 class _Result:
-    """最小结果对象：只有测试真正关心的两个字段。"""
+    """最小结果对象。
 
-    def __init__(self, exit_code: int, output: str, exception: BaseException | None = None):
+    `output` 是两流合并视图（既有断言都依赖它，保持不变）；`stdout` / `stderr`
+    分开保留，供"诊断只能进 stderr"这类断言使用——**合并视图做不到这件事**，
+    而 `--verbose` 的核心契约恰恰是"不污染 stdout"。
+    """
+
+    def __init__(
+        self,
+        exit_code: int,
+        output: str,
+        exception: BaseException | None = None,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ):
         self.exit_code = exit_code
         self.output = output
         self.exception = exception
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class _Cli:
@@ -55,7 +70,14 @@ class _Cli:
             code = 1
         finally:
             sys.stdout, sys.stderr = real_out, real_err
-        return _Result(code, stdout.getvalue() + stderr.getvalue(), exception)
+        out_text, err_text = stdout.getvalue(), stderr.getvalue()
+        return _Result(
+            code,
+            out_text + err_text,
+            exception,
+            stdout=out_text,
+            stderr=err_text,
+        )
 
 
 runner = _Cli()
@@ -341,3 +363,169 @@ class TestCommandsThatWereBroken:
             assert "NameError" not in result.output, f"{args} 触发 NameError"
             assert "TypeError" not in result.output, f"{args} 触发 TypeError"
             assert "UnboundLocalError" not in result.output, f"{args} 触发 UnboundLocalError"
+
+
+class TestConfigEdit:
+    """`config edit` 的**落盘路径**此前零覆盖（只测了"没有改动"那条早退分支）。
+
+    它是唯一一条"用户在编辑器里自由改写、然后走同一事务闭环"的入口，因此也是最
+    容易把 §9 的校验/备份/替换顺序写错的地方。
+    """
+
+    def _append_max_ports(self, cli_env) -> str:
+        """返回一段把 `maxPortsPerClient` 改成 30 的 sed 脚本内容。"""
+        return "s/^maxPortsPerClient = .*/maxPortsPerClient = 30/"
+
+    def test_edit_applies_change_and_restarts_nothing(self, cli_env, monkeypatch) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert "maxPortsPerClient = 20" in config.read_text("utf-8")
+
+        editor = cli_env / "editor.sh"
+        editor.write_text(
+            f"#!/bin/sh\nsed -i '{self._append_max_ports(cli_env)}' \"$1\"\n",
+            "utf-8",
+        )
+        editor.chmod(0o755)
+        monkeypatch.setenv("EDITOR", str(editor))
+
+        result = runner.invoke(app, ["config", "edit", "--yes"])
+        assert result.exit_code == 0, result.output
+        assert "maxPortsPerClient = 30" in config.read_text("utf-8")
+        # 实例没在跑：必须如实说明"尚未生效"，而不是谎报"已重启"
+        assert "未运行" in result.output or "start 后生效" in result.output, result.output
+        # 变更前必须先备份（§9 第 6 步）
+        history = cli_env / "instances" / "default" / "config-history"
+        assert history.is_dir() and list(history.iterdir()), "编辑前没有留下快照"
+
+    def test_edit_rejects_editor_failure(self, cli_env, monkeypatch) -> None:
+        """编辑器非零退出 = 用户放弃 → 配置必须零改动，且退出码 3。"""
+        runner.invoke(app, ["init", "--no-input"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        before = config.read_text("utf-8")
+
+        editor = cli_env / "editor.sh"
+        editor.write_text("#!/bin/sh\nexit 1\n", "utf-8")
+        editor.chmod(0o755)
+        monkeypatch.setenv("EDITOR", str(editor))
+
+        result = runner.invoke(app, ["config", "edit"])
+        assert result.exit_code == 3, result.output
+        assert config.read_text("utf-8") == before
+
+    def test_edit_rejects_invalid_result_before_touching_file(self, cli_env, monkeypatch) -> None:
+        """编辑器写坏了配置 → 必须在**动线上文件之前**被拒绝（§9 第 3/5 步）。"""
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        before = config.read_text("utf-8")
+
+        editor = cli_env / "editor.sh"
+        editor.write_text(
+            "#!/bin/sh\nprintf 'bindPort = 99999\\n' > \"$1\"\n",
+            "utf-8",
+        )
+        editor.chmod(0o755)
+        monkeypatch.setenv("EDITOR", str(editor))
+
+        result = runner.invoke(app, ["config", "edit", "--yes"])
+        assert result.exit_code == 3, result.output
+        assert config.read_text("utf-8") == before, "非法草稿动到了线上文件"
+
+
+class TestVerboseOption:
+    """`--verbose` 曾是一个"被文档承诺、被解析、然后**从未被读过**"的空选项。
+
+    那比没有这个选项更糟：用户加上它以为能看到诊断，实际什么都没变。现在它必须
+    产生**可见**的诊断输出，且那些输出**只能进 stderr**——`--json` 的 stdout 是
+    机器可读契约，混进诊断会让 `jq` 直接解析失败。
+    """
+
+    def test_verbose_emits_diagnostics_to_stderr(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["--verbose", "verify"])
+        assert result.exit_code == 0, result.output
+        assert "[trace]" in result.stderr, "--verbose 没有产生任何诊断输出"
+        assert "verify" in result.stderr
+        assert "[trace]" not in result.stdout, "诊断污染了 stdout"
+
+    def test_verbose_works_after_subcommand(self, cli_env) -> None:
+        """全局选项写在子命令**之后**也必须生效（README 的承诺）。
+
+        此前只有 `--json` 被逐命令打过补丁，`--verbose` / `--yes` 写在后面会直接
+        报 `No such option` —— 文档与实现不一致。现在由 `_AnywhereGroup` 统一处理。
+        """
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["verify", "--verbose"])
+        assert result.exit_code == 0, result.output
+        assert "[trace]" in result.stderr
+
+    def test_without_verbose_stderr_is_clean(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["verify"])
+        assert result.exit_code == 0, result.output
+        assert "[trace]" not in result.stderr
+
+    def test_verbose_never_pollutes_json_stdout(self, cli_env) -> None:
+        """`--verbose --json` 的 stdout 必须仍是**纯 JSON**。"""
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["--verbose", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)  # 混进 trace 就会在这里炸
+        assert payload["instance"] == "default"
+        assert "[trace]" in result.stderr
+
+
+class TestGlobalOptionPlacement:
+    """`_AnywhereGroup` 的行为契约。
+
+    它必须把全局选项搬到前面，同时**不能**碰子命令自己的同名/相近选项——否则
+    `install --version 0.71.0` 会被根命令的 `--version` 抢走，变成"打印版本后退出"。
+    """
+
+    def test_json_after_subcommand(self, cli_env) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["status", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["state"] == "STOPPED"
+
+    def test_instance_after_subcommand(self, cli_env) -> None:
+        result = runner.invoke(app, ["config", "get", "bindPort", "-i", "default"])
+        assert result.exit_code == 3, result.output  # 配置不存在 → 3，但**不是**用法错误 2
+        assert "No such option" not in result.output
+        assert result.exit_code != 2
+
+    def test_subcommand_version_still_belongs_to_install(self, cli_env) -> None:
+        """`--version` **不在**全局白名单里：它是 `install` 的版本参数。
+
+        若误把它当全局选项搬走，`install --version 0.69.1` 会变成"打印 frpsctl
+        版本并退出 0"——一个**静默的错误成功**，比报错危险得多。
+        """
+        result = runner.invoke(app, ["install", "--version", "0.69.1"])
+        assert result.exit_code == 4, result.output
+        assert "不支持的 frps 版本" in result.output
+        assert "0.69.1" in result.output
+
+    def test_local_options_keep_their_position(self, cli_env) -> None:
+        """局部选项的**值**不能被误当成子命令名搬走。"""
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["log", "-n", "5"])
+        assert result.exit_code == 3, result.output  # 日志文件不存在
+        assert "日志文件不存在" in result.output
+
+    def test_yes_after_subcommand(self, cli_env, monkeypatch) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setenv("EDITOR", "true")
+        result = runner.invoke(app, ["config", "edit", "--yes"])
+        assert result.exit_code == 0, result.output
+        assert "没有改动" in result.output
