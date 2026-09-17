@@ -66,6 +66,18 @@ class DoctorReport:
     def ok(self) -> bool:
         return not self.errors
 
+    @property
+    def counts(self) -> dict[str, int]:
+        """按严重度计数（小写键，与 `--json` 的其余字段同风格）。
+
+        CLI 末尾摘要、`doctor --json` 与 Web 体检卡片共用这一个口径——
+        三处各数一遍迟早漂移，而"发现几个 ERROR"是退出码之外用户最先看的信息。
+        """
+        out = {"error": 0, "warn": 0, "info": 0}
+        for finding in self.findings:
+            out[finding.severity.value.lower()] += 1
+        return out
+
     def sorted_findings(self) -> list[Finding]:
         return sorted(self.findings, key=lambda f: -f.severity.rank)
 

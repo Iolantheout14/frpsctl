@@ -11,17 +11,76 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Generic, TypeVar
 
 import httpx
 
-from ..errors import AdminUnreachable, ApiVersionMismatch
+from ..errors import AdminUnreachable, ApiVersionMismatch, FrpsctlError
 
-__all__ = ["AdminClient", "ProxyStat", "ServerInfo", "V2Proxy", "sum_proxy_types", "TRAFFIC_MAX_PROXIES"]
+__all__ = [
+    "AdminClient",
+    "PROXY_TYPES",
+    "PageResult",
+    "PruneOutcome",
+    "ProxyStat",
+    "ServerInfo",
+    "V2Proxy",
+    "aggregate_days",
+    "fetch_histories",
+    "sum_proxy_types",
+    "traffic_total",
+    "TRAFFIC_MAX_PROXIES",
+]
 
 #: 趋势/汇总类查询最多覆盖多少个代理（每个代理一次 dashboard 请求）。
 #: 放在 core 是因为 CLI `traffic` 与 Web 趋势接口共用同一约束——两处各写一个
 #: 数字迟早漂移，而"查了 50 个还是 100 个"直接决定响应时间。
 TRAFFIC_MAX_PROXIES = 50
+
+#: 趋势查询的并发度：dashboard 是本机 HTTP 服务，串行查 50 个代理要 50 个往返；
+#: 并发只要不把 dashboard 打爆即可（它同样是 ThreadingHTTPServer）。
+TRAFFIC_WORKERS = 8
+
+#: frp v0.71.0 的全部代理类型（`frps` 文档与 v2 Admin API 一致）。
+#: CLI `proxies --type` 用它做输入校验：拼错类型过去会静默返回空列表，
+#: 用户以为"没有代理"——ADR-7 不猜测，非法输入必须变成明确报错。
+PROXY_TYPES: frozenset[str] = frozenset(
+    {"tcp", "udp", "http", "https", "stcp", "xtcp", "tcpmux", "sudp"}
+)
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True)
+class PageResult(Generic[_T]):
+    """一次**全量翻页**的结果：条目 + 服务端声明的总数。
+
+    `total` 来自 v2 分页信封（第一页就带），因此"共 N 条"不需要额外请求。
+    `truncated` 为真说明翻页被 `max_pages` 上限截断（服务端 total 异常大时的
+    防御）——调用方应当如实展示"还有 N 条未加载"，而不是假装拿到了全量
+    （旧实现对上限截断完全静默）。
+    """
+
+    items: list[_T]
+    total: int
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > len(self.items)
+
+
+@dataclass(frozen=True)
+class PruneOutcome:
+    """一次"清理离线代理记录"的结果。
+
+    frp 的 `DELETE /api/proxies` 只回 code/msg、不回条数，因此清理数由
+    "清理前后的离线记录数之差"推导——`exact=False` 表示列表被翻页上限截断，
+    这个差值只是下界。
+    """
+
+    before: int
+    cleared: int
+    exact: bool = True
 
 
 def _is_loopback_url(base_url: str) -> bool:
@@ -156,6 +215,57 @@ def sum_proxy_types(counts: dict[str, int]) -> int:
     return sum(int(v) for v in counts.values())
 
 
+def traffic_total(points: list[dict]) -> dict[str, int]:
+    """逐日流量点的合计（in/out）。CLI `traffic` 与 Web 趋势图共用。"""
+    return {
+        "in": sum(int(point.get("in") or 0) for point in points),
+        "out": sum(int(point.get("out") or 0) for point in points),
+    }
+
+
+def aggregate_days(series: list[list[dict]]) -> list[dict]:
+    """把多个代理的日粒度历史按日期求和（按日期排序）。
+
+    这是 Web 趋势图与 CLI `traffic` 的**同一份**聚合实现：此前它只存在于
+    CLI，Web 是在前端 JS 里重新聚合的——两处口径一旦漂移（日期解析、缺字段
+    处理），同一份数据在两个界面上的合计会不一样。
+    """
+    days: dict[str, dict[str, int]] = {}
+    for history in series:
+        for point in history:
+            date = str(point.get("date") or "")
+            if not date:
+                continue
+            bucket = days.setdefault(date, {"date": date, "in": 0, "out": 0})
+            bucket["in"] += int(point.get("in") or 0)
+            bucket["out"] += int(point.get("out") or 0)
+    return [days[key] for key in sorted(days)]
+
+
+def fetch_histories(
+    client: AdminClient, names: list[str], *, workers: int = TRAFFIC_WORKERS
+) -> list[list[dict]]:
+    """并发取多个代理的流量历史；单个代理失败记空曲线（不拖垮整体）。
+
+    `httpx.Client` 是线程安全的（官方保证），因此可以直接共享一个 AdminClient。
+    串行查 50 个代理要 50 个 HTTP 往返——dashboard 稍慢就能把一次趋势刷新拖到
+    秒级；并发后总耗时约等于最慢的那一个。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch(name: str) -> list[dict]:
+        try:
+            return client.proxy_traffic(name)
+        except FrpsctlError:
+            # 离线/已删除的代理返回"无数据"是常态，不拖垮整体（真机语义 404）。
+            return []
+
+    if len(names) <= 1:
+        return [fetch(name) for name in names]
+    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as pool:
+        return list(pool.map(fetch, names))
+
+
 class AdminClient:
     """v2-only dashboard 客户端。"""
 
@@ -234,14 +344,6 @@ class AdminClient:
             tls_force=bool(config.get("tlsForce", False)),
         )
 
-    def clients(self) -> list[dict]:
-        """客户端列表。v2 的信封里是 `data.items`（真机实测），不是 `data.clients`。
-
-        ⚠️ **这是分页结果**：默认 `pageSize` 只有 50，超过就只返回前 50 条。
-        需要"有多少"时请用 `page_total()`——把分页片段当成全量是静默错误。
-        """
-        return _page_items(self._unwrap(self._get("/api/v2/clients")))
-
     def proxies(self, ptype: str) -> list[ProxyStat]:
         """某个类型的全部代理。`proxyTypeCount` 的交叉验证靠它（§13.1 C1）。"""
         resp = self._get(f"/api/proxy/{ptype}")
@@ -251,34 +353,50 @@ class AdminClient:
         items = body.get("proxies") if isinstance(body, dict) else body
         return [ProxyStat.from_api(item) for item in (items or [])]
 
-    def page_total(self, endpoint: str) -> int:
-        """取某个分页端点的**总数**（`data.total`），而不是当前页条数。
-
-        frp 的 v2 列表端点统一返回 `{total, page, pageSize, items}`，`total` 是
-        过滤后的总数。要"按用户统计代理数"就必须用它——逐页拉取既慢，又容易
-        在 pageSize 上悄悄截断。
-        """
-        payload = self._unwrap(self._get(endpoint))
-        if isinstance(payload, dict) and isinstance(payload.get("total"), int):
-            return int(payload["total"])
-        return len(_page_items(payload))
-
     # --- 全量列表（自动翻页） ------------------------------------------
 
     def list_clients(self, *, page_size: int = 200) -> list[dict]:
         """**全量**客户端列表（自动翻页）。
 
-        与 `clients()` 的区别：后者只取一页（默认 50 条，真机实测），用于
-        "看一眼"；本方法是 `frpsctl clients` 的实现，会把所有页拉全——
-        把分页片段当成全量是静默错误（§11.2.4 的教训）。
+        需要总数（"共 N 条"、截断检测）时用 `page_clients()`——它保留信封里的
+        `total` 并报告翻页上限截断；本方法只为"只要列表"的调用点保留。
         """
+        return self.page_clients(page_size=page_size).items
+
+    def page_clients(self, *, page_size: int = 200) -> PageResult[dict]:
+        """全量客户端列表 + 总数（见 `_paged`）。"""
         return self._paged("/api/v2/clients", page_size=page_size)
 
     def list_proxies(self, *, user: str = "", page_size: int = 200) -> list[V2Proxy]:
         """**全量**代理列表（v2 形状，自动翻页）。"""
+        return self.page_proxies(user=user, page_size=page_size).items
+
+    def page_proxies(self, *, user: str = "", page_size: int = 200) -> PageResult[V2Proxy]:
+        """全量代理列表 + 总数（见 `_paged`）。"""
         params = {"user": user} if user else None
         raw = self._paged("/api/v2/proxies", params=params, page_size=page_size)
-        return [V2Proxy.from_api(item) for item in raw]
+        return PageResult(
+            items=[V2Proxy.from_api(item) for item in raw.items],
+            total=raw.total,
+        )
+
+    def prune_offline_proxies(self) -> PruneOutcome:
+        """清理离线代理记录并**如实汇报清理条数**。
+
+        frp 的 DELETE 不返回条数，因此做"清理前后各数一次"——代价是两次全量
+        翻页，而 prune 是低频人工操作，准确性值得这个代价：CLI 与 Web 都会
+        把条数展示给用户，报错一个假的 0 比不报更糟。
+        """
+        before_page = self.page_proxies()
+        before = sum(1 for item in before_page.items if item.phase == "offline")
+        self.clear_offline_proxies()
+        after_page = self.page_proxies()
+        after = sum(1 for item in after_page.items if item.phase == "offline")
+        return PruneOutcome(
+            before=before,
+            cleared=max(0, before - after),
+            exact=not (before_page.truncated or after_page.truncated),
+        )
 
     def proxy_traffic(self, name: str) -> list[dict]:
         """某代理的流量历史（**日粒度**，实测固定返回近 7 天）。
@@ -325,19 +443,26 @@ class AdminClient:
         params: dict | None = None,
         page_size: int = 200,
         max_pages: int = 100,
-    ) -> list[dict]:
-        """逐页拉取直到 total 满足；带页数上限防止服务端异常时死循环。"""
+    ) -> PageResult[dict]:
+        """逐页拉取直到 total 满足；带页数上限防止服务端异常时死循环。
+
+        返回的 `total` 取自信封（第一页即可得）；若循环耗尽 `max_pages` 仍未
+        拉全，`PageResult.truncated` 会如实为真——旧实现只返回 items，调用方
+        无从知道"还有多少没拿到"（静默截断）。
+        """
         items: list[dict] = []
+        total = 0
         for page in range(1, max_pages + 1):
             query = dict(params or {})
             query.update({"page": str(page), "page_size": str(page_size)})
             payload = self._unwrap(self._get(path, params=query))
             batch = _page_items(payload)
             items.extend(batch)
-            total = payload.get("total") if isinstance(payload, dict) else None
-            if not batch or not isinstance(total, int) or len(items) >= total:
+            raw_total = payload.get("total") if isinstance(payload, dict) else None
+            total = int(raw_total) if isinstance(raw_total, int) else len(items)
+            if not batch or len(items) >= total:
                 break
-        return items
+        return PageResult(items=items, total=total)
 
     def proxy_count_for_user(self, user: str) -> int:
         """某用户当前的代理数（插件 `max_proxies` 配额用）。
@@ -400,8 +525,8 @@ def _page_items(payload: object) -> list[dict]:
     """从 v2 分页信封里取 items。
 
     兼容两种形状：`{total,page,pageSize,items}`（真机）与直接是列表（v1 风格
-    的裸数组）。**只取 items 而不校验 total**，因为调用方若关心总数应当用
-    `page_total()`——这里保持"列表就是列表"的单一语义。
+    的裸数组）。`total` 由 `_paged` 在信封层面读取——这里保持"列表就是列表"
+    的单一语义。
     """
     if isinstance(payload, dict):
         items = payload.get("items") or payload.get("clients") or []
