@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>frpsctl 管理台</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1d222c; --border: #262b36;
+    --text: #e6e9ef; --muted: #8b93a7; --accent: #4f8cff; --accent2: #7aa2ff;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", sans-serif;
+  }
+  a { color: var(--accent2); }
+  .hidden { display: none !important; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: #3a1d1d; border-color: #5b2a2a; color: #ffb4b4; }
+  button.danger:hover { background: #4a2222; color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font: inherit; width: 100%;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  code, pre { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+  pre {
+    background: #0b0d11; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; overflow: auto; max-height: 420px; font-size: 12.5px;
+    margin: 0; white-space: pre-wrap; word-break: break-all;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: rgba(15,17,21,.92); position: sticky; top: 0; backdrop-filter: blur(8px); z-index: 5;
+  }
+  header .brand { font-weight: 650; letter-spacing: .3px; }
+  header .spacer { flex: 1; }
+  nav { display: flex; gap: 4px; }
+  nav button { border: none; background: transparent; color: var(--muted); }
+  nav button.active { color: var(--text); background: var(--panel2); }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+    border-radius: 999px; font-size: 12.5px; border: 1px solid var(--border); color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.fail { background: var(--err); }
+  .dot.warn { background: var(--warn); }
+  main { padding: 20px; max-width: 1280px; margin: 0 auto; display: grid; gap: 16px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; letter-spacing: .4px; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13.5px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .num { font-size: 26px; font-weight: 650; }
+  .stat .label { color: var(--muted); font-size: 12.5px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  tr:hover td { background: var(--panel2); }
+  .muted { color: var(--muted); }
+  .tag { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.online { color: var(--ok); border-color: #1f4638; }
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column;
+    gap: 8px; z-index: 30; max-width: 420px;
+  }
+  #toast .item {
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 10px 14px; box-shadow: 0 8px 30px rgba(0,0,0,.45); white-space: pre-wrap;
+  }
+  #toast .item.err { border-left-color: var(--err); }
+  #toast .item.ok { border-left-color: var(--ok); }
+  #login { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  #login .card { width: 360px; }
+  #login h1 { margin: 0 0 4px; font-size: 20px; }
+  #login p { color: var(--muted); margin: 0 0 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .chart-wrap { overflow-x: auto; }
+  .field { display: grid; grid-template-columns: minmax(180px, 300px) 1fr; gap: 8px 14px; align-items: center; padding: 5px 0; }
+  .field label { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .field.dirty label { color: var(--warn); }
+  .field.dirty input { border-color: var(--warn); }
+  .group-title { margin: 18px 0 6px; color: var(--accent2); font-size: 13px; font-weight: 650; }
+  .diffbox { max-height: 320px; }
+  .logline { display: block; font-size: 12.5px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } .field { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div id="login" class="hidden">
+  <div class="card">
+    <h1>frpsctl 管理台</h1>
+    <p>输入启动时显示的管理口令（或口令文件里的值）。</p>
+    <input id="password" type="password" placeholder="口令" autocomplete="current-password">
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="login-btn" style="flex:1">登录</button>
+    </div>
+    <p class="muted" id="login-error" style="margin-top:10px"></p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <span class="brand">frpsctl</span>
+    <span class="badge" id="inst-badge"></span>
+    <span class="badge" id="state-badge"><span class="dot"></span><span id="state-text"></span></span>
+    <nav>
+      <button id="nav-dash" class="active">仪表盘</button>
+      <button id="nav-config">配置</button>
+    </nav>
+    <span class="spacer"></span>
+    <label class="muted" style="font-size:12.5px;display:flex;gap:6px;align-items:center">
+      <input type="checkbox" id="autopoll" checked style="width:auto"> 自动刷新
+    </label>
+    <button id="act-start">启动</button>
+    <button id="act-restart">重启</button>
+    <button class="danger" id="act-stop">停止</button>
+    <button id="logout" title="退出登录">登出</button>
+  </header>
+  <main>
+    <div id="view-dash" class="grid">
+      <section class="card">
+        <h2>实例状态</h2>
+        <div class="kv" id="kv-status"></div>
+      </section>
+      <section class="card">
+        <h2>控制面健康</h2>
+        <div class="kv" id="kv-health"></div>
+      </section>
+      <section class="card" style="grid-column: 1 / -1">
+        <h2>概览</h2>
+        <div class="stats" id="stats"></div>
+      </section>
+      <section class="card">
+        <h2>近 7 天流量（按天）</h2>
+        <div class="chart-wrap" id="chart-7d"></div>
+      </section>
+      <section class="card">
+        <h2>本次会话实时流量（Δ/区间）</h2>
+        <div class="chart-wrap" id="chart-live"></div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">页面打开期间每 5 秒采样一次（累计值差分），存本地浏览器。</p>
+      </section>
+      <section class="card" style="grid-column: 1 / -1">
+        <h2>客户端</h2>
+        <div id="clients-table" class="muted">加载中…</div>
+      </section>
+      <section class="card" style="grid-column: 1 / -1">
+        <h2>代理 <span class="spacer"></span>
+          <button id="prune-btn" style="float:right">清理离线记录</button>
+        </h2>
+        <div id="proxies-table" class="muted">加载中…</div>
+      </section>
+      <section class="card" style="grid-column: 1 / -1">
+        <h2>日志 <span class="muted" id="log-path" style="font-weight:400"></span></h2>
+        <pre id="logs">加载中…</pre>
+      </section>
+    </div>
+
+    <div id="view-config" class="hidden">
+      <section class="card">
+        <h2>配置编辑</h2>
+        <p class="muted" style="margin-top:0">
+          修改任意字段后点"预览变更"查看 diff，确认后应用到实例（会重启服务）。
+          敏感值（token / 口令）不回显：留空表示不改，填入新值才会覆盖。
+        </p>
+        <div id="config-form"></div>
+        <div class="row" style="margin-top:16px">
+          <button class="primary" id="cfg-preview">预览变更</button>
+          <button id="cfg-reset">丢弃修改</button>
+          <span class="muted" id="cfg-count" style="font-size:12.5px"></span>
+        </div>
+      </section>
+      <section class="card hidden" id="cfg-preview-card">
+        <h2>变更预览（打码后的 diff）</h2>
+        <pre class="diffbox" id="cfg-diff"></pre>
+        <div class="row" style="margin-top:12px">
+          <button class="danger" id="cfg-apply">确认应用（重启服务）</button>
+          <button id="cfg-cancel">取消</button>
+        </div>
+      </section>
+      <section class="card">
+        <h2>历史与回滚</h2>
+        <div class="row">
+          <button id="cfg-rollback">回滚到上一份快照（重启服务）</button>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let CSRF = null;           // 只存内存（不落 localStorage）
+let SAMPLES_KEY = "frpsctl_web_samples_v1";
+let timer = null;
+let lastStatus = null;
+
+/* ---------- 基础 ---------- */
+function toast(msg, kind = "") {
+  const box = document.createElement("div");
+  box.className = "item " + kind;
+  box.textContent = msg;
+  $("toast").appendChild(box);
+  setTimeout(() => box.remove(), 6000);
+}
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const child of [].concat(children)) {
+    node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+  }
+  return node;
+}
+async function api(path, { method = "GET", body = null } = {}) {
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (method !== "GET" && CSRF) headers["X-CSRF-Token"] = CSRF;
+  const resp = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : null });
+  let data = {};
+  try { data = await resp.json(); } catch (e) { /* 空响应体 */ }
+  if (resp.status === 401 && !path.endsWith("/login")) { showLogin(); throw new Error("登录已过期"); }
+  if (!resp.ok) throw new Error(data.error ? (data.error + (data.hint ? "\n" + data.hint : "")) : `HTTP ${resp.status}`);
+  return data;
+}
+
+/* ---------- 登录 ---------- */
+function showLogin() {
+  CSRF = null;
+  if (timer) { clearInterval(timer); timer = null; }
+  $("app").classList.add("hidden");
+  $("login").classList.remove("hidden");
+}
+function showApp() {
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  if (!timer) timer = setInterval(tick, 5000);
+  refresh();
+}
+$("login-btn").addEventListener("click", doLogin);
+$("password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+async function doLogin() {
+  $("login-error").textContent = "";
+  try {
+    const data = await api("/api/login", { method: "POST", body: { password: $("password").value } });
+    CSRF = data.csrf;
+    $("password").value = "";
+    showApp();
+  } catch (err) {
+    $("login-error").textContent = err.message;
+  }
+}
+$("logout").addEventListener("click", async () => {
+  try { await api("/api/logout", { method: "POST", body: {} }); } catch (e) { /* 忽略 */ }
+  showLogin();
+});
+
+/* ---------- 导航 ---------- */
+function switchView(which) {
+  const dash = which === "dash";
+  $("view-dash").classList.toggle("hidden", !dash);
+  $("view-config").classList.toggle("hidden", dash);
+  $("nav-dash").classList.toggle("active", dash);
+  $("nav-config").classList.toggle("active", !dash);
+  if (!dash) loadConfig();
+}
+$("nav-dash").addEventListener("click", () => switchView("dash"));
+$("nav-config").addEventListener("click", () => switchView("config"));
+
+/* ---------- 操作 ---------- */
+async function doAction(name, body = {}) {
+  const label = { start: "启动", stop: "停止", restart: "重启" }[name] || name;
+  if (name !== "start" && !confirm(`确认${label}实例？`)) return;
+  try {
+    const data = await api(`/api/actions/${name}`, { method: "POST", body });
+    toast(`${label}完成` + (data.pid ? `（pid ${data.pid}）` : "") + (data.healthy === false ? "，但健康检查未通过" : ""), data.healthy === false ? "err" : "ok");
+  } catch (err) {
+    toast(`${label}失败：\n` + err.message, "err");
+  }
+  refresh();
+}
+$("act-start").addEventListener("click", () => doAction("start"));
+$("act-stop").addEventListener("click", () => doAction("stop"));
+$("act-restart").addEventListener("click", () => doAction("restart"));
+$("autopoll").addEventListener("change", (e) => {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (e.target.checked) { timer = setInterval(tick, 5000); refresh(); }
+});
+async function tick() {
+  if (document.hidden || !$("autopoll").checked) return;
+  if (!$("view-dash").classList.contains("hidden")) refresh();
+}
+
+/* ---------- 仪表盘 ---------- */
+function badgeClass(state) {
+  if (state === "RUNNING" || state === "SYSTEMD_ACTIVE") return "ok";
+  if (state === "FOREIGN") return "fail";
+  if (state === "STALE") return "warn";
+  return "";
+}
+function kvRow(pairs) {
+  const rows = [];
+  for (const [k, v] of pairs) rows.push(el("div", { text: k }), el("div", { text: v }));
+  return rows;
+}
+function humanBytes(n) {
+  if (n === null || n === undefined) return "-";
+  let v = Number(n);
+  for (const unit of ["B", "KiB", "MiB", "GiB", "TiB"]) {
+    if (Math.abs(v) < 1024 || unit === "TiB") return unit === "B" ? `${Math.round(v)} B` : `${v.toFixed(1)} ${unit}`;
+    v /= 1024;
+  }
+}
+function humanDuration(s) {
+  if (s === null || s === undefined) return "-";
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d${h}h`; if (h) return `${h}h${m}m`; if (m) return `${m}m${s % 60}s`; return `${s}s`;
+}
+
+async function refresh() {
+  let status;
+  try { status = await api("/api/status"); } catch (err) { toast("状态刷新失败：" + err.message, "err"); return; }
+  lastStatus = status;
+  $("inst-badge").textContent = `${status.instance} · ${status.owner}`;
+  const dot = $("state-badge").querySelector(".dot");
+  dot.className = "dot " + badgeClass(status.state);
+  $("state-text").textContent = status.state;
+
+  $("kv-status").replaceChildren(...kvRow([
+    ["状态", status.state + (status.pid ? `（pid ${status.pid}）` : "")],
+    ["运行时长", humanDuration(status.uptime_seconds)],
+    ["版本", (status.binary_version || "-") + (status.disk_version && status.disk_version !== status.binary_version ? ` → 磁盘 ${status.disk_version}（重启生效）` : "")],
+    ["监听", status.listen ? `${status.listen.addr}:${status.listen.port}` : "-"],
+    ["systemd", status.systemd_unit || "-"],
+  ]));
+  const h = status.health;
+  $("kv-health").replaceChildren(...kvRow([
+    ["L1 进程", h ? h.l1_process : "-"],
+    ["L2 控制面", h ? h.l2_control : "-"],
+    ["L3 插件", h ? h.l3_plugin : "-"],
+    ["gate", h ? (h.gate ? "通过" : "未通过") : "-"],
+    ["详情", (h && h.detail) || "-"],
+  ]));
+
+  const dash = status.dashboard || {};
+  $("stats").replaceChildren(...[
+    ["客户端", dash.clients ?? "-"],
+    ["代理总数", dash.proxy_total ?? "-"],
+    ["当前连接", dash.cur_conns ?? "-"],
+    ["今日入站", humanBytes(dash.traffic_in)],
+    ["今日出站", humanBytes(dash.traffic_out)],
+    ["TLS 强制", dash.tls_force === undefined ? "-" : (dash.tls_force ? "开" : "关")],
+  ].map(([label, num]) => el("div", { class: "stat" }, [
+    el("span", { class: "num", text: String(num) }),
+    el("span", { class: "label", text: label }),
+  ])));
+
+  if (status.state === "RUNNING" || status.state === "SYSTEMD_ACTIVE") {
+    refreshLists();
+    refreshTraffic();
+    refreshLogs();
+  }
+}
+
+async function refreshLists() {
+  try {
+    const [clients, proxies] = await Promise.all([api("/api/clients"), api("/api/proxies")]);
+    renderClients(clients.clients || []);
+    renderProxies(proxies.proxies || []);
+  } catch (err) {
+    $("clients-table").textContent = "（dashboard 不可用：" + err.message + "）";
+    $("proxies-table").textContent = "（dashboard 不可用：" + err.message + "）";
+  }
+}
+function tableOf(headers, rows) {
+  if (!rows.length) return el("div", { class: "muted", text: "（空）" });
+  const table = el("table", {}, [
+    el("thead", {}, [el("tr", {}, headers.map((h) => el("th", { text: h })))]),
+    el("tbody", {}, rows),
+  ]);
+  return table;
+}
+function renderClients(items) {
+  const rows = items.map((c) => el("tr", {}, [
+    el("td", { text: c.key || "-" }),
+    el("td", { text: c.user || "-" }),
+    el("td", { text: c.hostname || "-" }),
+    el("td", { text: c.clientIP || "-" }),
+    el("td", {}, [el("span", { class: c.online ? "tag online" : "tag", text: c.online ? "online" : "offline" })]),
+    el("td", { text: c.version || "-" }),
+  ]));
+  $("clients-table").replaceChildren(tableOf(["name", "user", "hostname", "ip", "状态", "版本"], rows));
+}
+function renderProxies(items) {
+  const rows = items.map((p) => el("tr", {}, [
+    el("td", { text: p.name || "-" }),
+    el("td", { text: p.user || "-" }),
+    el("td", { text: p.type || "-" }),
+    el("td", { text: p.remote_port ? String(p.remote_port) : "-" }),
+    el("td", { text: p.phase || "-" }),
+    el("td", { text: String(p.cur_conns ?? 0) }),
+    el("td", { text: `${humanBytes(p.today_traffic_in)} / ${humanBytes(p.today_traffic_out)}` }),
+  ]));
+  $("proxies-table").replaceChildren(tableOf(["name", "user", "类型", "端口", "状态", "连接", "今日(入/出)"], rows));
+}
+async function pruneOffline() {
+  if (!confirm("清理 dashboard 统计里的离线代理记录？\n（frp 不支持强制下线在线代理，这里只清理历史记录）")) return;
+  try {
+    await api("/api/actions/prune", { method: "POST", body: {} });
+    toast("已清理离线代理记录", "ok");
+  } catch (err) { toast("清理失败：\n" + err.message, "err"); }
+}
+$("prune-btn").addEventListener("click", pruneOffline);
+
+/* ---------- 图表（SVG 自绘） ---------- */
+function svgEl(tag, attrs, children = []) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  for (const c of children) node.appendChild(c);
+  return node;
+}
+function bars7d(series) {
+  // series: [{name, history:[{date,in,out}]}]
+  const days = new Map();
+  for (const item of series) for (const point of item.history) {
+    const cur = days.get(point.date) || { in: 0, out: 0 };
+    cur.in += point.in; cur.out += point.out;
+    days.set(point.date, cur);
+  }
+  const points = [...days.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  if (!points.length) return el("div", { class: "muted", text: "（无数据）" });
+  const max = Math.max(1, ...points.map(([, v]) => Math.max(v.in, v.out)));
+  const W = 560, H = 160, pad = 24, bw = (W - pad * 2) / points.length / 2 - 4;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: H });
+  points.forEach(([date, v], i) => {
+    const x0 = pad + i * ((W - pad * 2) / points.length);
+    const hIn = (v.in / max) * (H - pad * 2);
+    const hOut = (v.out / max) * (H - pad * 2);
+    svg.appendChild(svgEl("rect", { x: x0, y: H - pad - hIn, width: bw, height: hIn, fill: "#4f8cff", rx: 2 }));
+    svg.appendChild(svgEl("rect", { x: x0 + bw + 3, y: H - pad - hOut, width: bw, height: hOut, fill: "#34d399", rx: 2 }));
+    const label = svgEl("text", { x: x0, y: H - 8, fill: "#8b93a7", "font-size": 10 });
+    label.textContent = date.slice(5);
+    svg.appendChild(label);
+  });
+  svg.appendChild(svgEl("text", { x: pad, y: 12, fill: "#8b93a7", "font-size": 11 })).textContent = "蓝=入站 绿=出站";
+  return svg;
+}
+function readSamples() {
+  try { return JSON.parse(localStorage.getItem(SAMPLES_KEY) || "[]"); } catch (e) { return []; }
+}
+function recordSample(trafficIn, trafficOut) {
+  if (trafficIn === null || trafficIn === undefined) return readSamples();
+  const now = Date.now();
+  const samples = readSamples().filter((s) => now - s.t < 3600 * 1000);
+  const last = samples[samples.length - 1];
+  if (last && now - last.t < 3000) return samples;
+  samples.push({ t: now, vin: trafficIn, vout: trafficOut });
+  try {
+    localStorage.setItem(SAMPLES_KEY, JSON.stringify(samples.slice(-720)));
+  } catch (e) {
+    /* 隐私模式/配额满：采样仅在内存中 */
+  }
+  return samples;
+}
+function sparkline(samples) {
+  if (samples.length < 2) return el("div", { class: "muted", text: "（采样不足，稍候）" });
+  const speeds = [];
+  for (let i = 1; i < samples.length; i++) {
+    const dt = (samples[i].t - samples[i - 1].t) / 1000;
+    if (dt <= 0) continue;
+    speeds.push({ t: samples[i].t, in: Math.max(0, (samples[i].vin - samples[i - 1].vin) / dt), out: Math.max(0, (samples[i].vout - samples[i - 1].vout) / dt) });
+  }
+  const max = Math.max(1, ...speeds.map((s) => Math.max(s.in, s.out)));
+  const W = 560, H = 140, pad = 20;
+  const mk = (key, color) => speeds.map((s, i) => {
+    const x = pad + (i / Math.max(1, speeds.length - 1)) * (W - pad * 2);
+    const y = H - pad - (s[key] / max) * (H - pad * 2);
+    return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: H });
+  svg.appendChild(svgEl("path", { d: mk("in", "#4f8cff") || "M0,0", fill: "none", stroke: "#4f8cff", "stroke-width": 1.6 }));
+  svg.appendChild(svgEl("path", { d: mk("out", "#34d399") || "M0,0", fill: "none", stroke: "#34d399", "stroke-width": 1.6 }));
+  const peak = svgEl("text", { x: pad, y: 12, fill: "#8b93a7", "font-size": 11 });
+  peak.textContent = `峰值 ${humanBytes(max)}/s`;
+  svg.appendChild(peak);
+  return svg;
+}
+
+async function refreshTraffic() {
+  try {
+    const data = await api("/api/traffic");
+    $("chart-7d").replaceChildren(bars7d(data.proxies || []));
+  } catch (err) { /* dashboard 不可用时保留旧图 */ }
+  const dash = (lastStatus && lastStatus.dashboard) || {};
+  const samples = recordSample(dash.traffic_in, dash.traffic_out);
+  $("chart-live").replaceChildren(sparkline(samples));
+}
+
+/* ---------- 日志 ---------- */
+let logScroll = true;
+async function refreshLogs() {
+  try {
+    const data = await api("/api/logs?lines=200");
+    $("log-path").textContent = "· " + (data.path || "");
+    const pre = $("logs");
+    const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+    pre.textContent = (data.lines || []).join("");
+    if (stick || logScroll) pre.scrollTop = pre.scrollHeight;
+  } catch (err) { $("logs").textContent = "日志读取失败：" + err.message; }
+}
+
+/* ---------- 配置编辑 ---------- */
+let configEntries = [];
+let dirty = new Map();
+async function loadConfig() {
+  dirty.clear();
+  updateDirtyCount();
+  $("cfg-preview-card").classList.add("hidden");
+  try {
+    const data = await api("/api/config");
+    configEntries = data.entries || [];
+    renderConfigForm();
+  } catch (err) {
+    $("config-form").replaceChildren(el("div", { class: "muted", text: "配置读取失败：" + err.message }));
+  }
+}
+function renderConfigForm() {
+  const box = $("config-form");
+  box.replaceChildren();
+  let currentGroup = null;
+  for (const entry of configEntries) {
+    const parts = entry.key.split(".");
+    const group = parts.length > 1 ? parts.slice(0, -1).join(".") : "(顶层)";
+    if (group !== currentGroup) {
+      currentGroup = group;
+      box.appendChild(el("div", { class: "group-title", text: group === "(顶层)" ? "顶层" : `[${group}]` }));
+    }
+    const input = el("input", {
+      "data-key": entry.key,
+      value: entry.masked ? "" : (typeof entry.value === "object" ? JSON.stringify(entry.value) : String(entry.value ?? "")),
+      placeholder: entry.masked ? "••••（已设置；留空不改）" : "",
+    });
+    input.addEventListener("input", () => {
+      const field = input.closest(".field");
+      const raw = input.value;
+      const original = entry.masked ? "" : (typeof entry.value === "object" ? JSON.stringify(entry.value) : String(entry.value ?? ""));
+      if (raw === original) dirty.delete(entry.key);
+      else dirty.set(entry.key, raw);
+      field.classList.toggle("dirty", dirty.has(entry.key));
+      updateDirtyCount();
+    });
+    box.appendChild(el("div", { class: "field" }, [el("label", { text: entry.key }), input]));
+  }
+}
+function updateDirtyCount() {
+  $("cfg-count").textContent = dirty.size ? `${dirty.size} 项已修改` : "无修改";
+}
+async function previewChanges() {
+  if (!dirty.size) { toast("没有修改", ""); return; }
+  const changes = [...dirty.entries()];
+  try {
+    const data = await api("/api/config/preview", { method: "POST", body: { changes } });
+    if (data.noop) { toast("这些值与当前配置相同，无需变更"); return; }
+    $("cfg-diff").textContent = data.diff || "(无文本差异)";
+    $("cfg-preview-card").classList.remove("hidden");
+    $("cfg-preview-card").dataset.previewId = data.preview_id;
+  } catch (err) { toast("预览失败：\n" + err.message, "err"); }
+}
+async function applyPreview() {
+  const id = $("cfg-preview-card").dataset.previewId;
+  if (!id) return;
+  if (!confirm("确认应用并重启服务？")) return;
+  try {
+    const data = await api("/api/config/apply", { method: "POST", body: { preview_id: id } });
+    toast(data.noop ? "无需变更" : "配置已应用并重启" + (data.plugin_warning ? "\n⚠ " + data.plugin_warning : ""), "ok");
+    $("cfg-preview-card").classList.add("hidden");
+    loadConfig();
+    refresh();
+  } catch (err) { toast("应用失败：\n" + err.message, "err"); }
+}
+$("cfg-preview").addEventListener("click", previewChanges);
+$("cfg-apply").addEventListener("click", applyPreview);
+$("cfg-cancel").addEventListener("click", () => $("cfg-preview-card").classList.add("hidden"));
+$("cfg-reset").addEventListener("click", loadConfig);
+$("cfg-rollback").addEventListener("click", async () => {
+  if (!confirm("确认回滚到上一份配置快照并重启？")) return;
+  try {
+    await api("/api/actions/rollback", { method: "POST", body: { steps: 1 } });
+    toast("已回滚并重启", "ok");
+    loadConfig(); refresh();
+  } catch (err) { toast("回滚失败：\n" + err.message, "err"); }
+});
+
+/* ---------- 启动 ---------- */
+async function restoreSession() {
+  // 刷新页面后 Cookie 还在，但内存里的 CSRF 丢了：从服务端取回
+  // （否则此后所有变更操作都会 403，且没有恢复路径）
+  const data = await api("/api/session");
+  CSRF = data.csrf;
+}
+(async function boot() {
+  try {
+    await api("/api/status");   // 有会话则直接进主界面
+    await restoreSession();
+    showApp();
+  } catch (err) {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>

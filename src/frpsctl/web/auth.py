@@ -1,0 +1,142 @@
+"""Web 管理台的认证与会话（设计文档 §18.3）。
+
+**安全基线（比 frp 自带 dashboard 更严）**——frp 的教训（user/password 双空 =
+完全不鉴权）是本项目全部安全决策的来源，而 Web 管理台能改配置、停服务，
+是比 dashboard 高得多的价值目标：
+
+| 风险 | 对策 |
+|------|------|
+| 暴露到非回环 | 默认只绑 `127.0.0.1`；绑非回环必须显式开关（CLI 层强制） |
+| 无口令即默认放行 | **不允许空口令**：显式提供或自动生成并打印一次 |
+| 会话劫持 | 随机 256 位 token；Cookie 带 `HttpOnly` + `SameSite=Strict`；TTL 过期 |
+| CSRF | 一切变更请求必须带 `X-CSRF-Token`（登录时下发，仅存内存） |
+| 口令爆破 | 来源级失败限速：窗口内 N 次失败后冷却，表现与"口令错误"完全一致 |
+| 时序侧信道 | `hmac.compare_digest` 常量时间比较 |
+
+会话只存在服务端内存里（重启即失效）——管理台是短生命周期工具，
+持久化会话表只会多一个需要保护的机密文件。
+"""
+
+from __future__ import annotations
+
+import hmac
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+
+__all__ = ["AuthManager", "Session", "generate_password", "SESSION_COOKIE"]
+
+#: 会话 Cookie 名（解析与下发都用这一个常量）。
+SESSION_COOKIE = "frpsctl_session"
+
+#: 登录失败限速：窗口（秒）与窗口内允许的失败次数。
+FAILURE_WINDOW = 60.0
+MAX_FAILURES = 5
+
+#: 默认会话有效期（8 小时）。
+DEFAULT_SESSION_TTL = 8 * 3600.0
+
+
+def generate_password() -> str:
+    """生成 24 字符启动口令（与 `init` 生成的 dashboard 口令同量级）。"""
+    return secrets.token_urlsafe(18)
+
+
+@dataclass(frozen=True)
+class Session:
+    """一次登录的会话。`csrf` 通过登录响应下发给前端（只存内存变量）。"""
+
+    token: str
+    csrf: str
+    expires_at: float
+
+    def expired(self, now: float) -> bool:
+        return now >= self.expires_at
+
+
+class AuthManager:
+    """口令校验、会话与 CSRF 的唯一实现。线程安全（handler 每请求一线程）。"""
+
+    def __init__(
+        self,
+        password: str,
+        *,
+        session_ttl: float = DEFAULT_SESSION_TTL,
+        clock=time.monotonic,
+    ) -> None:
+        if not password:
+            raise ValueError("Web 管理台不允许空口令")
+        self._password = password
+        self.session_ttl = session_ttl
+        self._clock = clock
+        self._sessions: dict[str, Session] = {}
+        self._failures: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    # --- 登录 / 登出 ----------------------------------------------------
+
+    def login(self, password: str, *, source: str) -> Session | None:
+        """校验口令并开一个会话；失败（含冷却中）返回 None。
+
+        冷却中的来源与"口令错误"**表现完全一致**——不给爆破者"这个来源被
+        限速了"的信号（否则可以换来源继续猜）。
+        """
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            fails = self._failures.get(source, [])
+            if len(fails) >= MAX_FAILURES:
+                return None
+            if not hmac.compare_digest(password, self._password):
+                fails.append(now)
+                self._failures[source] = fails
+                return None
+            self._failures.pop(source, None)
+            session = Session(
+                token=secrets.token_urlsafe(32),
+                csrf=secrets.token_urlsafe(32),
+                expires_at=now + self.session_ttl,
+            )
+            self._sessions[session.token] = session
+            return session
+
+    def logout(self, token: str) -> None:
+        with self._lock:
+            self._sessions.pop(token, None)
+
+    # --- 校验 -----------------------------------------------------------
+
+    def check_session(self, token: str | None) -> Session | None:
+        """会话是否有效；过期即删除（惰性清理）。"""
+        if not token:
+            return None
+        now = self._clock()
+        with self._lock:
+            session = self._sessions.get(token)
+            if session is None:
+                return None
+            if session.expired(now):
+                self._sessions.pop(token, None)
+                return None
+            return session
+
+    @staticmethod
+    def check_csrf(session: Session, csrf: str | None) -> bool:
+        """变更请求的 CSRF 校验（常量时间比较）。"""
+        if not csrf:
+            return False
+        return hmac.compare_digest(csrf, session.csrf)
+
+    # --- 内部 -----------------------------------------------------------
+
+    def _prune(self, now: float) -> None:
+        """清理过期会话与冷却窗口外的失败记录（持锁调用）。"""
+        for token in [token for token, session in self._sessions.items() if session.expired(now)]:
+            self._sessions.pop(token, None)
+        for source in list(self._failures):
+            kept = [stamp for stamp in self._failures[source] if now - stamp < FAILURE_WINDOW]
+            if kept:
+                self._failures[source] = kept
+            else:
+                self._failures.pop(source, None)
