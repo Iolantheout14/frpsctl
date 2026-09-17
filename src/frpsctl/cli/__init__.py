@@ -29,7 +29,13 @@ from ..core.instance import list_instances
 from ..core.lifecycle import Lifecycle, StartReport, State
 from ..core.lock import instance_lock
 from ..core.systemd import DEFAULT_SERVICE_USER, PluginService, Systemd, WebService
-from ..core.transaction import apply_edit, apply_set, apply_unset, rollback_to
+from ..core.transaction import (
+    apply_edit,
+    apply_set,
+    apply_unset,
+    rollback_to,
+    snapshot_diff,
+)
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
@@ -1290,28 +1296,15 @@ def config_diff(
 ) -> None:
     """当前配置 vs 历史快照（unified diff）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
-    inst = app_ctx.instance
-    # 锁内读两份文本：锁外读时"选中的快照"与"当前文本"可能来自不同时刻，
-    # 展示的差异与真实状态不符（并发 config set 正在推进历史的窗口）。
-    with instance_lock(inst.lock):
-        entries = inst.history_entries()
-        if not entries:
-            raise ConfigError("没有配置快照", hint="快照在每次 config set / edit 时自动创建")
-        index = max(0, steps - 1)
-        if index >= len(entries):
-            raise ConfigError(f"只找到 {len(entries)} 份快照")
-        snapshot = entries[index] / "frps.toml"
-        if not snapshot.exists():
-            raise ConfigError(f"快照不完整：{snapshot}")
-        snapshot_text = snapshot.read_text("utf-8")
-        current_text = cfg.read_config_text(inst.config)
-    diff = cfg.diff_texts(snapshot_text, current_text, "frps.toml")
+    # 快照选择与读取在 core 的 snapshot_diff 里（锁内完成）——与 Web 的
+    # "查看差异"共用同一份实现与边界错误。
+    result = snapshot_diff(app_ctx.instance, steps=steps)
     if app_ctx.json:
-        ui.emit_json({"snapshot": str(snapshot.parent), "diff": cfg.mask_diff(diff)})
+        ui.emit_json({"snapshot": str(result.snapshot), "diff": cfg.mask_diff(result.diff)})
     else:
-        ui.emit(cfg.mask_diff(diff).rstrip() or "(无差异)")
+        ui.emit(cfg.mask_diff(result.diff).rstrip() or "(无差异)")
         ui.emit("")
-        ui.emit(f"# 快照：{snapshot.parent.name}")
+        ui.emit(f"# 快照：{result.snapshot.name}")
 
 
 @config_app.command("rollback")
