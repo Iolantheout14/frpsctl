@@ -86,6 +86,10 @@
   现在纯函数边界（`looksBalanced` / `humanBytes` / `humanDuration`）由 node
   动态执行断言；`plugin audit tail -f` 与 `status --watch` 的实时性由真实
   子进程 + 管道读取断言（不是杀进程后的退出冲刷）。
+- **测试隔离（CI 抓到）**：`--instance` 补全的失败路径测试有两处缺陷——
+  patch 目标错误（`from` 导入的引用被复制，patch `core.instance` 不影响
+  调用点）且未隔离实例根（断言依赖"宿主默认目录为空"，本地假绿）。修复后
+  以"默认根存在实例"的污染环境全量复跑（615 条）系统性排除同类依赖。
 
 - **`typer.Exit` 的退出码在直接调用路径下被吞成 0**：`map_exceptions` 的兜底
   分支把 `Exit`（继承 `RuntimeError`、无 `format_message`）当作"未分类错误"，

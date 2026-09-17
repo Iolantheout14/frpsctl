@@ -2140,13 +2140,29 @@ class TestInstanceCompletion:
         assert names == ["default", "web"]
         assert _complete_instance(None, [], "we") == ["web"]
 
-    def test_completion_failure_returns_empty(self, monkeypatch) -> None:
+    def test_completion_failure_returns_empty(self, tmp_path, monkeypatch) -> None:
         from frpsctl.cli import _complete_instance
+
+        # 显式隔离实例根：补全读的是**进程环境**，不能依赖宿主机的默认目录
+        # （CI 抓到过：默认根恰好存在实例时此断言在本地假绿）。
+        monkeypatch.setenv("FRPSCTL_ROOT", str(tmp_path / "instances"))
+        monkeypatch.setenv("FRPSCTL_DATA_HOME", str(tmp_path / "data"))
 
         def boom(*args, **kwargs):
             raise OSError("disk on fire")
 
-        monkeypatch.setattr("frpsctl.core.instance.list_instances", boom)
+        # patch cli 模块的**绑定**：`from ..core.instance import list_instances`
+        # 复制了引用，patch frpsctl.core.instance.list_instances 不会影响调用点
+        # （正是这个错误让失效的注入掩盖了环境依赖）。
+        monkeypatch.setattr("frpsctl.cli.list_instances", boom)
+        assert _complete_instance(None, [], "") == []
+
+    def test_completion_on_empty_root_returns_empty(self, tmp_path, monkeypatch) -> None:
+        """空实例根（而非宿主机的默认目录）→ 空补全。"""
+        from frpsctl.cli import _complete_instance
+
+        monkeypatch.setenv("FRPSCTL_ROOT", str(tmp_path / "instances"))
+        monkeypatch.setenv("FRPSCTL_DATA_HOME", str(tmp_path / "data"))
         assert _complete_instance(None, [], "") == []
 
 
