@@ -36,6 +36,7 @@ from ..core.transaction import (
     rollback_to,
     snapshot_diff,
 )
+from ..core.uninstall import execute_uninstall, plan_uninstall
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
@@ -526,6 +527,112 @@ def verify(
         ui.emit_json({"file": str(target), "ok": True, "flags": flags})
     else:
         ui.emit(f"{target} 校验通过（frps {version}，标志：{flags}）")
+
+
+# ---------------------------------------------------------------------------
+# uninstall
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def uninstall(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    all_instances: bool = typer.Option(
+        False, "--all", help="卸载实例根下的全部实例（默认只卸当前实例）"
+    ),
+    keep_data: bool = typer.Option(
+        False, "--keep-data", help="保留实例数据（配置/快照/审计），只清 unit 与二进制"
+    ),
+    keep_bin: bool = typer.Option(False, "--keep-bin", help="保留共享二进制（其它实例仍要用）"),
+    force: bool = typer.Option(False, "--force", help="运行中的实例先停止再卸载"),
+) -> None:
+    """完整卸载：实例数据 / unit / 共享二进制（默认先列出清单并要求确认）。
+
+    ⚠️ 删除**不可恢复**：实例目录里有 auth.token、dashboard 口令、配置快照与
+    插件审计。默认只卸当前实例；删除共享二进制要求目标覆盖全部实例（或显式
+    --keep-bin）——多实例机器上删掉它会让其他实例起不来。运行中的实例默认
+    **拒绝**卸载（先 `frpsctl stop`，或用 --force 让它先停止）。
+
+    需要 root 的清理（unit）若权限不足，会汇总为"未清理项"并给出命令，
+    而不是静默跳过；Python 包本身请用 pipx / pip / install.sh --uninstall 移除。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    plan = plan_uninstall(
+        app_ctx.instance,
+        all_instances=all_instances,
+        keep_data=keep_data,
+        keep_bin=keep_bin,
+    )
+
+    if app_ctx.json and not app_ctx.yes:
+        # --json 的 stdout 是机器可读契约（确认提示会污染它），破坏性操作也
+        # 不该因为输出模式而被隐式确认。
+        raise UsageError("--json 下必须显式 --yes（破坏性操作不做隐式确认）")
+
+    if plan.is_empty:
+        if app_ctx.json:
+            ui.emit_json({"instances": [], "removed": [], "kept": [], "stopped": [], "warnings": []})
+        else:
+            ui.emit("没有可卸载的内容（实例数据与二进制都不存在）")
+        return
+
+    if not app_ctx.json:
+        _render_uninstall_plan(plan)
+        if not app_ctx.yes and not typer.confirm("确认执行卸载？（此操作不可恢复）", default=False):
+            ui.emit("已取消，未做任何改动")
+            return
+
+    report = execute_uninstall(plan, force=force)
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "instances": [item.name for item in plan.instances],
+                "removed": report.removed,
+                "kept": report.kept,
+                "stopped": report.stopped,
+                "warnings": report.warnings,
+            }
+        )
+        return
+
+    ui.emit("")
+    if report.stopped:
+        ui.emit("已停止：" + "、".join(report.stopped))
+    for item in report.removed:
+        ui.emit(f"已删除：{item}")
+    for item in report.kept:
+        ui.emit(f"已保留：{item}")
+    for warning in report.warnings:
+        ui.warn(f"⚠ {warning}")
+    ui.emit("")
+    ui.emit(
+        "卸载完成。Python 包本身请用 `pipx uninstall frpsctl` / `pip uninstall frpsctl` / "
+        "`./install.sh --uninstall` 移除。"
+    )
+
+
+def _render_uninstall_plan(plan) -> None:
+    """人读的卸载清单（确认前的"会删什么"预览）。"""
+    ui.emit("将执行以下卸载（删除不可恢复；实例数据含 auth.token / dashboard 口令 / 快照 / 审计）：")
+    ui.emit("")
+    if plan.instances:
+        ui.emit("  实例：" + "、".join(item.name for item in plan.instances))
+        for item in plan.instances:
+            action = "删除数据" if plan.remove_data else "保留数据"
+            ui.emit(f"    · {action}：{item.dir}")
+        if plan.remove_unit_templates:
+            ui.emit("  unit：停用并删除模板（frps@ / frpsctl-plugin@ / frpsctl-web@，需要 root）")
+        else:
+            ui.emit("  unit：仅停用本实例的 unit（共享模板保留，其它实例仍在用）")
+    else:
+        ui.emit("  实例：（无）")
+    if plan.remove_bin:
+        ui.emit(f"  共享二进制：删除 {plan.bin_dir}")
+    else:
+        ui.emit(f"  共享二进制：保留 {plan.bin_dir}")
+    ui.emit("")
 
 
 # ---------------------------------------------------------------------------
