@@ -86,6 +86,11 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             if parsed.path in ("/", "/index.html"):
                 self._send_index()
                 return
+            if parsed.path == "/favicon.ico":
+                # 页面内嵌 data URI 图标（CSP 零外部资源）；这一条是给仍会请求
+                # 站点图标的工具/旧浏览器收尾的——204 比 404 JSON 干净。
+                self._send_no_content()
+                return
             if not parsed.path.startswith("/api/"):
                 self._send_json(404, {"error": "not found"})
                 return
@@ -241,6 +246,16 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                     self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
+
+        def _send_no_content(self) -> None:
+            """204：没有响应体（favicon 等"无需内容"的请求）。"""
+            try:
+                self.send_response(204)
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在响应写出前断开连接")
 

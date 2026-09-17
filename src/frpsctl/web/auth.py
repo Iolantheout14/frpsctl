@@ -43,6 +43,12 @@ MAX_TRACKED_SOURCES = 1024
 #: 默认会话有效期（8 小时）。
 DEFAULT_SESSION_TTL = 8 * 3600.0
 
+#: 会话表上限。与失败来源表（`MAX_TRACKED_SOURCES`）同一条护栏纪律：持有口令
+#: 的调用方可以不断登录开新会话，而惰性清理只在过期或再次登录时发生——没有
+#: 上限意味着"一直登录"能把内存持续推高。超过上限时驱逐**最早到期**的会话
+#: （等价于先开先出，因为 TTL 相同）；正在使用的会话在正常交互下远少于 32 个。
+MAX_SESSIONS = 32
+
 
 def generate_password() -> str:
     """生成 24 字符启动口令（与 `init` 生成的 dashboard 口令同量级）。"""
@@ -108,6 +114,7 @@ class AuthManager:
                 expires_at=now + self.session_ttl,
             )
             self._sessions[session.token] = session
+            self._cap_sessions()
             return session
 
     def logout(self, token: str) -> None:
@@ -152,9 +159,21 @@ class AuthManager:
         # 来源表上限（见 MAX_TRACKED_SOURCES 的说明）：窗口内的来源数也必须
         # 有界，否则"每次失败一个新来源"就能持续放大内存。
         self._cap_sources()
+        self._cap_sessions()
 
     def _cap_sources(self) -> None:
         """把来源表收敛到上限，驱逐最早失败的来源（持锁调用）。"""
         while len(self._failures) > MAX_TRACKED_SOURCES:
             oldest = min(self._failures, key=lambda source: self._failures[source][0])
             self._failures.pop(oldest, None)
+
+    def _cap_sessions(self) -> None:
+        """把会话表收敛到上限，驱逐最早到期的会话（持锁调用）。
+
+        只可能发生在"持有正确口令的调用方反复登录"这一种情形（失败的登录不会
+        创建会话），威胁模型低于来源表；但它与来源表是同一类"输入驱动的表必须
+        有界"问题，护栏成本又只有几行，没有理由不做。
+        """
+        while len(self._sessions) > MAX_SESSIONS:
+            oldest = min(self._sessions, key=lambda token: self._sessions[token].expires_at)
+            self._sessions.pop(oldest, None)

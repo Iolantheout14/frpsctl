@@ -36,7 +36,7 @@ from ..core.instance import Instance
 from ..core.lifecycle import HealthReport, Lifecycle, State
 from ..core.lock import instance_lock
 from ..core.logs import resolve_log_target, tail_lines
-from ..core.transaction import apply_sets, rollback_to
+from ..core.transaction import apply_sets, rollback_to, snapshot_diff
 from ..errors import (
     AdminUnreachable,
     ConfigError,
@@ -63,6 +63,8 @@ class _Preview:
     expected_current: str
     changes: tuple[tuple[str, str], ...]
     created_at: float
+    #: 删除键（`config unset` 语义），与 changes 在同一事务里落盘。
+    unsets: tuple[str, ...] = ()
 
 
 @dataclass
@@ -171,6 +173,9 @@ def _route(
             return 200, config_payload(ctx)
         if path == "/api/config/history":
             return 200, history_payload(ctx)
+        if path.startswith("/api/config/history/") and path.endswith("/diff"):
+            steps = path[len("/api/config/history/") : -len("/diff")]
+            return 200, history_diff_payload(ctx, steps)
         if path == "/api/logs":
             return 200, logs_payload(ctx, query.get("lines"))
         return 404, {"error": f"未知接口：GET {path}"}
@@ -211,6 +216,9 @@ def _health(report: HealthReport | None) -> dict | None:
         "l3_plugin": report.l3_plugin.value,
         "detail": report.detail,
         "gate": report.gate,
+        # L3 失败不改变任何 gate，但必须显著提示（插件 fail-closed：客户端将
+        # 无法登录）——CLI 一直有这个告警，Web 此前丢了它。
+        "plugin_warning": report.plugin_warning,
     }
 
 
@@ -275,18 +283,28 @@ def traffic_payload(ctx: WebContext) -> dict:
 
     单个代理查询失败**不拖垮整张图**（记为无数据）——dashboard 半死不活时
     让整个趋势接口 502 没有意义。
+
+    `truncated` / `total` 如实汇报截断：CLI `traffic` 超限会告警"仅统计前
+    N 个"，Web 曾经静默截断——前端无从知道图是**全量**还是前 50 个代理的。
     """
     admin = _admin(ctx)
     with admin:
-        proxies = admin.list_proxies()[:TRAFFIC_MAX_PROXIES]
+        all_proxies = admin.list_proxies()
+        truncated = len(all_proxies) > TRAFFIC_MAX_PROXIES
         series = []
-        for item in proxies:
+        for item in all_proxies[:TRAFFIC_MAX_PROXIES]:
             try:
                 history = admin.proxy_traffic(item.name)
             except FrpsctlError:
                 history = []
             series.append({"name": item.name, "history": history})
-    return {"granularity": "day", "proxies": series}
+    return {
+        "granularity": "day",
+        "proxies": series,
+        "truncated": truncated,
+        "total": len(all_proxies),
+        "limit": TRAFFIC_MAX_PROXIES,
+    }
 
 
 def _plain(value: Any) -> Any:
@@ -338,6 +356,27 @@ def history_payload(ctx: WebContext) -> dict:
             }
         )
     return {"entries": entries}
+
+
+def history_diff_payload(ctx: WebContext, steps_raw: str) -> dict:
+    """某份快照 vs 当前配置的 diff（打码后下发）。
+
+    回滚是**危险操作**：看不到"会改什么"就确认，等于盲操作。CLI 的
+    `config diff --steps N` 一直有这个能力，Web 此前没有——这里补上，
+    并复用 core 的 `snapshot_diff`（与 CLI 同一实现、同一锁边界）。
+    """
+    try:
+        steps = int(steps_raw)
+    except ValueError:
+        raise UsageError(f"快照步数必须是整数：{steps_raw!r}") from None
+    if steps < 1:
+        raise UsageError(f"快照步数必须 >= 1：{steps_raw!r}")
+    result = snapshot_diff(ctx.inst, steps=steps)
+    return {
+        "steps": steps,
+        "snapshot": result.snapshot.name,
+        "diff": cfg.mask_diff(result.diff),
+    }
 
 
 def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
@@ -392,9 +431,15 @@ def action_payload(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
 
 
 def _normalize_changes(raw: Any) -> list[tuple[str, str]]:
-    """接受 `[[key, value], ...]` 或 `[{key, value}, ...]`，其余形状直接拒绝。"""
-    if not isinstance(raw, list) or not raw:
-        raise UsageError("changes 必须是非空数组")
+    """接受 `[[key, value], ...]` 或 `[{key, value}, ...]`，其余形状直接拒绝。
+
+    `None` 视为"没有这一项"（空数组同理）——整体非空由 `config_preview` 判定，
+    因为单独的 `unsets` 也是合法变更。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise UsageError("changes 必须是数组")
     changes: list[tuple[str, str]] = []
     for item in raw:
         if isinstance(item, (list, tuple)) and len(item) == 2:
@@ -406,12 +451,29 @@ def _normalize_changes(raw: Any) -> list[tuple[str, str]]:
     return changes
 
 
+def _normalize_unsets(raw: Any) -> list[str]:
+    """`unsets`：要删除的键名数组（`config unset` 语义）。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise UsageError("unsets 必须是数组")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise UsageError(f"无法识别的删除条目：{item!r}（应为非空键名字符串）")
+        out.append(item.strip())
+    return out
+
+
 def config_preview(ctx: WebContext, body: dict[str, Any]) -> dict:
     """锁内取当前快照 + 生成打码 diff，并登记一次待应用的预览。"""
     changes = _normalize_changes(body.get("changes"))
+    unsets = _normalize_unsets(body.get("unsets"))
+    if not changes and not unsets:
+        raise UsageError("changes 与 unsets 至少要有一个非空项")
     with instance_lock(ctx.inst.lock):
         current = cfg.read_config_text(ctx.inst.config)
-        plan = cfg.plan_set_many(ctx.inst.config, changes)
+        plan = cfg.plan_change_many(ctx.inst.config, changes, unsets)
 
     preview_id = secrets.token_urlsafe(16)
     ctx.prune_previews()
@@ -419,6 +481,7 @@ def config_preview(ctx: WebContext, body: dict[str, Any]) -> dict:
         ctx.previews[preview_id] = _Preview(
             expected_current=current,
             changes=tuple(changes),
+            unsets=tuple(unsets),
             created_at=ctx.clock(),
         )
 
@@ -432,6 +495,18 @@ def config_preview(ctx: WebContext, body: dict[str, Any]) -> dict:
                 "key": key,
                 "before": cfg.mask_value(before) if secret else before,
                 "after": cfg.mask_value(after) if secret else after,
+                "deleted": False,
+            }
+        )
+    for key in unsets:
+        secret = cfg.is_secret_key(key)
+        before = plan.before.get(key)
+        keys.append(
+            {
+                "key": key,
+                "before": cfg.mask_value(before) if secret else before,
+                "after": None,
+                "deleted": True,
             }
         )
     return {
@@ -454,6 +529,7 @@ def config_apply(ctx: WebContext, body: dict[str, Any]) -> dict:
     outcome = apply_sets(
         ctx.inst,
         changes=preview.changes,
+        unsets=preview.unsets,
         expected_current=preview.expected_current,
         lifecycle=Lifecycle(ctx.inst),
         restart=True,
