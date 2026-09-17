@@ -1,64 +1,112 @@
 # frpsctl
 
-把 [frp](https://github.com/fatedier/frp) 服务端（frps）包装成命令行工具。
+**把 [frp](https://github.com/fatedier/frp) 服务端（frps）包装成命令行工具 + 内置 Web 管理台。**
 
-> **设计哲学**：frps 是黑盒服务，Python 只做**配置翻译器、进程保镖、状态聚合器**。
-> 转发逻辑一行都不碰；配置合法性走官方 `verify`；状态采集走官方 v2 Admin API；
-> 生命周期走进程管理。
+CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作——两者**共用同一套核心逻辑**，
+同样的操作不会有两套行为。frps 二进制始终是官方原版：本工具只做
+**配置翻译器、进程保镖、状态聚合器**，转发逻辑一行都不碰。
 
-完整设计（含每条事实的源码依据与复现命令）见 [`frpsctl-设计方案.md`](frpsctl-设计方案.md)。
+> 设计哲学：配置合法性走官方 `frps verify`；状态采集走官方 v2 Admin API；
+> 生命周期走进程管理 / systemd。完整设计（含每条事实的源码依据与复现命令）见
+> [`frpsctl-设计方案.md`](frpsctl-设计方案.md)。
 
 ---
 
 ## 目录
 
-- [它解决什么问题](#它解决什么问题)
+- [介绍](#介绍)
+  - [它解决什么问题](#它解决什么问题)
+  - [两副面孔，一套内核](#两副面孔一套内核)
+  - [一条硬边界](#一条硬边界)
 - [环境要求](#环境要求)
 - [安装](#安装)
+  - [方式一：pipx / pip（推荐）](#方式一pipx--pip推荐)
+  - [方式二：源码一键脚本](#方式二源码一键脚本)
+  - [方式三：源码手动安装](#方式三源码手动安装)
+  - [安装 frps 二进制](#安装-frps-二进制)
+  - [验证安装](#验证安装)
 - [五分钟上手](#五分钟上手)
-- [日常使用](#日常使用)
-  - [看状态](#看状态)
-  - [看客户端与代理](#看客户端与代理)
-  - [改配置](#改配置)
-  - [看日志](#看日志)
-  - [停下来](#停下来)
-  - [体检](#体检)
-  - [清理离线记录](#清理离线记录)
-- [多实例](#多实例)
-- [服务端插件（多用户鉴权 + 端口白名单）](#服务端插件多用户鉴权-端口白名单)
-- [Web 管理台](#web-管理台)
-- [用 systemd 托管](#用-systemd-托管)
-- [升级 frps](#升级-frps)
-- [退出码（脚本化契约）](#退出码脚本化契约)
-- [环境变量与全局选项](#环境变量与全局选项)
-- [目录布局](#目录布局)
-- [备份与回滚](#备份与回滚)
+- [CLI 使用教程](#cli-使用教程)
+  - [全局选项与命令总览](#全局选项与命令总览)
+  - [教程 1：看状态](#教程-1看状态)
+  - [教程 2：看客户端、代理与流量](#教程-2看客户端代理与流量)
+  - [教程 3：改配置（核心事务）](#教程-3改配置核心事务)
+  - [教程 4：看日志](#教程-4看日志)
+  - [教程 5：启停](#教程-5启停)
+  - [教程 6：体检与巡检](#教程-6体检与巡检)
+  - [教程 7：清理离线记录](#教程-7清理离线记录)
+- [Web 管理台教程](#web-管理台教程)
+  - [启动与登录](#启动与登录)
+  - [仪表盘](#仪表盘)
+  - [配置编辑：预览、应用与回滚](#配置编辑预览应用与回滚)
+  - [口令、部署与安全](#口令部署与安全)
+  - [CLI 与 Web 的对应关系](#cli-与-web-的对应关系)
+- [进阶用法](#进阶用法)
+  - [多实例](#多实例)
+  - [服务端插件（多用户鉴权 + 端口白名单）](#服务端插件多用户鉴权--端口白名单)
+  - [用 systemd 托管 frps](#用-systemd-托管-frps)
+  - [用 systemd 托管 Web 管理台与插件](#用-systemd-托管-web-管理台与插件)
+  - [升级 frps](#升级-frps)
+- [参考手册](#参考手册)
+  - [退出码（脚本化契约）](#退出码脚本化契约)
+  - [环境变量与全局选项](#环境变量与全局选项)
+  - [目录布局](#目录布局)
+  - [备份与回滚](#备份与回滚)
 - [排障](#排障)
 - [安全说明](#安全说明)
 - [开发](#开发)
 - [已知边界](#已知边界)
+- [许可](#许可)
 
 ---
 
-## 它解决什么问题
+## 介绍
+
+### 它解决什么问题
 
 直接用官方 `frps` 管服务端，有四件事必须手工完成，且都容易出错：
 
 | 痛点 | frpsctl 的做法 |
 |------|---------------|
-| **手写 TOML**：字段是驼峰、嵌套结构、取值范围分散在文档各处，写错了要等启动才报错 | `init` 交互式生成安全基线配置；`config set` 改单键 |
-| **配进程守护**：`frps -c frps.toml` 前台运行，关掉 SSH 就断 | `start` 派生后台进程（脱离会话），管 pid、优雅停止、开机自启 |
-| **看状态靠翻日志**：谁在线、有几个代理、跑了多少流量 | `status` 一条命令聚合，支持 `--json` |
+| **手写 TOML**：字段是驼峰、嵌套结构、取值范围分散在文档各处，写错了要等启动才报错 | `init` 交互式生成安全基线配置；`config set` 改单键，注释与排版原样保留 |
+| **配进程守护**：`frps -c frps.toml` 前台运行，关掉 SSH 就断 | `start` 派生后台进程（脱离会话），管 pid、优雅停止、开机自启（systemd） |
+| **看状态靠翻日志**：谁在线、有几个代理、跑了多少流量 | `status` 一条命令聚合，支持 `--json`；Web 仪表盘自动刷新 |
 | **改配置必然重启**：frps **没有热重载**，改一个端口就要停服 | `config set` 走**带回滚的事务**：校验 → 备份 → 替换 → 重启 → 失败自动恢复 |
 
-一条硬边界：**绝不重新实现 frp 已有的能力**。
+### 两副面孔，一套内核
+
+**CLI**——精确、可脚本化、可接 CI：
+
+| 分类 | 命令 |
+|------|------|
+| 二进制与配置 | `install` / `init` / `verify` |
+| 生命周期 | `start` / `stop` / `restart` / `status` / `log` |
+| 配置子命令 | `config get` / `set` / `unset` / `edit` / `list` / `diff` / `rollback`（`set` 支持 `--dry-run` / `--stdin` / `--prompt`） |
+| 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` |
+| systemd 集成 | `service install` / `uninstall` / `status` / `logs` |
+| 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin service install|uninstall|status` |
+| Web 管理台 | `web serve`、`web service install|uninstall|status`、`web password show` |
+
+**Web 管理台**——浏览器中的同等能力（`web serve` 启动，默认只绑回环）：
+
+| 区域 | 能力 |
+|------|------|
+| 仪表盘 | 实例状态 / 三层健康 / 概览统计 / 近 7 天流量图（可下钻单代理）/ 会话内实时速率曲线 / 客户端与代理列表（可展开代理曲线）/ 日志（跟随/暂停） |
+| 配置 | 逐字段表单（敏感值打码提示）→ 预览 diff（+绿/−红）→ 应用（一次事务、一次重启）→ 失败自动回滚；可删除键、可新增键 |
+| 历史 | 快照列表，**先看差异再回滚** |
+| 进程 | 启动 / 重启 / 停止 / 清理离线记录（操作期间按钮禁用、状态徽章显示"操作中…"） |
+| 主题 | 明暗双主题：跟随系统（可实时变化）或手动切换 |
+
+### 一条硬边界
+
+**绝不重新实现 frp 已有的能力。**
 
 | 能力 | 由谁提供 |
 |------|---------|
 | 配置合法性判定 | 官方 `frps verify -c`（唯一权威） |
 | 状态、统计、代理列表 | 官方 v2 Admin API |
 | 服务进程 | 官方 `frps` 二进制，或 systemd |
-| 配置生成、进程编排、失败回滚、终端呈现 | **frpsctl** |
+| 配置生成、进程编排、失败回滚、终端/浏览器呈现 | **frpsctl** |
 
 ---
 
@@ -69,7 +117,7 @@
 | 操作系统 | **仅 Linux** | 进程身份校验依赖 `/proc/<pid>/stat`；互斥用 `flock`；原子写用 `fchmod` |
 | Python | **≥ 3.11** | 依赖标准库 `tomllib` |
 | frps | **≥ 0.70.0** | v2 Admin API 自 0.70.0 引入，本工具只用 v2 |
-| 建议版本 | 0.71.0 | 0.70.x 可用，但缺少一个已知远程 DoS 的修复（`start`/`doctor` 会告警） |
+| 建议版本 | 0.71.0 | 0.70.x 可用，但缺少一个已知远程 DoS 的修复（`start` / `doctor` 会告警） |
 
 非 Linux 内核、或未挂载 `/proc` 的容器会被**直接拒绝启动**，而不是降级——
 身份校验失效的代价是杀掉无关进程。
@@ -78,18 +126,78 @@
 
 ## 安装
 
+### 方式一：pipx / pip（推荐）
+
 ```bash
-# 1) 装 Python 侧（已发布到 PyPI）
-pipx install frpsctl          # 或：pip install frpsctl；升级：pip install -U frpsctl
-
-# 2) 装 frps 二进制（从官方发布页下载，sha256 强校验）
-frpsctl install
-
-# 3) 生成配置
-frpsctl init
+pipx install frpsctl        # 或：pip install frpsctl
+# 升级：pipx upgrade frpsctl / pip install -U frpsctl
 ```
 
-`install` 会做这些事：
+建议开启 shell 补全（支持 bash/zsh/fish）：
+
+```bash
+frpsctl --install-completion
+```
+
+### 方式二：源码一键脚本
+
+```bash
+git clone https://github.com/ThzxxArt/frpsctl.git
+cd frpsctl
+./install.sh
+```
+
+脚本做的事：建一个独立 venv → 装依赖 → 把 `frpsctl` 注册到 `~/.local/bin` → 自检。
+**不需要 pipx、不需要 uv、不需要 sudo**（venv 是标准库自带的）。
+
+```console
+$ ./install.sh
+检查运行环境
+ ✓ 操作系统：Linux
+ ✓ Python：Python 3.13.5（/usr/bin/python3）
+ ✓ 源码目录：/mnt/d/CodeWorkspace/frpsctl
+ ✓ venv 模块可用
+
+创建虚拟环境
+ ✓ 已创建：/home/u/.local/share/frpsctl-src/venv
+安装 frpsctl 及其依赖
+ ✓ 依赖就绪（typer / pydantic / tomlkit / httpx）
+注册全局命令
+ ✓ 已注册：/home/u/.local/bin/frpsctl
+自检
+ ✓ 命令可用：frpsctl 0.2.4
+
+frpsctl 安装完成
+```
+
+| 选项 | 作用 |
+|------|------|
+| （无） | 装到 `~/.local`（命令 → `~/.local/bin/frpsctl`） |
+| `--system` | 装到 `/usr/local`（需要 `sudo`） |
+| `--prefix DIR` | 自定义前缀 |
+| `--uninstall` | 卸载（删 venv 与命令，**不动实例数据**） |
+| `--no-verify` | 跳过安装后自检 |
+
+**反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
+源码无需重装，命令立即生效。
+
+> 脚本**不下载 frps 二进制**——那是 `frpsctl install` 的职责（需要网络与校验和，
+> 且要写入用户数据目录）。
+
+### 方式三：源码手动安装
+
+```bash
+git clone https://github.com/ThzxxArt/frpsctl.git && cd frpsctl
+uv venv && uv pip install -e ".[dev]"
+.venv/bin/frpsctl --version          # 直接用 venv 里的命令，不注册全局
+
+# 或让 pip 直接装到用户环境
+pip install --user -e .
+```
+
+### 安装 frps 二进制
+
+Python 侧装好后，用 `frpsctl install` 下载官方 frps（sha256 强校验）：
 
 ```console
 $ frpsctl install
@@ -116,77 +224,19 @@ frps 0.71.0 → /home/u/.local/share/frpsctl/bin/frps-0.71.0
 - **幂等**：同版本已在盘上时不重复下载，但**仍会校正 `bin/frps` 软链**——手工改歪的
   链会被修回来。想"只落盘、不动链"请显式加 `--only-download`。
 
-#### `frpc` 是测试专用件，不是运维件
-
-`--with-frpc` 会从**同一个 tar 包**里额外取出 `frpc`（`bin/frpc-<version>` + 软链），
+`--with-frpc` 会从**同一个 tar 包**里额外取出 `frpc`（测试专用件，供插件契约测试用），
 不产生额外下载：
 
 ```bash
 frpsctl install --with-frpc        # frps + frpc
 ```
 
-它不服务于 frps 的日常运维，只为了让**插件契约测试**能跑起来——插件（`Login` /
-`NewProxy` 回调）的唯一真实调用方是 frpc，没有它就只能靠手工拼报文验证协议。
-`frps` 与 `frpc` 的落盘判定**互相独立**，因此"机器上已有 frps，现在想补装 frpc"
-也能装上。
-
-### 从源码安装（一键脚本）
+### 验证安装
 
 ```bash
-git clone https://github.com/ThzxxArt/frpsctl.git
-cd frpsctl
-./install.sh
-```
-
-脚本做的事：建一个独立 venv → 装依赖 → 把 `frpsctl` 注册到 `~/.local/bin` → 自检。
-**不需要 pipx、不需要 uv、不需要 sudo**（venv 是标准库自带的）。
-
-```console
-$ ./install.sh
-检查运行环境
- ✓ 操作系统：Linux
- ✓ Python：Python 3.13.5（/usr/bin/python3）
- ✓ 源码目录：/mnt/d/CodeWorkspace/frpsctl
- ✓ venv 模块可用
-
-创建虚拟环境
- ✓ 已创建：/home/u/.local/share/frpsctl-src/venv
-安装 frpsctl 及其依赖
- ✓ 依赖就绪（typer / pydantic / tomlkit / httpx）
-注册全局命令
- ✓ 已注册：/home/u/.local/bin/frpsctl
-自检
- ✓ 命令可用：frpsctl 0.2.2
-
-frpsctl 安装完成
-```
-
-| 选项 | 作用 |
-|------|------|
-| （无） | 装到 `~/.local`（命令 → `~/.local/bin/frpsctl`） |
-| `--system` | 装到 `/usr/local`（需要 `sudo`） |
-| `--prefix DIR` | 自定义前缀 |
-| `--uninstall` | 卸载（删 venv 与命令，**不动实例数据**） |
-| `--no-verify` | 跳过安装后自检 |
-
-**反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
-源码无需重装，命令立即生效。用 pipx / pip 安装的版本可分别用
-`pipx upgrade frpsctl` / `pip install -U frpsctl` 升级。
-
-建议开启 shell 补全（`frpsctl --install-completion`，支持 bash/zsh/fish）。
-
-> 脚本**不下载 frps 二进制**——那是 `frpsctl install` 的职责（需要网络与校验和，
-> 且要写入用户数据目录）。安装器只负责让 `frpsctl` 这个命令可用。
-
-### 从源码安装（手动）
-
-```bash
-git clone https://github.com/ThzxxArt/frpsctl.git && cd frpsctl
-uv venv && uv pip install -e ".[dev]"
-.venv/bin/frpsctl --version          # 直接用 venv 里的命令，不注册全局
-
-# 或让 pip 直接装到用户环境
-pip install --user -e .
+frpsctl --version                  # frpsctl 0.2.4
+frpsctl install                    # 下载 frps 二进制
+frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
 
 ---
@@ -213,7 +263,7 @@ dashboard 端口（0 = 不启用，将失去状态聚合能力） [7500]:
 ```
 
 **把这三项记下来**——`auth.token` 要填到每个 frpc 客户端，dashboard 口令用于
-`prune` 与 Web 管理台等操作。
+`prune`、Web 管理台等操作。
 
 ```console
 $ frpsctl verify
@@ -233,6 +283,21 @@ dashboard: 127.0.0.1:7500 (auth: on)
 health   : L1 process ok  L2 control ok  L3 plugin skipped
 clients  : 0 online
 traffic  : in 0 B / out 0 B  (conns now 0)
+```
+
+frpc 侧对应配置：
+
+```toml
+serverAddr = "your-server"
+serverPort = 7000
+auth.token = "上面那个 auth.token"
+
+[[proxies]]
+name = "my-ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000        # 必须落在 allowPorts 范围内
 ```
 
 `init` 生成的配置长这样（每条安全项旁边都写了它为什么在那儿）：
@@ -277,34 +342,56 @@ level = "info"
 maxDays = 7
 ```
 
-frpc 侧对应配置：
-
-```toml
-serverAddr = "your-server"
-serverPort = 7000
-auth.token = "上面那个 auth.token"
-
-[[proxies]]
-name = "my-ssh"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 22
-remotePort = 6000        # 必须落在 allowPorts 范围内
-```
-
 > ⚠️ **TOML 位置纪律**：`allowPorts`、`maxPortsPerClient` 这类**顶层键必须写在任何
 > `[table]` 之前**。写错了它们会变成那张表的子键，而 frps 的报错是极具误导性的
 > `unknown field "allowPorts"`——看起来像键名错了，实际是位置错了。
 
+**接下来**：想用浏览器看，直接读 [Web 管理台教程](#web-管理台教程)；想在终端里
+深入操作，读 [CLI 使用教程](#cli-使用教程)。
+
 ---
 
-## 日常使用
+## CLI 使用教程
 
-### 看状态
+### 全局选项与命令总览
+
+```
+--instance, -i NAME    实例名（默认 default，可用 FRPSCTL_INSTANCE 覆盖）
+--root PATH            实例根目录（默认 ~/.local/share/frpsctl/instances）
+--config PATH          直接指定配置文件（覆盖实例默认）
+--binary PATH          直接指定 frps 二进制
+--json                 机器可读输出（所有查询类命令支持）
+--admin-password       dashboard 口令（优先于配置文件）
+--yes, -y              跳过交互确认
+--verbose, -v          详细输出（把外部命令与判定过程打进 stderr）
+--version              frpsctl 版本
+```
+
+**长名可以写在任意位置，短名 `-v` 只能写在子命令之前**：
+
+```bash
+frpsctl status --json
+frpsctl config get bindPort -i web
+frpsctl verify --verbose
+```
+
+`frpsctl --verbose status` 与 `frpsctl status --verbose` 完全等价。`--verbose`
+只进 stderr，因此 `--verbose --json` 的 stdout 仍是干净的 JSON，可以直接管道给 `jq`：
+
+```console
+$ frpsctl verify --verbose
+[trace] 读取二进制版本：~/.local/share/frpsctl/bin/frps-0.71.0 -v
+[trace] 二进制版本：0.71.0（退出码 0）
+[trace] 执行权威校验：~/.local/share/frpsctl/bin/frps-0.71.0 --strict_config=true verify -c …/tmpXXXX.toml
+[trace] verify 退出码 0
+…/instances/default/frps.toml 校验通过（frps 0.71.0，标志：--strict_config=true）
+```
+
+### 教程 1：看状态
 
 ```bash
 frpsctl status              # 人读
-frpsctl status --json       # 机器可读（前后位置都行：status --json / --json status）
+frpsctl status --json       # 机器可读（前后位置都行）
 frpsctl status --watch      # 持续刷新
 frpsctl status --watch --json   # 持续输出单行 JSON（NDJSON），可逐行消费
 ```
@@ -321,8 +408,7 @@ listen   : 0.0.0.0:7000
 dashboard: 127.0.0.1:7500 (auth: on)
 ```
 
-```console
-$ frpsctl status --json
+```json
 {
   "instance": "default",
   "owner": "direct",
@@ -332,10 +418,7 @@ $ frpsctl status --json
   "binary_version": "0.71.0",
   "disk_version": "0.71.0",
   "config_mode": "0600",
-  "listen": {
-    "addr": "0.0.0.0",
-    "port": 7000
-  },
+  "listen": { "addr": "0.0.0.0", "port": 7000 },
   "health": {
     "l1_process": "ok",
     "l2_control": "ok",
@@ -371,7 +454,7 @@ $ frpsctl status --json
 | `systemd` | 由 systemd 托管，`start`/`stop`/`restart` 委托 systemctl |
 | `none` | 没有进程在跑，也没有 unit |
 
-### 看客户端与代理
+### 教程 2：看客户端、代理与流量
 
 `status` 给的是总数；"谁在线、哪个代理在跑、各跑了多少流量"用这两条
 （走 v2 Admin API，自动翻页取全量，`--json` 可管道给 `jq`）：
@@ -401,12 +484,9 @@ $ frpsctl traffic alice.alice-ssh  # 单个代理的明细
 ```
 
 离线或已删除的代理在数据源上返回 404 = 无数据（不是错误）；单个代理查询失败
-也不拖垮整体。
+也不拖垮整体。代理数超过 50 时会明确提示"仅统计前 50 个"（Web 同理）。
 
-`prune` 清理离线代理记录；在线代理无法从服务端强制下线（frp 没有该 API，
-见"清理离线记录"一节）。
-
-### 改配置
+### 教程 3：改配置（核心事务）
 
 frps 没有热重载，所以"改配置"和"重启"是同一件事。`config set` 把它实现为一次
 **带回滚的事务**：
@@ -424,7 +504,7 @@ $ frpsctl config set maxPortsPerClient 30
  
  # 端口白名单：只允许客户端申请这些端口 / 端口段。
  # 不设的话，任何持有 token 的客户端都能申请任意端口。
-
+ 
 ✓ 已写入并重启，健康检查通过
 ```
 
@@ -438,7 +518,7 @@ $ frpsctl config set maxPortsPerClient 30
      → 重启 → 健康检查 → 失败自动回滚（退出码 9，并如实告知回滚结果）
 ```
 
-常用变体：
+**常用变体**：
 
 ```bash
 frpsctl config set bindPort 8000 --no-restart   # 只写不重启（输出会提示"尚未生效"）
@@ -454,15 +534,28 @@ frpsctl config get auth                         # 读整张表（机密自动打
 frpsctl config get auth.token --reveal          # 需要看原值时显式索取
 frpsctl config edit                             # 用 $EDITOR 改，保存后走同一闭环
 frpsctl config diff                             # 当前 vs 上一份快照
+frpsctl config diff --steps 3                   # 当前 vs 第 3 新的一份
 frpsctl config rollback                         # 回滚到上一份
 frpsctl config rollback 3                       # 回滚到 3 份之前
+```
+
+`config list` 的输出（值自动打码）：
+
+```console
+$ frpsctl config list --prefix webServer
+webServer.addr = "127.0.0.1"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = hQ***x3
 ```
 
 > `--dry-run` 与 `--no-restart` 的区别：前者**什么都不写**（只校验+预览），
 > 后者已经落盘、只是没有重启；`config unset` 删除不存在的键会报配置错误(3)
 > ——拼错键名的"成功删除"会让人以为清掉了某个设置。
+>
+> `--no-restart` 之后别忘了 `frpsctl restart` 让变更生效（`status` 会提示）。
 
-**机密保护**：`config get` 默认打码（`SU***56` 形式，保留首尾便于核对是不是同一个
+**机密保护**：`config get` 默认打码（`hQ***x3` 形式，保留首尾便于核对是不是同一个
 值），`--json` 与所有 diff 输出同样打码。要看明文必须 `--reveal`。
 
 **拒绝危险组合**：`config set` 与 `doctor` 双重拦截"dashboard 绑非回环 **且**
@@ -478,9 +571,9 @@ $ frpsctl config set webServer.addr '"0.0.0.0"'   # 这一步会让它变成完�
 ```
 
 反向也成立：**只要口令非空，绑非回环是允许的**（远程看 dashboard 是常见需求，
-此时有 Basic Auth 保护）。拦截的是"无鉴权 + 对外暴露"这个组合本身，不是对外暴露。
+此时有 Basic Auth 保护）。拦截的是"无鉴权 + 对外暴露"这个组合本身。
 
-### 看日志
+### 教程 4：看日志
 
 ```bash
 frpsctl log                 # 最近 100 行
@@ -495,7 +588,7 @@ frpsctl service logs -f     # systemd 模式：unit 级日志（journalctl -u）
 `service logs` 看的是 **journald** 里的 unit 级日志（启动失败、OOM、权限拒绝
 这类"frp 还没写进自己的日志文件"的问题），两者互补。
 
-### 停下来
+### 教程 5：启停
 
 ```bash
 frpsctl stop                # SIGTERM → 轮询确认 → 超时 SIGKILL
@@ -516,7 +609,7 @@ $ frpsctl stop
 提示：该 pid 可能已被复用为无关进程。确认后手工删除 …/state.json 即可恢复
 ```
 
-### 体检
+### 教程 6：体检与巡检
 
 ```console
 $ frpsctl doctor
@@ -545,10 +638,22 @@ $ frpsctl doctor
 | 进程所有权冲突 | ERROR | systemd 与 direct 同时成立 |
 | 插件暴露面 | ERROR | 插件回调指向非回环（协议无认证） |
 | 插件可达性 | WARN | 不可达时提示"客户端将无法登录" |
+| Web 口令文件权限 | WARN | `web service install` 生成的口令文件权限过宽（应 0600） |
 
 **有 ERROR 时退出码为 1**，可直接接进 CI 或监控。
 
-### 清理离线记录
+多实例巡检用 `instances`（一行一个：owner / 状态 / pid / 版本 / 健康）：
+
+```console
+$ frpsctl instances
+default          direct   RUNNING (pid 10582, up 2m10s)  frps 0.71.0  L1 process ok  L2 control ok  L3 plugin skipped
+web              systemd  SYSTEMD_ACTIVE (pid 20041)
+```
+
+默认不做网络探测（快速）；加 `--health` 会对运行中的实例跑三层健康检查。
+`instances --json` 输出与 `status --json` 同构的数组。
+
+### 教程 7：清理离线记录
 
 ```bash
 frpsctl prune               # 清理 dashboard 统计里的离线代理记录
@@ -561,7 +666,143 @@ frpsctl prune               # 清理 dashboard 统计里的离线代理记录
 
 ---
 
-## 多实例
+## Web 管理台教程
+
+### 启动与登录
+
+```bash
+frpsctl web serve                                  # 默认只绑 127.0.0.1:8787
+frpsctl web serve --bind 127.0.0.1:9000            # 换端口
+FRPSCTL_WEB_PASSWORD=my-pw frpsctl web serve       # 指定口令（默认自动生成并打印一次）
+frpsctl web serve --password-file ./web-password   # 从 0600 文件读口令（systemd 部署用）
+```
+
+```console
+$ frpsctl web serve
+Web 管理台：http://127.0.0.1:8787/
+登录口令（仅显示这一次）：Ih2x...（24 字符）
+Ctrl-C 停止。
+```
+
+浏览器打开上面的 URL，输入口令即进入主界面。会话默认 8 小时（只存服务端内存，
+重启即失效）；刷新页面不会掉线（Cookie 还在，前端自动恢复会话）。
+
+**忘了口令？** 如果口令是自动生成的（只在启动时打印过一次），用：
+如果口令是 `web service install` 写入文件的：
+
+```bash
+frpsctl web password show
+```
+
+### 仪表盘
+
+打开后是仪表盘页，每 5 秒自动刷新（右上角可关，或点"刷新"手动更新）：
+
+| 区域 | 内容 | 要点 |
+|------|------|------|
+| 实例状态 | owner / 状态 / pid / 运行时长 / 版本 / 监听地址 / systemd unit | 二进制版本与磁盘版本不一致时显示"重启生效" |
+| 控制面健康 | L1 / L2 / L3 三层 + gate + 详情 | L2 或 L3 失败时详情直接给出原因 |
+| 概览 | 客户端 / 代理总数 / 当前连接 / 今日入站出站 / TLS 强制 | 数字来自 dashboard 统计 |
+| 近 7 天流量 | 按天双色柱状图（蓝=入站 绿=出站） | 悬停看单日数值；标题栏带合计；点下方代理行可下钻该代理曲线 |
+| 实时流量 | 页面打开期间的速率曲线（每 5 秒采样一次，累计值差分） | 显示当前速率与峰值；采样存本地浏览器，刷新不丢 |
+| 客户端 | name / user / hostname / ip / 状态 / 版本 | 在线状态用彩色标签 |
+| 代理 | name / user / 类型 / 端口 / 状态 / 连接 / 今日流量 | **点击任意行展开该代理的 7 天曲线**；右上角"清理离线记录" |
+| 日志 | 最近的日志尾部（复用 `log.to` 解析） | 向上滚动自动暂停跟随（标题栏显示"已暂停"），滚回底部恢复 |
+
+页面顶部的**横幅**会明确报告异常：
+
+- state.json 损坏（附处置指引）；0.70.x 缺安全修复；插件不可达（客户端将无法登录）；
+  流量超过 50 个代理时提示已截断。
+
+**进程操作**在右上角：启动 / 重启 / 停止。操作进行中按钮会禁用、状态徽章显示
+"操作中…"——启动最长要等 10 秒健康检查，此前完全无反馈。
+
+### 配置编辑：预览、应用与回滚
+
+配置页分三块：**编辑表单**、**变更预览**、**历史与回滚**。
+
+**编辑**：
+
+1. 每个字段一行（按表分组）。敏感值（token / 口令）不回显，显示打码提示
+   `hQ***x3（已设置；留空不改）`——留空表示保留原值，填入新值才会覆盖。
+2. 想删除某个键（回落 frp 默认值），点行尾的"删除"（会划线标记，再点"恢复"可取消）。
+3. 想**新增**配置里还没有的键（例如 `kcpBindPort`），用表单底部的"新增键"输入
+   键名与值（值语法与 CLI 一致：`7001`、`"text"`、`[1,2]`…）。
+4. 顶部计数会显示"N 项待应用（改 x / 删 y）"，点它可以跳到第一处修改。
+
+**预览 → 应用**：
+
+5. 点"预览变更"：服务端在锁内取当前配置快照并生成**打码 diff**（`+` 绿、`-` 红）。
+   预览有效期 10 分钟；期间配置若被 CLI 改过，应用会被**拒绝**而不是覆盖
+   （CAS 保护）——重新预览即可。
+6. 确认 diff 无误后点"确认应用（重启服务）"：多键修改与删除合并成**一次事务**
+   （一份快照、一次重启）；健康检查失败会自动回滚并如实告知。
+
+**历史与回滚**：
+
+7. "历史与回滚"卡片列出最近 10 份快照（时间 / 操作 / 步数）。
+8. 每行先点**"查看差异"**——展开该快照与当前配置的打码 diff（与 CLI
+   `config diff --steps N` 同一实现）。回滚是危险操作，先看清会改什么。
+9. 确认后点"回滚到此份"：与 CLI 一样走完整闭环（校验 → 替换 → 重启 → 失败再回滚）。
+
+> **配置原文绝不下发浏览器**：界面与 API 只返回打码值；快照列表只读元数据
+> （时间/动作/步数），差异接口也返回打码 diff。要看明文用 CLI `config get --reveal`。
+
+### 口令、部署与安全
+
+**默认只绑回环**。要远程访问必须显式 `--allow-non-loopback`：
+
+```bash
+frpsctl web serve --bind 0.0.0.0:8787 --allow-non-loopback
+```
+
+建议再套一层反向代理终结 TLS；反代后加 `--trusted-proxy`，让登录失败限速按
+`X-Forwarded-For` 的**最后一跳**区分来源（否则所有请求同源，攻击者的失败会
+连带把管理员锁在冷却之外）。默认关闭时该头完全不被读取——伪造它既不能绕开
+限速、也不能制造新来源。
+
+**用 systemd 托管**（生成 0600 口令文件，unit 只引用路径，明文不落 unit）：
+
+```bash
+sudo frpsctl web service install    # 体检 → 渲染 frpsctl-web@.service → enable
+sudo frpsctl web service status
+sudo frpsctl web service uninstall  # 口令文件保留
+```
+
+`web service install` 同样需要 `frpsctl` 位于系统路径（不能被 `ProtectHome`
+挡住）——与插件服务的部署要求一致。`--trusted-proxy` 会写进 unit。
+
+**安全设计**（比 frp 自带 dashboard 更严——它正是本项目安全决策的来源）：
+
+- 默认只绑回环；绑非回环必须显式开关；
+- **不允许空口令**：自动生成（仅打印一次）或显式指定；会话 Cookie 带
+  `HttpOnly` + `SameSite=Strict`；
+- 一切变更请求要求 `X-CSRF-Token`（登录时下发，仅存浏览器内存）；
+- 登录失败按来源限速（60 秒 5 次），错误口令与限速的响应完全一致；
+- 配置原文绝不回显；响应带 CSP（`default-src 'none'`）与 `no-store`；
+- 单文件前端、零外部资源（不加载任何 CDN）。
+
+### CLI 与 Web 的对应关系
+
+Web 的每个操作都调用与 CLI **同一套 core 函数**——不存在"界面专用"的第二套逻辑：
+
+| 操作 | CLI | Web |
+|------|-----|-----|
+| 启停 / 重启 | `start` / `stop` / `restart` | 右上角按钮 → `POST /api/actions/*` |
+| 看状态与健康 | `status` | 仪表盘各卡片 |
+| 客户端 / 代理 / 流量 | `clients` / `proxies` / `traffic` | 列表与图表（同一 v2 数据源） |
+| 改配置 | `config set` / `config unset` | 表单 → 预览 → 应用（多键一次事务） |
+| 看差异 | `config diff --steps N` | "查看差异"（同一 `snapshot_diff`） |
+| 回滚 | `config rollback [N]` | "回滚到此份" |
+| 日志 | `log` | 日志面板（同一 `core/logs`） |
+| 清理离线记录 | `prune` | "清理离线记录" |
+| 口令 | `web password show` | 登录页输入 |
+
+---
+
+## 进阶用法
+
+### 多实例
 
 一台机器跑多个 frps：用 `--instance` 或环境变量区分，各自有独立的配置、状态、
 日志、锁。
@@ -574,28 +815,14 @@ frpsctl --instance web status
 FRPSCTL_INSTANCE=web frpsctl status    # 或长期用环境变量
 ```
 
-优先级：`--instance` > `FRPSCTL_INSTANCE` > `default`。
-
-一眼看全部实例（一行一个：owner / 状态 / pid / 版本 / 健康）：
-
-```console
-$ frpsctl instances
-default          direct   RUNNING (pid 10582, up 2m10s)  frps 0.71.0  L1 process ok  L2 control ok  L3 plugin skipped
-web              systemd  SYSTEMD_ACTIVE (pid 20041)
-```
-
-默认不做网络探测（快速）；加 `--health` 会对运行中的实例跑三层健康检查。
-`instances --json` 输出与 `status --json` 同构的数组。
-
-服务端场景可把实例根目录放到 `/etc`：
+优先级：`--instance` > `FRPSCTL_INSTANCE` > `default`。服务端场景可把实例根目录
+放到 `/etc`：
 
 ```bash
 frpsctl --root /etc/frps/instances --instance web init
 ```
 
----
-
-## 服务端插件（多用户鉴权 + 端口白名单）
+### 服务端插件（多用户鉴权 + 端口白名单）
 
 frp 的服务端插件是一个 HTTP 回调：frps 在 `Login` / `NewProxy` 等事件发生时 POST
 一段 JSON，由插件决定放行还是拒绝。本工具用 Python（标准库）实现该回调。
@@ -640,7 +867,7 @@ $ frpsctl plugin check
 策略校验通过
 ```
 
-### 策略文件
+#### 策略文件
 
 `plugin init` 生成 `<实例目录>/plugin-policy.json`（可用 `--policy` 或
 `FRPSCTL_PLUGIN_POLICY` 指定）：
@@ -673,7 +900,7 @@ $ frpsctl plugin check
 | `max_proxies` | 每用户代理数上限（0 = 不限） |
 | `admin_url` | 填了它，配额计数走 dashboard 的**权威**统计；不填只在插件进程内计数 |
 
-### frps 侧配置
+#### frps 侧配置
 
 ```toml
 [[httpPlugins]]
@@ -685,7 +912,7 @@ ops  = ["Login", "NewProxy"]
 
 `ops` 至少要有 `Login` 与 `NewProxy`：前者做鉴权，后者做端口与配额治理。
 
-### frpc 侧配置
+#### frpc 侧配置
 
 ```toml
 serverAddr = "your-server"
@@ -701,26 +928,7 @@ localPort = 8080
 remotePort = 6005                        # 必须在自己被允许的范围内
 ```
 
-### 用 systemd 守护（推荐）
-
-`plugin serve` 是前台进程，而插件是**全部客户端登录的单点**且 fail-closed——
-生产环境必须让它随系统自启、退出即拉起。工具直接生成 unit：
-
-```bash
-sudo frpsctl plugin service install     # 体检 → 渲染 frpsctl-plugin@.service → enable
-sudo frpsctl plugin service status
-sudo frpsctl plugin service uninstall   # 停用并移除
-```
-
-生成的 unit 要点：`Restart=always`、`ProtectSystem=strict`、`ReadWritePaths=<实例目录>`
-（策略与审计都在那里）、`ExecStart=... --instance %i plugin serve --policy ...`。
-
-安装前的体检与 frps 的 `service install` 同样严格，且多一条硬约束——绑定地址
-必须是回环。另外 `frpsctl` 本身必须对服务用户可达且**不在家目录**：
-`ProtectHome=true` 会挡住 `~/.local/bin`，pipx 用户请用
-`sudo pipx install --global frpsctl`（或 `sudo pip install frpsctl`）。
-
-### 审计
+#### 审计
 
 每次裁决写入 JSONL（默认 `./plugin-audit.jsonl`，可用 `audit.path` 改）：
 
@@ -743,80 +951,9 @@ $ tail -1 plugin-audit.jsonl
 >    所以插件只允许绑回环。指向非回环会被 `plugin serve` 拒绝，`doctor` 也报 ERROR。
 
 `plugin serve` 收到 **SIGTERM**（`systemctl stop` 发的就是它）会**优雅退出**：先停
-服务、再把审计缓冲刷盘，然后才退出。默认处置下进程会立即死亡，缓冲里未落盘的裁决
-记录会一起丢掉——那恰恰是最不该丢的时候。
+服务、再把审计缓冲刷盘，然后才退出。
 
-`plugin serve --json` 输出的是**启动前的一次性状态**，之后仍然是前台阻塞运行；
-它不提供 JSON 流。需要探活请轮询 `GET /healthz`（免认证）。
-
----
-
-## Web 管理台
-
-内置的浏览器界面——不是 frp 自带 dashboard 的复刻，而是**含控制面**的管理台：
-进程启停、配置编辑（预览 diff → 应用 → 失败自动回滚）、日志、7 天流量图。
-
-```bash
-frpsctl web serve                                  # 默认只绑 127.0.0.1:8787
-frpsctl web serve --bind 127.0.0.1:9000            # 换端口
-FRPSCTL_WEB_PASSWORD=my-pw frpsctl web serve       # 指定口令（默认自动生成并打印一次）
-```
-
-```console
-$ frpsctl web serve
-Web 管理台：http://127.0.0.1:8787/
-登录口令（仅显示这一次）：Ih2x...（24 字符）
-Ctrl-C 停止。
-```
-
-打开浏览器即可——单文件前端（明暗双主题，跟随系统并可手动切换），零外部资源（不加载任何 CDN）：
-
-| 页面 | 内容 |
-|------|------|
-| 仪表盘 | 实例状态 / 三层健康 / 客户端与代理列表 / 近 7 天流量柱状图（悬停看数值，点代理行展开单代理曲线）/ 会话内实时流量曲线 / 日志（5 秒自动刷新，向上翻自动暂停跟随）。操作进行中有"操作中…"状态，清理离线记录后列表即时刷新 |
-| 配置 | 逐字段表单（敏感值以打码形式提示"已设置"，留空表示不改；可**删除**任意键回落默认值、也可**新增**键）→ 预览打码 diff（+绿/−红）→ 确认应用（一次事务、一次重启）→ 历史回滚（**先看差异再回滚**） |
-
-状态异常不会藏在角落：state.json 损坏、0.70.x 缺安全修复、插件不可达（客户端
-将无法登录）、流量超 50 个代理被截断——都会在页面顶部横幅或图表下方明确写出。
-
-**安全设计**（比 frp 自带 dashboard 更严——它正是本项目安全决策的来源）：
-
-- 默认只绑回环；绑非回环必须显式 `--allow-non-loopback`（建议再套反向代理 + TLS）；
-- **不允许空口令**：自动生成（仅打印一次）或显式指定，会话 Cookie 带 `HttpOnly` + `SameSite=Strict`；
-- 一切变更请求要求 `X-CSRF-Token`（登录时下发，仅存浏览器内存）；
-- 登录失败按来源限速（防爆破），错误口令与限速的响应完全一致；
-- **配置原文绝不回显**：界面与 API 只返回打码值；要明文用 `config get --reveal`；
-- 响应带 CSP（`default-src 'none'`）与 `no-store`。
-
-用 systemd 托管（生成 0600 口令文件，unit 只引用路径，明文不落 unit）：
-
-```bash
-sudo frpsctl web service install    # 体检 → 渲染 frpsctl-web@.service → enable
-sudo frpsctl web service status
-sudo frpsctl web service uninstall
-```
-
-> `web service install` 同样需要 `frpsctl` 位于系统路径（不能被 `ProtectHome`
-> 挡住）——与插件服务的部署要求一致。
-
-配置页里还有**历史与回滚**：列出最近 10 份快照（时间 / 动作 / 步数），每行可
-先"查看差异"再决定是否回滚到那一份（差异接口 `GET /api/config/history/{steps}/diff`
-与 `config diff --steps` 共用同一实现，同样打码；列表接口只读快照元数据，
-**不下发配置原文**——快照是含 token 与口令的完整副本）。
-
-生成的口令随时可以取回（权限过宽时会告警）：
-
-```bash
-frpsctl web password show
-```
-
-**在反向代理后运行**（`--allow-non-loopback` + Nginx 等）时加 `--trusted-proxy`：
-登录失败限速按 `X-Forwarded-For` 的**最后一跳**区分来源。默认关闭时该头完全
-不被读取；开启的前提是"前面确实有一层会重写该头的可信代理"——否则攻击者的
-失败会与管理员同源，5 次失败就能把管理员锁在冷却之外。
-`web service install --trusted-proxy` 会把该标志写进 unit。
-
-## 用 systemd 托管
+### 用 systemd 托管 frps
 
 ```bash
 sudo frpsctl service install      # 安装 frps@.service 模板并 enable
@@ -827,7 +964,7 @@ sudo frpsctl service uninstall    # 解除托管
 安装后 `owner` 变为 `systemd`，`start` / `stop` / `restart` 全部**委托 systemctl**，
 pid 文件不再参与任何判定。
 
-### 部署前置（`service install` 会在安装前检查）
+#### 部署前置（`service install` 会在安装前检查）
 
 unit 只是第一步——下面三项不满足时 `systemctl start` 必然失败。`service install`
 会在**安装之前**逐项检查并当场拒绝，而不是让你事后去 systemctl 的报错里找原因：
@@ -897,9 +1034,22 @@ WantedBy=multi-user.target
 > ⚠️ unit 的 `ExecStart` 写的是**具体二进制路径**，因此 `install` 换版本后需要
 > `systemctl restart` 才生效（软链换向不影响已加载的 unit）。
 
----
+### 用 systemd 托管 Web 管理台与插件
 
-## 升级 frps
+两者的部署要求与 frps 一致（账户 / frpsctl 可达且不在家目录 / 实例目录不在家
+目录），都由安装命令在**安装前**体检：
+
+```bash
+# Web 管理台：Restart=on-failure（交互工具，正常停止不自启）
+sudo frpsctl web service install
+sudo systemctl start frpsctl-web@default.service
+
+# 插件：Restart=always（登录单点，退出必须立刻拉起）
+sudo frpsctl plugin service install
+sudo systemctl start frpsctl-plugin@default.service
+```
+
+### 升级 frps
 
 ```bash
 frpsctl install --version 0.72.0                    # 下载 + 校验 + 落盘 + 换软链
@@ -923,7 +1073,9 @@ frpsctl install --version 0.71.0 && frpsctl restart
 
 ---
 
-## 退出码（脚本化契约）
+## 参考手册
+
+### 退出码（脚本化契约）
 
 | 码 | 含义 | 典型触发 |
 |----|------|---------|
@@ -934,7 +1086,7 @@ frpsctl install --version 0.71.0 && frpsctl restart
 | 4 | 二进制缺失 / 不可执行 / 版本不受支持 | 未 install，或版本 `< 0.70.0` |
 | 5 | 实例未运行 | `stop` 时无进程 |
 | 6 | 实例已在运行 | 重复 `start` |
-| 7 | dashboard 不可达 / 未启用 | `clients` / `proxies` / `prune` 时 `webServer.port = 0`；v2 API 缺失 |
+| 7 | dashboard 不可达 / 未启用 | `clients` / `proxies` / `traffic` / `prune` 时 `webServer.port = 0`；v2 API 缺失 |
 | 8 | 权限不足 | 需要 root 的操作 |
 | 9 | 变更已自动回滚 | 配置写入后启动/健康检查失败，已恢复上一版 |
 | 10 | 启动失败 / 进程停不下来 | 启动即退出（附 frp 原始报错）；SIGKILL 后仍存在 |
@@ -955,9 +1107,7 @@ case $? in
 esac
 ```
 
----
-
-## 环境变量与全局选项
+### 环境变量与全局选项
 
 | 环境变量 | 作用 |
 |---------|------|
@@ -970,46 +1120,10 @@ esac
 | `FRPSCTL_WEB_PASSWORD` | Web 管理台登录口令（`web serve --password` 优先于它） |
 | `FRPSCTL_TRACEBACK` | 设为 `1` 时打印完整回溯（排查未分类错误用） |
 
-全局选项（写在子命令前后都可以）：
+全局选项见 [上文](#全局选项与命令总览)。凭据优先级：
+`--admin-password` > `FRPSCTL_ADMIN_PASSWORD` > 配置文件里的 `webServer.password`。
 
-```
---instance, -i NAME    实例名
---root PATH            实例根目录
---config PATH          直接指定配置文件
---binary PATH          直接指定 frps 二进制
---json                 机器可读输出
---admin-password       dashboard 口令
---yes, -y              跳过交互确认
---verbose, -v          详细输出（把外部命令与判定过程打进 stderr）
---version              frpsctl 版本
-```
-
-> **长名可以写在任意位置，短名 `-v` 只能写在子命令之前**。`frpsctl status --json`、
-> `frpsctl config get bindPort -i web`、`frpsctl verify --verbose` 都可用；但 `-v`
-> 与子命令自己的短选项（`-n` / `-f`）挤在一起，盲目前移会把子命令的参数搬到错误
-> 位置，因此短写不做重排。`frpsctl --verbose status` 与 `frpsctl status --verbose`
-> 完全等价。
-
-`--verbose` 输出的是**诊断**，只进 stderr（例如实际执行的 `frps verify` 命令、
-读到的二进制版本、派生的进程与落盘的启动日志路径）：
-
-```console
-$ frpsctl verify --verbose
-[trace] 读取二进制版本：~/.local/share/frpsctl/bin/frps-0.71.0 -v
-[trace] 二进制版本：0.71.0（退出码 0）
-[trace] 执行权威校验：~/.local/share/frpsctl/bin/frps-0.71.0 --strict_config=true verify -c …/tmpXXXX.toml
-[trace] verify 退出码 0
-…/instances/default/frps.toml 校验通过（frps 0.71.0，标志：--strict_config=true）
-```
-
-因为只进 stderr，`--verbose --json` 的 stdout 仍是干净的 JSON，可以直接管道给 `jq`。
-
-凭据优先级：`--admin-password` > `FRPSCTL_ADMIN_PASSWORD` > 配置文件里的
-`webServer.password`。
-
----
-
-## 目录布局
+### 目录布局
 
 ```
 ~/.local/share/frpsctl/
@@ -1023,6 +1137,7 @@ $ frpsctl verify --verbose
         ├── frps.pid              # 人类可读副本，不参与任何判定
         ├── frps.log              # 由 frp 自己写并轮转
         ├── .lock                 # flock 互斥
+        ├── web-password          # Web 管理台口令文件（web service install 生成，0600）
         ├── plugin-policy.json    # 插件策略（若使用插件）
         ├── plugin-audit.jsonl    # 插件审计
         ├── config-history/       # 最近 10 份配置快照（0600）+ meta.json
@@ -1034,12 +1149,11 @@ $ frpsctl verify --verbose
 其中 `start_time` 是识别 pid 复用的唯一依据，`binary` 存的是**真实路径**（不是软链，
 否则换版本后身份校验会失配）。
 
----
+### 备份与回滚
 
-## 备份与回滚
-
-每次 `config set` / `config edit` / `config rollback` 都会先把当前配置存进
-`config-history/NNNN-<时间戳>/`（保留最近 10 份，含 `meta.json` 记录操作与结果）。
+每次 `config set` / `config unset` / `config edit` / `config rollback` 都会先把当前
+配置存进 `config-history/NNNN-<时间戳>/`（保留最近 10 份，含 `meta.json` 记录操作
+与结果）。
 
 ```bash
 frpsctl config diff              # 当前 vs 上一份
@@ -1110,7 +1224,8 @@ $ frpsctl status
 ```
 
 `status` 仍以退出码 0 结束（它必须能回答现状），但会显著告警。**工具不会**在
-状态不可信时猜测——因为猜错的代价是杀掉无关进程。
+状态不可信时猜测——因为猜错的代价是杀掉无关进程。Web 管理台遇到同一情况会在
+页面顶部显示红色横幅。
 
 ### 锁被占用
 
@@ -1132,6 +1247,15 @@ $ frpsctl status
 ```bash
 /path/to/frps --strict_config=true verify -c /path/to/frps.toml
 ```
+
+### Web 管理台打不开 / 登录不了
+
+- **打不开**：确认 `web serve` 还在前台运行（`Ctrl-C` 会停掉它）；systemd 托管时
+  `frpsctl web service status` 看 `active`。
+- **口令不对**：自动生成的口令只在启动时显示一次；systemd 部署的口令用
+  `frpsctl web password show` 取回。
+- **连续失败后被拒**：登录失败限速（60 秒 5 次），表现与"口令错误"完全一致
+  ——等一分钟后重试；反代部署请加 `--trusted-proxy`，否则所有人的失败会算在同一来源上。
 
 ### 想看完整回溯
 
@@ -1157,8 +1281,8 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ### dashboard 鉴权的真实语义（实测）
 
-上面那条"两者全空 = 完全不鉴权"容易让人以为"只要填了 user 就安全了"。真机上
-逐项实测（frps 0.71.0）后，完整语义是这样的：
+"两者全空 = 完全不鉴权"容易让人以为"只要填了 user 就安全了"。真机上逐项实测
+（frps 0.71.0）后，完整语义是这样的：
 
 | `webServer.user` | `webServer.password` | 无 `Authorization` 头 | `user:(空口令)` |
 |---|---|---|---|
@@ -1170,21 +1294,11 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 两条推论：
 
 1. **鉴权开关是"任一非空即启用"**。因此 `frpsctl` 只拒绝"两者全空 + 绑非回环"
-   ——那是真·完全不鉴权；而"有 user、口令为空"属于**强度不足**（毕竟启用了鉴权），
-   是用户的显式选择，所以由 `doctor` 报 **WARN** 而不是否决写配置。
+   ——那是真·完全不鉴权；而"有 user、口令为空"属于**强度不足**，由 `doctor`
+   报 **WARN** 而不是否决写配置。
 2. **Basic Auth 里的空口令是合法口令**。`user = "admin"` 而 `password = ""` 时，
    任何人用 `admin` + 空口令就能进 dashboard——等于只用用户名保护。`doctor`
-   会明确报出来：
-
-   ```console
-   $ frpsctl config set webServer.password '""' && frpsctl doctor
-   [WARN ] dashboard 弱口令: password 为空（user = 'admin'）—— frp 把空口令当作合法口令，
-           等于只用用户名保护 dashboard
-           ↳ 设置一个随机口令：`frpsctl config set webServer.password '"..."'`
-   ```
-
-   只设 password 不设 user 也启用鉴权，但调用方要发**空用户名**的 Basic Auth
-   （`frpsctl` 自己发请求时已按此处理）。
+   会明确报出来。
 
 其他保证：
 
@@ -1212,8 +1326,8 @@ uv venv && uv pip install -e ".[dev]"
 CI（Linux，Python 3.11/3.12/3.13/3.14）还包含：ruff、覆盖率门禁、真 frp 0.71.0
 契约层、**真 frp 0.70.0 下界契约矩阵**、无二进制降级路径、端到端冒烟与
 Web 管理台冒烟（含配置差异接口）、**前端静态守卫**（逐 `<script>` 块
-`node --check` + 禁 innerHTML/外部资源）、**文档一致性守卫**（README/设计文档/
-API 表 vs 代码的交叉核对）。
+`node --check` + 禁 innerHTML/外部资源 + JS 与 HTML 的 id 双向核对）、
+**文档一致性守卫**（README/设计文档/API 表 vs 代码的交叉核对）。
 
 ### 测试分七层
 
@@ -1225,7 +1339,7 @@ API 表 vs 代码的交叉核对）。
 | 契约 | `tests/test_facts.py` | **设计文档事实基线的自动化守卫**（需真 frps） |
 | 故障注入 | `tests/test_faults.py` | 注入系统调用失败，验证异常路径的五项不变量 |
 | 插件 | `tests/test_plugin.py` | 协议报文、裁决、审计、配额；含真 frpc 端到端契约 |
-| 前端与文档 | `tests/test_web_frontend.py`、`tests/test_docs.py` | 单文件前端的静态守卫（`node --check`、禁 innerHTML/外部资源、CSS 变量对齐）与 README / 设计文档 / API 表的双向一致性 |
+| 前端与文档 | `tests/test_web_frontend.py`、`tests/test_docs.py` | 单文件前端的静态守卫（`node --check`、禁 innerHTML/外部资源、CSS 变量对齐、id 双向核对）与 README / 设计文档 / API 表的双向一致性 |
 
 让契约层跑起来（需要真实二进制）：
 
@@ -1266,6 +1380,9 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **systemd 模式下 pid 文件不参与判定** | 所有权委托 systemctl；`install` 换版本后需 `systemctl restart` |
 | **Web 管理台不限制并发连接数** | 单机管理工具的取舍（请求线程随连接创建，监听 backlog 64）；公网暴露请在前置反代上做限流 |
 | **`--trusted-proxy` 只信 X-Forwarded-For 的最后一跳** | 前提是前面确实有一层会重写该头的可信代理；直连部署不要开启 |
+| **Web 无 WebSocket/SSE 推送** | 5 秒轮询足够，且省掉长连接的生命周期管理 |
+| **Web 不做 DOM 级前端测试框架** | 引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产；语法与静态纪律由 CI 守卫，UI 分支仍靠人工点验（残余风险已记账） |
+| **一个 web 进程服务一个实例** | 多实例请起多个 `web serve`（各自 `--instance`） |
 
 ---
 
