@@ -36,7 +36,8 @@
 15. [风险登记表](#15-风险登记表)
 16. [设计评审变更记录](#16-设计评审变更记录问题-15-闭环)
 17. [实现验证记录](#17-实现验证记录m0m5-已落地)
-    - [17.6 第二轮全量 review](#176-第二轮全量-reviewm0m5--文档定稿--真-frpc-契约复核后)
+   - [17.6 第二轮全量 review](#176-第二轮全量-reviewm0m5--文档定稿--真-frpc-契约复核后)
+18. [Web 管理台](#18-web-管理台)
 - [附录 A：frps 配置键速查表](#附录-afrps-配置键速查表)
 - [附录 B：事实复核清单](#附录-b事实复核清单)
   - [附录 B-2：§3.6 版本矩阵的复核命令](#附录-b-236-版本矩阵的复核命令)
@@ -138,7 +139,7 @@ dashboard 仅在 `webServer.port > 0` 时启动；`port = 0` 表示**完全不�
 | `GET /api/v2/proxies`、`/api/v2/proxies/{name}`、`/api/v2/proxies/{name}/traffic` | Basic | ✔ 代理列表 / 详情 / 流量序列（带分页） |
 | `GET /api/v2/users` | Basic | ✔ 按用户聚合 |
 | `POST /api/v2/system/prune` | Basic | ✔ 供未来 `stats prune` 使用 |
-| `DELETE /api/proxies` | Basic | ✔ `kick` 用（v1 路径，v2 无对应写接口） |
+| `DELETE /api/proxies` | Basic | ✔ `prune` 用——**实际语义是"清理离线代理记录"**（`?status=offline`，源码 `controller.go` 的 `ClearOfflineProxies()`；真机实测无参数返回 400）。frp **没有**强制下线在线代理的 API；旧 `kick` 命令基于误读，从未工作（§18.6） |
 | `GET /api/proxy/{type}` | Basic | ✔ 逐类型代理列表（`{"proxies":[...]}`，用于 §13.1 C1 的交叉验证） |
 | `GET /api/serverinfo`、`GET /api/clients` | Basic | ✘ **v1 遗留**，不实现（ADR-3） |
 | `GET /metrics` | Basic | ✘ 仅当 `enablePrometheus = true`，超出 v1 范围 |
@@ -527,7 +528,7 @@ class Instance:
 | `frpsctl log [-f] [-n 100]` | 看日志 | tail `log.to`；缺失时回退到 startup 日志 |
 | `frpsctl service install\|uninstall\|status` | systemd 集成 | 渲染 unit + `daemon-reload` + `enable`（需 root，明确提示） |
 | `frpsctl doctor [--json]` | 体检 | §8.7 检查项，按 severity 输出 |
-| `frpsctl kick <proxy-name>` | 下线指定代理 | `DELETE /api/proxies` |
+| `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；frp 不支持强制下线在线代理 |
 
 ### 7.3 退出码
 
@@ -2409,6 +2410,150 @@ diff。发现 **3 个真实缺陷**——全部集中在"**展示层与业务层
   `dist/`、`.venv/` 等构建产物）；
 - 版本引用零残留（`0.3.0` 字样已全部改为 `0.2.1`；历史段落里的 `v0.2.0`
   是真实发布记录，保留）。
+
+---
+
+## 18. Web 管理台
+
+### 18.1 目标：控制面，而不只是仪表盘
+
+frp 自带 dashboard 只有**数据面**（状态、客户端、代理、流量）且界面陈旧；
+本工具的内置管理台补齐**控制面**——进程启停、配置编辑（预览 → 事务 → 自动
+回滚）、日志——数据面则复用 v2 Admin API（§3.2）。
+
+架构定位：`web/` 是与 `cli/` **平级的又一个前端**，只调 `core/`，不复制任何
+业务逻辑；`core/` 不感知 HTTP。技术栈与插件服务同源：标准库
+`ThreadingHTTPServer`，零新增依赖。
+
+```
+浏览器（单文件前端，内嵌 CSS/JS，零外部资源）
+   │  JSON API + 会话 Cookie + CSRF 头
+   ▼
+frpsctl web serve（独立进程，默认只绑 127.0.0.1）
+   ├── core.Lifecycle     → 状态 / start / stop / restart（含健康门控）
+   ├── core.AdminClient   → clients / proxies / traffic（v2，自动翻页）
+   ├── core.transaction   → 配置预览（plan_set_many + CAS）与应用（apply_sets）
+   └── core.logs          → 日志 tail
+```
+
+### 18.2 API 契约
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/login` `/api/logout` | 口令登录（下发会话 Cookie + CSRF）/ 登出；**login 是唯一免认证入口** |
+| GET | `/api/status` | 进程状态 + 三层健康 + dashboard 统计（统计不可得为 null） |
+| GET | `/api/clients` `/api/proxies` `/api/traffic` | v2 数据（自动翻页；traffic 为 7 天日粒度） |
+| GET | `/api/config` | 配置树（**打码值 + masked 标记**，原文永不下发） |
+| GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`） |
+| POST | `/api/config/preview` | 多键变更 → 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
+| POST | `/api/config/apply` | 按 `preview_id` 应用；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
+| POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口 |
+
+错误映射：`FrpsctlError.exit_code` → HTTP（用法/配置 400、未运行/冲突 409、
+权限 403、dashboard 不可达/健康未过 502）——响应只含 `message` 与 `hint`，
+机密不进错误体（core 已保证）。
+
+### 18.3 安全基线（比 frp 自带 dashboard 更严）
+
+frp 的教训（user/password 双空 = 完全不鉴权，§3.3）是本项目全部安全决策的
+来源；管理台能改配置、停服务，是比 dashboard 高得多的价值目标：
+
+| 风险 | 对策 |
+|------|------|
+| 暴露到非回环 | 默认只绑 `127.0.0.1`；`--bind` 非回环必须显式 `--allow-non-loopback` |
+| 无口令 | **不允许空口令**：自动生成（仅打印一次）或显式提供 |
+| 会话劫持 | 256 位随机 token；Cookie `HttpOnly` + `SameSite=Strict`；TTL 8h（内存态） |
+| CSRF | 一切变更请求要求 `X-CSRF-Token`（登录下发，仅存浏览器内存） |
+| 口令爆破 | 来源级失败限速（60s/5 次）；冷却与错口令**响应完全一致** |
+| 时序侧信道 | `hmac.compare_digest` |
+| 配置泄露 | 界面/API 只出打码值；欲看明文用 CLI `--reveal` |
+| 前端供应链 | 单文件、零外部资源；CSP `default-src 'none'` + `connect-src 'self'` |
+
+### 18.4 systemd 托管
+
+`frpsctl web service install` 渲染 `frpsctl-web@.service`：`Restart=on-failure`
+（交互工具，正常停止不自启）、四项体检与插件一致、安装时生成 0600 口令文件
+并移交服务用户——**口令明文绝不进 unit**（unit 是 0644，只引用文件路径）。
+
+### 18.5 实现记录：下沉与复用
+
+为 web 与 CLI 共用，三处逻辑下沉到 core（消除重复实现）：`parse_bind`
+（bind 解析，插件服务同时受益）、`mask_value`（打码单点，`cli.ui.mask_secret`
+委托）、`core/logs.py`（日志路径解析与 tail，`frpsctl log` 改用）。
+
+### 18.6 实现期发现：`kick` 是一个从未工作过的功能
+
+Web 端到端测试（真 frps + frpc）第一次调用"下线代理"就暴露：frp 的
+`DELETE /api/proxies` 实现是 `ClearOfflineProxies()`，**只接受
+`?status=offline`**（源码 `server/http/controller.go`），路由表里也没有任何
+强制下线在线代理的 API。旧 `kick` 按"按 name 下线"实现该端点——真机**永远**
+返回 400，而它从未被真机验证过（契约层是盲区）。
+
+修正：`kick` 移除，`prune` 取代（正确语义：清理离线记录）；契约层新增 **C9**
+锁定该事实（无参数 400 / `?status=offline` 200 / 客户端源码反向断言）。
+
+### 18.7 未做与边界
+
+| 项 | 结论 |
+|----|------|
+| WebSocket/SSE 实时推送 | 不做：5 秒轮询足够，且省掉长连接的生命周期管理 |
+| 多实例切换 | 不做：一个 web 进程服务一个实例（`--instance`），多实例起多个进程 |
+| HTTPS | 不做：默认回环明文即可；远程访问建议反向代理终结 TLS（文档已说明） |
+| 配置的"全文编辑器" | 不做：表单式逐键编辑 + 预览 diff 更安全（原文不回传浏览器） |
+| 强制下线在线代理 | 做不到：frp 没有该 API（§18.6）；停掉对端 frpc 是唯一途径 |
+
+### 18.8 发布前回归 review（第八轮）
+
+对抗性复现（浏览器刷新场景、TOML datetime、全路由认证扫描、单代理故障注入）
+发现 **4 个真实缺陷**，全部修复并补 **21 条测试**（410 → 431）：
+
+| # | 缺陷 | 复现方式 | 修复 |
+|---|------|---------|------|
+| 1 | 配置含 TOML datetime 时 `json.dumps` 抛 `TypeError`——traceback 后连接被断开，整个配置页不可用 | 配置写 `expires_at = 2026-12-31T23:59:59` 后 `GET /api/config` | `_send_json` 统一 `default=str` 兜底（与 `cli.ui.emit_json` 一致） |
+| 2 | 浏览器**刷新页面**后 Cookie 还在但前端内存的 CSRF 丢失——所有变更操作 403 且无恢复路径 | 有 Cookie 无 CSRF 的 POST | 新增 `GET /api/session`（有效会话归还 CSRF）；前端 boot 时恢复 |
+| 3 | 趋势接口中单个代理查询失败会拖垮整张图（dashboard 半死不活时全 502） | mock 单代理抛 `AdminUnreachable` | 逐代理容错（记空 history），其余照常返回 |
+| 4 | 预览条目无上限（已登录用户可持续 preview 堆内存）；前端 `localStorage` 在隐私模式下抛异常会中断流量采样 | 代码审查 + 存储注入 | 预览上限 32 条（丢最旧）；采样读/写 try 包裹 |
+
+另新增**全路由认证扫描**（16 条参数化用例）：除 `POST /api/login` 外的每条 API
+在未登录时必须 401——**未知路由同样返回 401**（不泄露路由存在性）。前端 425 行
+JS 经 `node --check` 语法验证通过。
+
+### 18.9 发布前最终验收（v0.2.2）
+
+方法同 §17.12：**验证发布产物本身 + 复刻 CI 全套**。本轮补齐了 CI 对 Web 的
+覆盖缺口（此前 CI 从不触碰 web），结论：**可发布**。
+
+#### 发布产物验证
+
+| 项 | 结果 |
+|----|------|
+| wheel / sdist | `frpsctl-0.2.2`（41 条目，含 web 模块与 26KB 单文件前端） |
+| 干净安装（独立 venv） | `frpsctl 0.2.2`；**11/11 命令 help 全部可用**（含 `web`/`prune`） |
+| 前端资源 | 安装后 `STATIC_INDEX` 可读（26389 字符） |
+| tag 一致性（模拟 release workflow） | `v0.2.2` == `__version__` |
+| wheel 自检 | 含 `py.typed` / `web/static/index.html` / 全部模块 |
+
+#### CI 全套本地复刻
+
+| 步骤 | 结果 |
+|------|------|
+| ruff / 覆盖率门禁（80%） | 全绿 / 82.44% |
+| 非契约 | 405 passed |
+| 契约层（0.71.0，含新增 C9/C10） | 26 passed |
+| 故障注入层 | 23 passed |
+| 插件契约层（真 frpc） | 4 passed |
+| 端到端冒烟（CLI 12 步） | 通过 |
+| **Web 冒烟（本轮新增的 CI 步骤）** | 通过（login / session / status / config / 静态页） |
+| 无二进制降级路径 | 3 passed / 23 skipped |
+| 0.70.0 下界契约矩阵 | 26 passed（C9/C10 在 0.70 上同样成立） |
+
+#### 本轮 review 的修补
+
+- **CI 覆盖缺口**：此前 CI 从不触碰 Web——新增 web 冒烟步骤（已在本地复刻验证
+  可上 CI）；
+- **契约补充**：C10 锁定 v2 traffic 端点的"无数据 = 404"语义（Web 前端容错的
+  前提），0.70.0 上同样成立；`AdminClient.proxy_traffic` 的解析与名称转义补单测；
+- 交叉核对：命令（39 条路径）/ 环境变量 / 退出码三向一致，无幽灵命令。
 
 ---
 

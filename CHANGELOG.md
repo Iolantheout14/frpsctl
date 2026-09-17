@@ -3,6 +3,40 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-09-17
+
+Web 管理台（内置界面）与 `kick` 语义修正。
+
+### 新增
+
+- `frpsctl web serve`：内置 Web 管理台——仪表盘（状态 / 三层健康 / 7 天流量
+  柱状图 / 会话内实时曲线）、客户端与代理列表、日志面板、进程启停、配置编辑
+  （预览打码 diff → 应用 → 失败自动回滚 → 一键回滚）。单文件前端、零外部
+  资源（CSP `default-src 'none'`），默认只绑回环。
+- `frpsctl web service install|uninstall|status`：Web 管理台的 systemd 集成
+  （生成 0600 口令文件并移交服务用户；口令明文不进 unit）。
+- `frpsctl prune`：清理 dashboard 统计里的离线代理记录。
+- 配置编辑的多键事务 `apply_sets` / `plan_set_many`：一次快照、一次重启，
+  带 CAS（预览之后文件被改 → 拒绝而不是覆盖）。
+- 契约层新增 **C9**（代理写 API 的真实语义）与 **C10**（traffic 端点的"无数据
+  = 404"语义，Web 容错的前提），0.70.0 上同样成立。
+
+### 修复
+
+- **修正 `kick` 的语义错误**：frp 的 `DELETE /api/proxies` 实际是
+  `ClearOfflineProxies()`（只接受 `?status=offline`），**不存在**强制下线在线
+  代理的 API。原 `kick` 按"按 name 下线"实现该端点，真机永远返回 400——一个
+  从未工作过的功能（Web 端到端测试暴露）。已由 `prune` 取代。
+
+### 工程
+
+- 新增 78 条测试（357 → 435），覆盖率 82%。含 Web 层的全路由认证扫描（16 条）、
+  浏览器刷新恢复、TOML datetime 序列化、单代理故障注入等回归用例。
+- core 下沉三处共用逻辑（消除重复实现）：`parse_bind`（插件服务同时受益）、
+  `mask_value`（打码单点）、`core/logs.py`（`frpsctl log` 与 web 共用）。
+- CI 新增 **Web 管理台冒烟**步骤（此前 CI 从不触碰 web）：登录 → 会话恢复 →
+  状态 → 配置 → 静态页，全链路验证。
+
 ## [0.2.1] - 2026-09-17
 
 第四轮全量迭代：并发根治、策略 fail-open 修复与便捷性命令。

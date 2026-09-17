@@ -23,9 +23,10 @@
   - [看日志](#看日志)
   - [停下来](#停下来)
   - [体检](#体检)
-  - [下线代理](#下线代理)
+  - [清理离线记录](#清理离线记录)
 - [多实例](#多实例)
 - [服务端插件（多用户鉴权 + 端口白名单）](#服务端插件多用户鉴权-端口白名单)
+- [Web 管理台](#web-管理台)
 - [用 systemd 托管](#用-systemd-托管)
 - [升级 frps](#升级-frps)
 - [退出码（脚本化契约）](#退出码脚本化契约)
@@ -155,7 +156,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.2.1
+ ✓ 命令可用：frpsctl 0.2.2
 
 frpsctl 安装完成
 ```
@@ -212,7 +213,7 @@ dashboard 端口（0 = 不启用，将失去状态聚合能力） [7500]:
 ```
 
 **把这三项记下来**——`auth.token` 要填到每个 frpc 客户端，dashboard 口令用于
-`kick` 等操作。
+`prune` 与 Web 管理台等操作。
 
 ```console
 $ frpsctl verify
@@ -387,7 +388,8 @@ alice.alice-ssh              alice      tcp     6000   online   0      0 B / 0 B
 $ frpsctl proxies --type http      # 只看某类型
 ```
 
-`kick <proxy-name>` 下线指定代理（名字就是 `proxies` 列出的 name）。
+`prune` 清理离线代理记录；在线代理无法从服务端强制下线（frp 没有该 API，
+见"清理离线记录"一节）。
 
 ### 改配置
 
@@ -523,13 +525,16 @@ $ frpsctl doctor
 
 **有 ERROR 时退出码为 1**，可直接接进 CI 或监控。
 
-### 下线代理
+### 清理离线记录
 
 ```bash
-frpsctl kick my-ssh          # DELETE /api/proxies
+frpsctl prune               # 清理 dashboard 统计里的离线代理记录
 ```
 
-需要 dashboard 启用（`webServer.port > 0`）；未启用时退出码 7。
+⚠️ **frp 没有强制下线在线代理的 API**——`DELETE /api/proxies` 的实际语义是
+`ClearOfflineProxies()`（只接受 `?status=offline`，源码与真机均已核实）。
+要断开某个客户端请停掉它的 frpc。此前版本的 `kick` 基于对该端点的误读，
+从未真正工作过，已由 `prune` 取代。
 
 ---
 
@@ -709,6 +714,51 @@ $ tail -1 plugin-audit.jsonl
 
 ---
 
+## Web 管理台
+
+内置的浏览器界面——不是 frp 自带 dashboard 的复刻，而是**含控制面**的管理台：
+进程启停、配置编辑（预览 diff → 应用 → 失败自动回滚）、日志、7 天流量图。
+
+```bash
+frpsctl web serve                                  # 默认只绑 127.0.0.1:8787
+frpsctl web serve --bind 127.0.0.1:9000            # 换端口
+FRPSCTL_WEB_PASSWORD=my-pw frpsctl web serve       # 指定口令（默认自动生成并打印一次）
+```
+
+```console
+$ frpsctl web serve
+Web 管理台：http://127.0.0.1:8787/
+登录口令（仅显示这一次）：Ih2x...（24 字符）
+Ctrl-C 停止。
+```
+
+打开浏览器即可——单文件前端（暗色主题），零外部资源（不加载任何 CDN）：
+
+| 页面 | 内容 |
+|------|------|
+| 仪表盘 | 实例状态 / 三层健康 / 客户端与代理列表 / 近 7 天流量柱状图 / 会话内实时流量曲线 / 日志（5 秒自动刷新） |
+| 配置 | 逐字段表单（敏感值不回显，留空表示不改）→ 预览打码 diff → 确认应用（一次事务、一次重启）→ 一键回滚 |
+
+**安全设计**（比 frp 自带 dashboard 更严——它正是本项目安全决策的来源）：
+
+- 默认只绑回环；绑非回环必须显式 `--allow-non-loopback`（建议再套反向代理 + TLS）；
+- **不允许空口令**：自动生成（仅打印一次）或显式指定，会话 Cookie 带 `HttpOnly` + `SameSite=Strict`；
+- 一切变更请求要求 `X-CSRF-Token`（登录时下发，仅存浏览器内存）；
+- 登录失败按来源限速（防爆破），错误口令与限速的响应完全一致；
+- **配置原文绝不回显**：界面与 API 只返回打码值；要明文用 `config get --reveal`；
+- 响应带 CSP（`default-src 'none'`）与 `no-store`。
+
+用 systemd 托管（生成 0600 口令文件，unit 只引用路径，明文不落 unit）：
+
+```bash
+sudo frpsctl web service install    # 体检 → 渲染 frpsctl-web@.service → enable
+sudo frpsctl web service status
+sudo frpsctl web service uninstall
+```
+
+> `web service install` 同样需要 `frpsctl` 位于系统路径（不能被 `ProtectHome`
+> 挡住）——与插件服务的部署要求一致。
+
 ## 用 systemd 托管
 
 ```bash
@@ -827,7 +877,7 @@ frpsctl install --version 0.71.0 && frpsctl restart
 | 4 | 二进制缺失 / 不可执行 / 版本不受支持 | 未 install，或版本 `< 0.70.0` |
 | 5 | 实例未运行 | `stop` 时无进程 |
 | 6 | 实例已在运行 | 重复 `start` |
-| 7 | dashboard 不可达 / 未启用 | `kick` 时 `webServer.port = 0`；v2 API 缺失 |
+| 7 | dashboard 不可达 / 未启用 | `clients` / `proxies` / `prune` 时 `webServer.port = 0`；v2 API 缺失 |
 | 8 | 权限不足 | 需要 root 的操作 |
 | 9 | 变更已自动回滚 | 配置写入后启动/健康检查失败，已恢复上一版 |
 | 10 | 启动失败 / 进程停不下来 | 启动即退出（附 frp 原始报错）；SIGKILL 后仍存在 |
@@ -860,6 +910,7 @@ esac
 | `FRPSCTL_ADMIN_PASSWORD` | dashboard 口令（优先于配置文件） |
 | `FRPSCTL_PLUGIN_POLICY` | 插件策略文件路径 |
 | `FRPSCTL_MIRROR` | frps 下载镜像（逗号分隔；`install --mirror` 优先于它） |
+| `FRPSCTL_WEB_PASSWORD` | Web 管理台登录口令（`web serve --password` 优先于它） |
 | `FRPSCTL_TRACEBACK` | 设为 `1` 时打印完整回溯（排查未分类错误用） |
 
 全局选项（写在子命令前后都可以）：
@@ -1095,8 +1146,8 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 357 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（332 条）
+.venv/bin/pytest                       # 全部 435 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（405 条）
 .venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 83%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
