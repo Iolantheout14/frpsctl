@@ -18,7 +18,7 @@ from frpsctl.core import platform as plat
 from frpsctl.core.lock import instance_lock, is_locked
 from frpsctl.errors import ConfigError, LockBusy, TemplateSyntaxRejected
 
-from .conftest import make_fake_frps
+from .conftest import BASIC_CONFIG, make_fake_frps
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +562,108 @@ class TestPlanSetMany:
         plan = cfg.plan_set_many(path, [])
         assert plan.is_noop is True
         assert plan.text == "bindPort = 7000\n"
+
+
+class TestHealthDetailAggregation:
+    """健康 detail 必须把**所有失败层**的详情都带上。
+
+    回归（P0 级展示缺陷）：L3 失败时 `detail = l3_detail` **直接覆盖** L2 的
+    失败详情——控制面与插件同时挂掉时，`status` 里看不到"dashboard 为什么没
+    起来"，而它恰恰是先要修的那一层（控制面恢复前连统计都拿不到）。
+    """
+
+    def test_render_shows_l2_detail_on_l2_failure(self) -> None:
+        from frpsctl.core.health import HealthLayer, HealthReport
+
+        report = HealthReport(
+            HealthLayer.OK,
+            HealthLayer.FAIL,
+            HealthLayer.SKIPPED,
+            detail="/healthz 无响应 (http://127.0.0.1:1)",
+        )
+        assert "/healthz 无响应" in report.render()
+
+    def test_l2_and_l3_failures_are_both_visible(self, inst, write_config) -> None:
+        from frpsctl.core.health import HealthLayer
+        from frpsctl.core.lifecycle import Lifecycle
+
+        from .conftest import free_port
+
+        dead = free_port()
+        write_config(
+            BASIC_CONFIG.replace("17500", str(dead))
+            + f'[[httpPlugins]]\nname = "auth"\naddr = "http://127.0.0.1:{dead}"\n'
+            'path = "/handler"\nops = ["Login"]\n'
+        )
+        report = Lifecycle(inst).check_health()
+
+        assert report.l2_control is HealthLayer.FAIL
+        assert report.l3_plugin is HealthLayer.FAIL
+        assert "/healthz 无响应" in report.detail, "L2 的失败详情被 L3 覆盖了"
+        assert "auth 127.0.0.1" in report.detail, "L3 的失败详情缺失"
+
+
+class TestPlanUnset:
+    """`plan_unset`：删除单个键（回落 frp 默认），内存补丁不落盘。"""
+
+    def test_removes_target_key_and_keeps_everything_else(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text(SAMPLE, "utf-8")
+
+        plan = cfg.plan_unset(path, "webServer.port")
+
+        assert plan.before == 7500
+        assert plan.after is None
+        assert "port = 7500" not in plan.text
+        # 同表的其他键、注释、排版全部保留
+        assert 'addr = "127.0.0.1"' in plan.text
+        assert "# frps 示例配置（这段注释必须原样存活）" in plan.text
+        assert "# 下面是安全相关设置" in plan.text
+        assert "-port = 7500" in plan.diff
+        # 只做内存补丁
+        assert path.read_text("utf-8") == SAMPLE
+
+    def test_removing_last_key_in_table_leaves_valid_toml(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text('bindPort = 7000\n\n[webServer]\nport = 7500\n', "utf-8")
+
+        plan = cfg.plan_unset(path, "webServer.port")
+
+        # 删空一张表后，剩下的文本必须仍是合法 TOML（空表头合法）
+        import tomllib
+
+        parsed = tomllib.loads(plan.text)
+        assert parsed["bindPort"] == 7000
+        assert parsed.get("webServer", {}) == {}
+
+    def test_missing_key_is_a_config_error(self, tmp_path) -> None:
+        """键不存在 → 配置错误(3)，而不是静默 noop。
+
+        拼错键名得到"成功删除"会让用户以为清掉了某个设置，而它从未存在——
+        与 `config get` 对不存在键报错同理（ADR-7：不猜测）。
+        """
+        from frpsctl.errors import ConfigKeyMissing
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(ConfigKeyMissing):
+            cfg.plan_unset(path, "webServer.port")
+
+    def test_path_through_scalar_is_a_config_error(self, tmp_path) -> None:
+        from frpsctl.errors import ConfigKeyMissing
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(ConfigKeyMissing):
+            cfg.plan_unset(path, "bindPort.sub")
+
+    def test_illegal_dotted_name_is_usage_error(self, tmp_path) -> None:
+        from frpsctl.errors import UsageError
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(UsageError):
+            cfg.plan_unset(path, ".bindPort")
 
 
 class TestGetValue:
@@ -1853,6 +1955,42 @@ class TestDoctorBinaryDiagnosis:
         assert "无法读取版本" not in message
 
 
+class TestDoctorWebPasswordFile:
+    """`doctor` 检查 web-password 的权限（它含管理台登录口令）。
+
+    未部署 Web 管理台时文件不存在——那是常态，不该有任何输出噪音。
+    """
+
+    def _findings(self, tmp_path, *, mode: int | None):
+        from frpsctl.core.doctor import run_doctor
+        from frpsctl.core.instance import Instance
+
+        inst = Instance(name="t", instances_root=tmp_path / "instances", data_home=tmp_path / "data")
+        inst.ensure_dirs()
+        inst.config.write_text(
+            'bindPort = 17000\n[auth]\ntoken = "x"\n[webServer]\nport = 0\n', "utf-8"
+        )
+        inst.config.chmod(0o600)
+        if mode is not None:
+            path = inst.dir / "web-password"
+            path.write_text("pw\n", "utf-8")
+            path.chmod(mode)
+        return run_doctor(inst).findings
+
+    def test_loose_permissions_are_warned(self, tmp_path) -> None:
+        hits = [f for f in self._findings(tmp_path, mode=0o644) if f.check == "Web 口令文件"]
+        assert hits and hits[0].severity.value == "WARN"
+        assert "0600" in hits[0].message
+
+    def test_0600_is_reported_ok(self, tmp_path) -> None:
+        hits = [f for f in self._findings(tmp_path, mode=0o600) if f.check == "Web 口令文件"]
+        assert hits and hits[0].severity.value == "INFO"
+
+    def test_absent_file_is_silent(self, tmp_path) -> None:
+        hits = [f for f in self._findings(tmp_path, mode=None) if f.check == "Web 口令文件"]
+        assert not hits, "未部署管理台时不该产生噪音"
+
+
 class TestProxyTrafficParsing:
     """`proxy_traffic`：真机形状的解析与名称转义（Web 趋势图数据源）。"""
 
@@ -1905,6 +2043,25 @@ class TestProxyTrafficParsing:
                 return _Resp()
 
         assert _Client("http://127.0.0.1:1").proxy_traffic("x") == []
+
+    def test_not_found_means_no_data(self) -> None:
+        """404 = "这个代理没有数据"（C10 的端点事实），返回空列表而不是报错。
+
+        离线/不存在的代理返回 404——它是**常态**（清理前的离线记录、已下线的
+        客户端），不是 dashboard 故障。把它升级成 `AdminUnreachable` 会让
+        "查一个离线代理的历史"变成错误；CLI `traffic` 与 Web 趋势图都依赖
+        这里返回空。
+        """
+        from frpsctl.core.admin import AdminClient
+
+        class _Resp:
+            status_code = 404
+
+        class _Client(AdminClient):
+            def _get(self, path, *, params=None):
+                return _Resp()
+
+        assert _Client("http://127.0.0.1:1").proxy_traffic("gone") == []
 
 
 class TestAdminPaging:
@@ -1993,13 +2150,14 @@ class TestUiOutputResilience:
         import sys
 
         from frpsctl.cli import ui
+        from frpsctl.core import diagnostics
 
         monkeypatch.setattr(sys, "stderr", self._Broken())
         ui.note("x")
         ui.progress("y")
         ui.warn("z")
         ui.end_progress()
-        monkeypatch.setattr(ui, "_VERBOSE", True)
+        monkeypatch.setattr(diagnostics, "_VERBOSE", True)
         ui.trace("t")
 
     def test_progress_tty_branch_clears_line(self, monkeypatch) -> None:
@@ -2227,6 +2385,48 @@ class TestSystemdOwnerDetection:
         # 反向：unit 未 active 但存在 state.json → DIRECT
         inst.write_state({"pid": 1, "start_time": 1, "binary": "/x", "config": "/y"})
         assert Lifecycle(inst).resolve_owner() is Owner.DIRECT
+
+    def test_status_survives_corrupted_state_with_systemd(self, inst, monkeypatch) -> None:
+        """systemd 托管 + 损坏的残留 state.json：必须照常报告 SYSTEMD_ACTIVE。
+
+        回归（P0）：`status` 的损坏分支直接返回 owner=NONE/STOPPED，**完全不探测
+        unit**——而 systemd 托管下 state.json 本就不参与任何判定（ADR-1）。一份
+        残留且损坏的 state.json（direct → systemd 迁移的常见遗留）会让 status
+        误报"服务没在跑"，用户据此去"重启"，而服务一直在正常服务。
+        """
+        from frpsctl.core import systemd as sd_mod
+        from frpsctl.core.lifecycle import Lifecycle, State
+        from frpsctl.core.systemd import Systemd
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        inst.config.chmod(0o600)
+        inst.state.write_text("{broken json", "utf-8")
+
+        unit_dir = inst.dir / "units"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(
+            sd_mod, "Systemd", lambda instance, **_kw: Systemd(instance, unit_dir=unit_dir)
+        )
+        self._runner(monkeypatch, active="active")
+
+        report = Lifecycle(inst).status()
+        assert report.state is State.SYSTEMD_ACTIVE, report
+        assert report.state_corrupted is True
+        assert report.systemd_unit == "frps@test.service"
+
+    def test_corrupted_state_without_systemd_is_indeterminate(self, inst, monkeypatch) -> None:
+        """对照：没有 systemd 时，损坏 state.json 仍报"不可判定"而不是硬猜。"""
+        from frpsctl.core.lifecycle import Lifecycle, Owner, State
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        inst.config.chmod(0o600)
+        inst.state.write_text("{broken json", "utf-8")
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: None)
+
+        report = Lifecycle(inst).status()
+        assert report.state is State.STOPPED
+        assert report.owner is Owner.NONE
+        assert report.state_corrupted is True
 
     def test_same_config_active_matches_execstart_path(self, systemd, monkeypatch) -> None:
         """`same_config_active` 比的是 ExecStart 里的**配置路径**，不是 unit 名。

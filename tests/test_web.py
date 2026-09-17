@@ -48,7 +48,7 @@ def web_ctx(inst) -> WebContext:
 
 @pytest.fixture
 def web(web_ctx):
-    server = WebServer(web_ctx, WebSettings(bind="127.0.0.1:0", password="secret-password"))
+    server = WebServer(web_ctx, WebSettings(bind="127.0.0.1:0"))
     server.start()
     try:
         yield server
@@ -165,6 +165,103 @@ class TestAuthManager:
         assert second is not None
         assert auth.check_session(first.token) is None
 
+    def test_failure_sources_are_bounded(self) -> None:
+        """失败来源表必须有上限：大量不同来源的失败不能把内存撑大。
+
+        窗口清理只在 login 时发生——持续、分散的失败请求会在窗口内堆积任意多
+        的来源条目（慢速内存放大）。上限是最基本的内存护栏。
+        """
+        from frpsctl.web.auth import MAX_TRACKED_SOURCES
+
+        auth = AuthManager("pw")
+        for index in range(MAX_TRACKED_SOURCES + 400):
+            auth.login("wrong", source=f"10.{(index // 65536) % 256}.{(index // 256) % 256}.{index % 256}")
+        with auth._lock:
+            assert len(auth._failures) <= MAX_TRACKED_SOURCES
+
+
+class TestTrustedProxy:
+    """反向代理部署下的来源识别（文档推荐的部署方式，此前完全不可用）。
+
+    默认模式下所有请求都来自代理（127.0.0.1）→ 攻击者 5 次失败即可把管理员
+    锁在冷却之外（60 秒内口令正确也拒绝）。`--trusted-proxy` 显式开启后，
+    来源取 `X-Forwarded-For` 的**最后一跳**（最靠近我们的代理写入的；左侧
+    可被客户端伪造）。
+    """
+
+    MAX_FAILURES_LOCAL = MAX_FAILURES
+
+    def test_forwarded_header_ignored_by_default(self, web) -> None:
+        """默认不读 X-Forwarded-For：伪造它不能绕开限速，也不能制造新来源。"""
+        client = Client(web)
+        for _ in range(self.MAX_FAILURES_LOCAL):
+            status, _, _ = client.call(
+                "/api/login",
+                method="POST",
+                body={"password": "wrong"},
+                headers={"X-Forwarded-For": "1.1.1.1"},
+            )
+            assert status == 401
+        # 伪造另一个"来源"用正确口令 → 仍应被限速（真实来源一直是 127.0.0.1）
+        status, _, _ = client.call(
+            "/api/login",
+            method="POST",
+            body={"password": "secret-password"},
+            headers={"X-Forwarded-For": "2.2.2.2"},
+        )
+        assert status == 401, "默认模式读取了 X-Forwarded-For（伪造头不应生效）"
+
+    def test_trusted_proxy_limits_by_last_forwarded_hop(self, web_ctx) -> None:
+        server = WebServer(
+            web_ctx,
+            WebSettings(bind="127.0.0.1:0", trusted_proxy=True),
+        )
+        server.start()
+        try:
+            client = Client(server)
+            for _ in range(self.MAX_FAILURES_LOCAL):
+                status, _, _ = client.call(
+                    "/api/login",
+                    method="POST",
+                    body={"password": "wrong"},
+                    headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"},
+                )
+                assert status == 401
+            # 同一最后一跳（9.9.9.9）+ 正确口令 → 冷却生效
+            status, _, _ = client.call(
+                "/api/login",
+                method="POST",
+                body={"password": "secret-password"},
+                headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"},
+            )
+            assert status == 401, "可信代理模式下没有按最后一跳限速"
+            # 不同最后一跳 + 正确口令 → 放行（证明来源确实按最后一跳区分）
+            status, payload, _ = client.call(
+                "/api/login",
+                method="POST",
+                body={"password": "secret-password"},
+                headers={"X-Forwarded-For": "5.5.5.5"},
+            )
+            assert status == 200, payload
+        finally:
+            server.stop()
+
+    def test_trusted_proxy_falls_back_to_peer_address(self, web_ctx) -> None:
+        """可信代理模式但没有 X-Forwarded-For 头 → 退回对端地址。"""
+        server = WebServer(
+            web_ctx,
+            WebSettings(bind="127.0.0.1:0", trusted_proxy=True),
+        )
+        server.start()
+        try:
+            client = Client(server)
+            status, _, _ = client.call(
+                "/api/login", method="POST", body={"password": "secret-password"}
+            )
+            assert status == 200
+        finally:
+            server.stop()
+
 
 # ---------------------------------------------------------------------------
 # API 集成（真实 HTTP）
@@ -180,6 +277,7 @@ class TestApiAuthBoundary:
             ("/api/proxies", "GET"),
             ("/api/traffic", "GET"),
             ("/api/config", "GET"),
+            ("/api/config/history", "GET"),
             ("/api/logs", "GET"),
             ("/api/session", "GET"),
             ("/api/config/preview", "POST"),
@@ -380,6 +478,102 @@ class TestApiData:
         assert payload["lines"] == ["line-2\n", "line-3\n"]
 
 
+class TestActionParameterValidation:
+    """动作接口的参数范围校验。
+
+    回归（P0）：`/api/actions/stop` 的 `timeout` 走 `_float` 宽松解析，负值一路
+    传到 `Lifecycle.stop` —— `_wait_gone(ref, -1)` 的 deadline 落在过去，循环
+    一次都不执行、直接返回"未退出"，于是**立刻升级 SIGKILL**。这与 CLI 侧
+    `stop --timeout -1`（v0.2.0 修复、Click min 约束）是同一个缺陷的镜像。
+    """
+
+    def test_out_of_range_parameters_are_rejected(self, web) -> None:
+        client = Client(web)
+        client.login()
+        cases = (
+            ("start", {"health_timeout": -1}),
+            ("restart", {"health_timeout": 99999}),
+            ("stop", {"timeout": -1}),
+            ("stop", {"timeout": -0.5}),
+            ("stop", {"timeout": "abc"}),
+            ("stop", {"timeout": True}),  # bool 是 float 的子类：不得当作 1.0
+            ("rollback", {"steps": 0}),
+            ("rollback", {"steps": -3}),
+        )
+        for action, body in cases:
+            status, payload, _ = client.call(f"/api/actions/{action}", method="POST", body=body)
+            assert status == 400, (action, body, status, payload)
+
+    def test_negative_stop_timeout_does_not_kill_the_process(self, web) -> None:
+        """负 timeout 必须在请求边界被拒，**进程绝不能**被这一步碰掉。"""
+        from frpsctl.core.platform import pid_alive
+
+        make_fake_frps(web.ctx.inst.bin_dir)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/start", method="POST", body={})
+        assert status == 200, payload
+        pid = payload["pid"]
+        try:
+            status, payload, _ = client.call(
+                "/api/actions/stop", method="POST", body={"timeout": -1}
+            )
+            assert status == 400, payload
+            assert pid_alive(pid), "负 timeout 的请求把进程杀掉了（应为 400 拒绝）"
+        finally:
+            client.call("/api/actions/stop", method="POST", body={})
+
+
+class TestConfigHistory:
+    """`GET /api/config/history`：快照列表（Web"历史与回滚"卡片的数据源）。
+
+    `steps` 与 `config rollback N` / `/api/actions/rollback` 的语义完全一致：
+    最新快照是 1（= 回滚一步）。接口只读 meta.json，**不读快照里的配置原文**
+    （快照是完整配置副本，含机密，没有理由读进内存再考虑打码）。
+    """
+
+    def test_empty_history(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/config/history")
+        assert status == 200
+        assert payload["entries"] == []
+
+    def test_lists_snapshots_newest_first_with_steps(self, web) -> None:
+        from frpsctl.core.transaction import config_snapshot
+
+        inst = web.ctx.inst
+        config_snapshot(inst, action="set bindPort")
+        config_snapshot(inst, action="rollback 1")
+
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/config/history")
+        assert status == 200, payload
+        entries = payload["entries"]
+        assert len(entries) == 2
+        assert entries[0]["steps"] == 1
+        assert entries[0]["action"] == "rollback 1"
+        assert entries[0]["name"].startswith("0002")
+        assert entries[1]["steps"] == 2
+        assert entries[1]["name"].startswith("0001")
+        assert entries[0]["at"], "meta.json 里的时间没有透出"
+        assert entries[0]["has_config"] is True
+
+    def test_tolerates_corrupted_meta(self, web) -> None:
+        from frpsctl.core.transaction import config_snapshot
+
+        inst = web.ctx.inst
+        slot = config_snapshot(inst, action="set x")
+        (slot / "meta.json").write_text("{broken", "utf-8")
+
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/config/history")
+        assert status == 200
+        assert payload["entries"][0]["steps"] == 1  # 元数据坏了不影响列表
+
+
 class TestConfigEditFlow:
     """预览 → 应用（含 CAS）——Web 配置编辑的核心链路。"""
 
@@ -435,7 +629,7 @@ class TestConfigEditFlow:
         make_fake_frps(web_ctx.inst.bin_dir)
         clock = {"t": 1000.0}
         web_ctx.clock = lambda: clock["t"]
-        server = WebServer(web_ctx, WebSettings(bind="127.0.0.1:0", password="p"))
+        server = WebServer(web_ctx, WebSettings(bind="127.0.0.1:0"))
         server.start()
         try:
             client = Client(server)

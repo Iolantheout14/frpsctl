@@ -51,7 +51,14 @@ jobs:
 
           wheel = next(pathlib.Path("dist").glob("*.whl"))
           names = set(zipfile.ZipFile(wheel).namelist())
-          required = {"frpsctl/py.typed", "frpsctl/cli/__init__.py", "frpsctl/core/lifecycle.py"}
+          required = {
+              "frpsctl/py.typed",
+              "frpsctl/cli/__init__.py",
+              "frpsctl/core/lifecycle.py",
+              "frpsctl/core/diagnostics.py",
+              # 前端是 package data：丢它 = 管理台页面 500，而 CLI 测试全绿
+              "frpsctl/web/static/index.html",
+          }
           missing = required - names
           if missing:
               raise SystemExit(f"wheel 缺少文件：{sorted(missing)}")

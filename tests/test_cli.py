@@ -795,6 +795,322 @@ class TestPruneCommand:
         assert "已清理" in result.stdout
 
 
+class TestTrafficCommand:
+    """`traffic`：7 天流量历史的 CLI 出口（`AdminClient.proxy_traffic` 早已实现）。"""
+
+    class _TrafficAdmin:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def list_proxies(self):
+            from frpsctl.core.admin import V2Proxy
+
+            return [
+                V2Proxy(name="alice.web", type="tcp"),
+                V2Proxy(name="bob.web", type="tcp"),
+            ]
+
+        def proxy_traffic(self, name: str):
+            if name == "bob.web":
+                from frpsctl.errors import AdminUnreachable
+
+                raise AdminUnreachable("boom")  # 单代理失败必须被容错
+            return [
+                {"date": "2026-09-16", "in": 1024, "out": 2048},
+                {"date": "2026-09-17", "in": 512, "out": 0},
+            ]
+
+    def test_requires_dashboard(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["traffic"])
+        assert result.exit_code == 7, result.output
+
+    def test_aggregates_all_proxies_and_tolerates_failures(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        result = runner.invoke(app, ["traffic"])
+        assert result.exit_code == 0, result.output
+        assert "2026-09-16" in result.stdout
+        assert "2026-09-17" in result.stdout
+        # alice 一条成功 + bob 失败 → 汇总只有 alice 的数字
+        assert "1.5 KiB" in result.stdout  # 1024+512 in 合计
+
+    def test_json_shape(self, cli_env, monkeypatch) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        result = runner.invoke(app, ["traffic", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["proxies"] == 2
+        assert payload["truncated"] is False
+        assert payload["days"][0] == {"date": "2026-09-16", "in": 1024, "out": 2048}
+        assert payload["days"][1] == {"date": "2026-09-17", "in": 512, "out": 0}
+
+    def test_truncation_is_reported(self, cli_env, monkeypatch) -> None:
+        """超过上限时**如实汇报**（不静默截断——"降级必须可见"同样适用于查询上限）。"""
+        import json
+
+        class _Many(TestTrafficCommand._TrafficAdmin):
+            def list_proxies(self):
+                from frpsctl.core.admin import V2Proxy
+
+                return [V2Proxy(name=f"p{i}", type="tcp") for i in range(60)]
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", _Many)
+        result = runner.invoke(app, ["traffic", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["truncated"] is True
+        assert payload["proxies"] == 50, "上限没有生效"
+
+        human = runner.invoke(app, ["traffic"])
+        assert human.exit_code == 0, human.output
+        assert "仅统计前 50 个" in human.output
+
+    def test_single_proxy_detail(self, cli_env, monkeypatch) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        result = runner.invoke(app, ["traffic", "alice.web", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["name"] == "alice.web"
+        assert payload["total"] == {"in": 1536, "out": 2048}
+
+    def test_single_proxy_without_data(self, cli_env, monkeypatch) -> None:
+        """不存在的代理在端点上是 404 = 无数据（C10）→ 友好提示而不是错误。"""
+        class _Empty(TestTrafficCommand._TrafficAdmin):
+            def proxy_traffic(self, name: str):
+                return []
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", _Empty)
+        result = runner.invoke(app, ["traffic", "ghost"])
+        assert result.exit_code == 0, result.output
+        assert "没有" in result.stdout and "ghost" in result.stdout
+
+
+class TestPluginUserCommands:
+    """`plugin user`：策略的结构化编辑。
+
+    策略是安全单点，手写 JSON 的风险（引号、逗号、类型写错）在这里被收敛为
+    命令参数：写入前用 `PluginPolicy.parse` + `validate` 复验（与 `plugin check`
+    同一判据），原子写 0600，未知键原样保留。
+    """
+
+    def _policy_path(self, cli_env):
+        return cli_env / "instances" / "default" / "plugin-policy.json"
+
+    def _init(self, cli_env) -> None:
+        result = runner.invoke(app, ["plugin", "init"])
+        assert result.exit_code == 0, result.output
+
+    def test_set_runs_inside_the_instance_lock(self, cli_env, monkeypatch) -> None:
+        """不变量（确定性）：策略的读-改-写必须在本进程持锁时完成。
+
+        回归（review）：`plugin user set/remove` 的"读 raw → 改 → 写回"此前
+        没有锁——两个并发调用会互相静默覆盖（与第四轮修复的 `config set`
+        并发丢失是同一形态）。这条直接守根因，不依赖时序。
+        """
+        from frpsctl.core import lock as lock_mod
+
+        self._init(cli_env)
+        lock_path = cli_env / "instances" / "default" / ".lock"
+        observed: list[bool] = []
+        from frpsctl.cli import _save_policy_raw as real_save
+
+        def spy(path, raw):
+            observed.append(lock_mod.is_locked(lock_path))
+            return real_save(path, raw)
+
+        monkeypatch.setattr("frpsctl.cli._save_policy_raw", spy)
+        result = runner.invoke(app, ["plugin", "user", "set", "bob", "--ports", "7000"])
+        assert result.exit_code == 0, result.output
+        assert observed == [True], "策略写回发生在实例锁之外（并发覆盖的根因）"
+
+        observed.clear()
+        result = runner.invoke(app, ["plugin", "user", "remove", "bob"])
+        assert result.exit_code == 0, result.output
+        assert observed == [True]
+
+    def test_set_creates_user(self, cli_env) -> None:
+        from frpsctl.plugin.policy import PluginPolicy
+
+        self._init(cli_env)
+        result = runner.invoke(
+            app,
+            [
+                "plugin", "user", "set", "bob",
+                "--ports", "7000-7010",
+                "--types", "tcp",
+                "--max-proxies", "3",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        bob = PluginPolicy.load(self._policy_path(cli_env)).user("bob")
+        assert bob is not None
+        assert bob.render_ports() == "7000-7010"
+        assert bob.allowed_proxy_types == ("tcp",)
+        assert bob.max_proxies == 3
+
+    def test_set_updates_only_given_fields(self, cli_env) -> None:
+        from frpsctl.plugin.policy import PluginPolicy
+
+        self._init(cli_env)
+        runner.invoke(app, ["plugin", "user", "set", "bob", "--ports", "7000-7010"])
+        result = runner.invoke(app, ["plugin", "user", "set", "bob", "--max-proxies", "5"])
+        assert result.exit_code == 0, result.output
+        bob = PluginPolicy.load(self._policy_path(cli_env)).user("bob")
+        assert bob is not None
+        assert bob.render_ports() == "7000-7010", "未被指定的字段被清掉了"
+        assert bob.max_proxies == 5
+
+    def test_unknown_keys_are_preserved(self, cli_env) -> None:
+        """顶层与用户内的未知键（`_comment` 等）必须原样保留。"""
+        import json
+
+        self._init(cli_env)
+        path = self._policy_path(cli_env)
+        raw = json.loads(path.read_text("utf-8"))
+        raw["_custom_top"] = {"note": "keep me"}
+        raw["users"]["alice"]["custom_field"] = "keep"
+        path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), "utf-8")
+
+        result = runner.invoke(app, ["plugin", "user", "set", "alice", "--note", "更新"])
+        assert result.exit_code == 0, result.output
+
+        after = json.loads(path.read_text("utf-8"))
+        assert after["_custom_top"] == {"note": "keep me"}
+        assert after["users"]["alice"]["custom_field"] == "keep"
+        assert after["users"]["alice"]["note"] == "更新"
+
+    def test_invalid_ports_rejected(self, cli_env) -> None:
+        self._init(cli_env)
+        result = runner.invoke(app, ["plugin", "user", "set", "bob", "--ports", "7000-abc"])
+        assert result.exit_code == 3, result.output
+
+    def test_empty_spec_clears_the_key(self, cli_env) -> None:
+        """`--names ""` = 删除该键（回落"不限名称"）；--ports "" = 清空白名单。"""
+        import json
+
+        self._init(cli_env)
+        result = runner.invoke(app, ["plugin", "user", "set", "alice", "--names", ""])
+        assert result.exit_code == 0, result.output
+        raw = json.loads(self._policy_path(cli_env).read_text("utf-8"))
+        assert "allowed_proxy_names" not in raw["users"]["alice"]
+
+    def test_random_port_flags(self, cli_env) -> None:
+        from frpsctl.plugin.policy import PluginPolicy
+
+        self._init(cli_env)
+        assert runner.invoke(app, ["plugin", "user", "set", "bob", "--random-port"]).exit_code == 0
+        assert PluginPolicy.load(self._policy_path(cli_env)).user("bob").allow_random_port is True
+        assert runner.invoke(app, ["plugin", "user", "set", "bob", "--no-random-port"]).exit_code == 0
+        assert PluginPolicy.load(self._policy_path(cli_env)).user("bob").allow_random_port is False
+
+    def test_conflicting_random_port_flags_are_usage_error(self, cli_env) -> None:
+        self._init(cli_env)
+        result = runner.invoke(
+            app, ["plugin", "user", "set", "bob", "--random-port", "--no-random-port"]
+        )
+        assert result.exit_code == 2, result.output
+
+    def test_remove_user(self, cli_env) -> None:
+        from frpsctl.plugin.policy import PluginPolicy
+
+        self._init(cli_env)
+        result = runner.invoke(app, ["plugin", "user", "remove", "alice"])
+        assert result.exit_code == 0, result.output
+        assert PluginPolicy.load(self._policy_path(cli_env)).user("alice") is None
+
+    def test_remove_missing_user_is_config_error(self, cli_env) -> None:
+        self._init(cli_env)
+        result = runner.invoke(app, ["plugin", "user", "remove", "nobody"])
+        assert result.exit_code == 3, result.output
+
+    def test_list_is_readable_and_hides_policy_secrets(self, cli_env) -> None:
+        """`list` 不得泄露策略级的 `admin_password`（它含 dashboard 凭据）。"""
+        import json
+
+        self._init(cli_env)
+        path = self._policy_path(cli_env)
+        raw = json.loads(path.read_text("utf-8"))
+        raw["admin_password"] = "S3CRET-DASH"
+        path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), "utf-8")
+
+        result = runner.invoke(app, ["plugin", "user", "list", "--json"])
+        assert result.exit_code == 0, result.output
+        assert "S3CRET-DASH" not in result.output
+        payload = json.loads(result.stdout)
+        assert payload["users"][0]["name"] == "alice"
+
+        human = runner.invoke(app, ["plugin", "user", "list"])
+        assert human.exit_code == 0
+        assert "S3CRET-DASH" not in human.output
+        assert "alice" in human.output
+
+    def test_written_policy_passes_check(self, cli_env) -> None:
+        """写盘后的策略必须与 `plugin check` 的离线判据一致（同一套校验）。"""
+        self._init(cli_env)
+        runner.invoke(app, ["plugin", "user", "set", "bob", "--ports", "7000"])
+        result = runner.invoke(app, ["plugin", "check"])
+        assert result.exit_code == 0, result.output
+        assert "bob" in result.stdout
+
+
+class TestWebPasswordShow:
+    """`web password show`：读回 `web service install` 生成的口令文件。"""
+
+    def _write_password(self, cli_env, value: str, mode: int = 0o600):
+        path = cli_env / "instances" / "default" / "web-password"
+        path.write_text(value, "utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_missing_file_is_config_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["web", "password", "show"])
+        assert result.exit_code == 3, result.output
+        assert "口令文件" in result.output
+
+    def test_shows_password(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        self._write_password(cli_env, "my-web-pw\n")
+        result = runner.invoke(app, ["web", "password", "show"])
+        assert result.exit_code == 0, result.output
+        assert "my-web-pw" in result.stdout
+
+    def test_json_shape(self, cli_env) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        self._write_password(cli_env, "my-web-pw\n")
+        result = runner.invoke(app, ["web", "password", "show", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["password"] == "my-web-pw"
+        assert payload["password_file"].endswith("web-password")
+
+    def test_insecure_permissions_warn(self, cli_env) -> None:
+        """口令文件权限过宽必须告警（它是敏感文件）——但不阻止显示。"""
+        runner.invoke(app, ["init", "--no-input"])
+        self._write_password(cli_env, "my-web-pw\n", mode=0o644)
+        result = runner.invoke(app, ["web", "password", "show"])
+        assert result.exit_code == 0, result.output
+        assert "0600" in result.output
+        assert "my-web-pw" in result.stdout
+
+
 class TestServiceLogs:
     """`service logs`（journald 集成）：argv 构造与缺命令时的一致性报错。"""
 
@@ -969,6 +1285,209 @@ class TestInstallMirrorOption:
         result = runner.invoke(app, ["install"])
         assert result.exit_code == 0, result.output
         assert captured["version"] == ".".join(map(str, RECKONED_VERSION))
+
+
+class TestSnapshotStepValidation:
+    """快照步数的范围校验。
+
+    回归（P0）：`config rollback -1` 会被 `max(0, steps - 1)` 静默归一成
+    "回滚 1 步"——参数笔误得到的是"看起来成功"的另一个动作（与 `--timeout -1`
+    同类：脚本化契约里必须拒绝而不是猜测）。
+    """
+
+    def test_rollback_nonpositive_steps_is_usage_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        for bad in ("0", "-1", "-5"):
+            result = runner.invoke(app, ["config", "rollback", bad])
+            assert result.exit_code == 2, (bad, result.output)
+
+    def test_diff_nonpositive_steps_is_usage_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "diff", "--steps", "0"])
+        assert result.exit_code == 2, result.output
+
+
+class TestConfigUnsetCommand:
+    """`config unset`：删键回落默认（与 `config set` 同一闭环）。"""
+
+    def test_unset_removes_key(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert "maxPortsPerClient = 20" in config.read_text("utf-8")
+
+        result = runner.invoke(app, ["config", "unset", "maxPortsPerClient"])
+        assert result.exit_code == 0, result.output
+        assert "maxPortsPerClient" not in config.read_text("utf-8")
+        # 变更前快照照常产生
+        history = cli_env / "instances" / "default" / "config-history"
+        assert list(history.iterdir())
+
+    def test_unset_missing_key_is_config_error(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "unset", "webServer.noSuchKey"])
+        assert result.exit_code == 3, result.output
+
+    def test_unset_json_shape(self, cli_env) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "unset", "maxPortsPerClient", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["applied"] is True
+        assert payload["after"] is None
+
+
+class TestConfigDryRun:
+    """`config set --dry-run`：跑完真实验证但零落盘。"""
+
+    def test_dry_run_does_not_write(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        before = config.read_text("utf-8")
+
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "30", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        assert "dry-run" in result.output
+        assert config.read_text("utf-8") == before, "dry-run 改动了文件"
+        history = cli_env / "instances" / "default" / "config-history"
+        assert not history.exists() or not list(history.iterdir()), "dry-run 产生了快照"
+
+    def test_dry_run_json_reports_the_flag(self, cli_env) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(
+            app, ["config", "set", "maxPortsPerClient", "30", "--dry-run", "--json"]
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["dry_run"] is True
+        assert payload["applied"] is False
+
+    def test_dry_run_invalid_value_is_still_rejected(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "set", "bindPort", "99999", "--dry-run"])
+        assert result.exit_code == 3, result.output
+
+
+class TestValueInputChannels:
+    """`config set` 的值来源：位置参数 / --stdin / --prompt（互斥）。
+
+    敏感值（token、口令）走 argv 会进 shell 历史与 `/proc/<pid>/cmdline`；
+    `--stdin`（脚本）与 `--prompt`（交互隐藏输入）是替代通道。
+    """
+
+    def test_stdin_channel(self, cli_env, monkeypatch) -> None:
+        import io
+        import sys
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO("30\n"))
+
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "--stdin"])
+        assert result.exit_code == 0, result.output
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert "maxPortsPerClient = 30" in config.read_text("utf-8")
+
+    def test_prompt_channel(self, cli_env, monkeypatch) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: "30")
+
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "--prompt"])
+        assert result.exit_code == 0, result.output
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert "maxPortsPerClient = 30" in config.read_text("utf-8")
+
+    def test_stdin_value_is_whitespace_trimmed(self, cli_env, monkeypatch) -> None:
+        """裸文本值去掉首尾空白（TOML 里裸值不允许空白；要保留请显式加引号）。
+
+        回归（review）：`parse_scalar` 此前对裸文本返回**未 strip 的原文**，
+        `echo "  example.com  " | config set subDomainHost --stdin` 会写入带
+        空格的域名——一个看似成功却永远匹配不上的配置。
+        """
+        import io
+        import sys
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO("  example.com  \n"))
+
+        result = runner.invoke(app, ["config", "set", "subDomainHost", "--stdin"])
+        assert result.exit_code == 0, result.output
+        text = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
+        assert 'subDomainHost = "example.com"' in text, text
+
+    def test_prompt_eof_is_a_usage_error(self, cli_env, monkeypatch) -> None:
+        """无终端 / 无输入时 `--prompt` 必须给用法错误与替代方案，而不是 EOFError。
+
+        回归（review）：`getpass.getpass` 在 EOF 抛裸 `EOFError`，CLI 会把它
+        映射成"未分类错误(1)"——用户看到的是"工具内部出错"。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+
+        def eof(*_args, **_kwargs):
+            raise EOFError
+
+        monkeypatch.setattr("getpass.getpass", eof)
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "--prompt"])
+        assert result.exit_code == 2, result.output
+        assert "--stdin" in result.output
+
+    def test_conflicting_sources_are_usage_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        for args in (
+            ["config", "set", "k", "1", "--stdin"],
+            ["config", "set", "k", "1", "--prompt"],
+            ["config", "set", "k", "--stdin", "--prompt"],
+        ):
+            result = runner.invoke(app, args)
+            assert result.exit_code == 2, (args, result.output)
+
+    def test_missing_value_is_usage_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient"])
+        assert result.exit_code == 2, result.output
+
+    def test_empty_stdin_is_usage_error(self, cli_env, monkeypatch) -> None:
+        import io
+        import sys
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "--stdin"])
+        assert result.exit_code == 2, result.output
+
+    def test_blank_line_is_usage_error(self, cli_env, monkeypatch) -> None:
+        """空行不是合法值：清空字符串值请显式写 '""'（键的删除请用 config unset）。"""
+        import io
+        import sys
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "--stdin"])
+        assert result.exit_code == 2, result.output
+        assert "空" in result.output
+
+    def test_whitespace_only_positional_value_is_usage_error(self, cli_env) -> None:
+        """位置参数给纯空白同样拒绝（`config set k "  "` 是常见的漏填变量形态）。
+
+        回归（review）：空检查用 `text == ""` 时纯空白会绕过校验，最终把空字符串
+        写进配置（`parse_scalar` 的 strip 发生在更晚的层）。
+        """
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "set", "subDomainHost", "   "])
+        assert result.exit_code == 2, result.output
+        assert "空" in result.output
 
 
 class TestConfigEdit:

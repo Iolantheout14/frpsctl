@@ -536,6 +536,99 @@ class TestConcurrentChanges:
         assert not inst.history_entries()
 
 
+class TestUnsetAndDryRun:
+    """`config unset` 与 `config set --dry-run` 的闭环行为。"""
+
+    def test_unset_applies_and_snapshots(self, inst, write_config) -> None:
+        from frpsctl.core.transaction import apply_unset
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        outcome = apply_unset(
+            inst, dotted="webServer.password", lifecycle=lc, restart=False
+        )
+
+        assert outcome.applied is True
+        assert outcome.before == "test-password"
+        assert outcome.after is None
+        assert "password" not in inst.config.read_text("utf-8")
+        assert len(inst.history_entries()) == 1, "unset 也应留下变更前快照"
+
+    def test_unset_missing_key_is_config_error(self, inst, write_config) -> None:
+        from frpsctl.core.transaction import apply_unset
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        with pytest.raises(ConfigError):
+            apply_unset(inst, dotted="webServer.nothere", lifecycle=lc, restart=False)
+
+    def test_dry_run_writes_nothing(self, inst, write_config) -> None:
+        """dry-run：真实验证（语义 + 权威 + 危险组合）都跑，但零落盘、零快照。"""
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        before = inst.config.read_text("utf-8")
+
+        outcome = apply_set(
+            inst, dotted="bindPort", raw="18000", lifecycle=lc, dry_run=True
+        )
+
+        assert outcome.dry_run is True
+        assert outcome.applied is False
+        assert "dry-run" in outcome.note
+        assert inst.config.read_text("utf-8") == before, "dry-run 改动了文件"
+        assert not inst.history_entries(), "dry-run 不该产生快照"
+
+    def test_dry_run_still_validates(self, inst, write_config) -> None:
+        """dry-run 不是"跳过校验"：非法值照常配置错误(3)。"""
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        before = inst.config.read_text("utf-8")
+        with pytest.raises(ConfigError):
+            apply_set(inst, dotted="bindPort", raw="99999", lifecycle=lc, dry_run=True)
+        assert inst.config.read_text("utf-8") == before
+
+    def test_dry_run_rejects_dangerous_combination(self, inst, write_config) -> None:
+        """dry-run 必须跑危险组合拦截：否则用户会带着"校验通过"的错觉去掉 --dry-run。"""
+        write_config('bindPort = 17000\n[webServer]\naddr = "0.0.0.0"\nport = 17500\n')
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        before = inst.config.read_text("utf-8")
+        with pytest.raises(ConfigError, match="危险配置"):
+            apply_set(inst, dotted="maxPortsPerClient", raw="30", lifecycle=lc, dry_run=True)
+        assert inst.config.read_text("utf-8") == before
+
+    def test_dry_run_unset_writes_nothing(self, inst, write_config) -> None:
+        from frpsctl.core.transaction import apply_unset
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        before = inst.config.read_text("utf-8")
+        outcome = apply_unset(
+            inst, dotted="webServer.password", lifecycle=lc, dry_run=True
+        )
+        assert outcome.dry_run is True
+        assert inst.config.read_text("utf-8") == before
+        assert not inst.history_entries()
+
+    def test_dry_run_multi_key_writes_nothing(self, inst, write_config) -> None:
+        """`apply_sets` 的 dry-run 与单键同一语义（Web 表单底座的一致性）。"""
+        from frpsctl.core.transaction import apply_sets
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        before = inst.config.read_text("utf-8")
+        outcome = apply_sets(
+            inst,
+            changes=[("bindPort", "18010"), ("maxPortsPerClient", "30")],
+            lifecycle=lc,
+            dry_run=True,
+        )
+        assert outcome.dry_run is True
+        assert outcome.applied is False
+        assert inst.config.read_text("utf-8") == before
+        assert not inst.history_entries()
+
+
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -117,9 +117,14 @@ jobs:
           assert call("/api/session")["csrf"] == csrf
           config = call("/api/config")
           assert any(item["key"] == "bindPort" for item in config["entries"]), config
+          history = call("/api/config/history")
+          assert isinstance(history["entries"], list), history
+          # 端到端冒烟里的 config set 会留下快照：history 必须真的读得到
+          # （只断言"是列表"的话，空列表也能骗过这层守卫）。
+          assert any(str(e.get("action", "")).startswith("set ") for e in history["entries"]), history
           html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
           assert "frpsctl 管理台" in html
-          print("web 冒烟通过：login / session / status / config / 静态页")
+          print("web 冒烟通过：login / session / status / config / history / 静态页")
           EOF
           kill "$WEB_PID"
           wait "$WEB_PID" 2>/dev/null || true

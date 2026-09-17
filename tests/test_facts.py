@@ -356,14 +356,21 @@ class TestC10TrafficEndpointSemantics:
         assert resp.status_code == 404, resp.text
         assert "no proxy info found" in resp.text
 
-    def test_our_client_treats_it_as_unreachable(self) -> None:
-        """反向断言：客户端把这个 404 归入 `AdminUnreachable`（web 据此容错）。"""
+    def test_our_client_treats_404_as_no_data(self) -> None:
+        """反向断言：客户端把 404 当作"无数据"（返回空列表），而不是升级成错误。
+
+        这是 Web 逐代理容错与 CLI `traffic` 的共同前提：离线代理是常态，
+        不能让一个离线代理把整个趋势查询变成错误。
+        """
+        import re
+
         import frpsctl.core.admin as admin_module
 
         source = Path(admin_module.__file__).read_text("utf-8")
-        assert "proxy_traffic" in source
-        # traffic 走 _unwrap：>=400 一律 AdminUnreachable（含 404 的"无数据"）
-        assert "resp.status_code >= 400" in source
+        block = re.search(r"def proxy_traffic.*?(?=\n    def |\n\ndef )", source, re.S)
+        assert block is not None, "找不到 proxy_traffic 实现"
+        assert "status_code == 404" in block.group(0), "404 无数据语义丢失"
+        assert "return []" in block.group(0)
 
 
 # ---------------------------------------------------------------------------
