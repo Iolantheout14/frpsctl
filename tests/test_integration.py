@@ -944,3 +944,276 @@ class TestV2ApiAssertion:
             assert report.healthy is True
         finally:
             kill_quietly(report.pid)
+
+
+class TestUninstall:
+    """完整卸载（§21）：作用域规则、安全拒绝与执行顺序。
+
+    这一层守两件事：**不确定就拒绝**（运行中 / 身份不明 / 状态损坏 / 多实例
+    共用二进制）与**删除的精确边界**（删哪些、保留哪些、警告哪些）。
+    """
+
+    def test_full_uninstall_removes_data_and_bin(self, inst, write_config) -> None:
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        make_fake_frps(inst.bin_dir)
+        plan = plan_uninstall(inst)
+        assert plan.remove_data is True
+        assert plan.remove_bin is True
+
+        report = execute_uninstall(plan)
+
+        assert not inst.dir.exists(), "实例数据应被删除"
+        assert not inst.bin_dir.exists(), "共享二进制应被删除"
+        assert str(inst.dir) in report.removed
+        assert str(inst.bin_dir) in report.removed
+
+    def test_keep_data_and_keep_bin(self, inst, write_config) -> None:
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        make_fake_frps(inst.bin_dir)
+        plan = plan_uninstall(inst, keep_data=True, keep_bin=True)
+        report = execute_uninstall(plan)
+
+        assert inst.dir.exists(), "keep-data 下数据必须保留"
+        assert inst.bin_dir.exists(), "keep-bin 下二进制必须保留"
+        assert str(inst.dir) in report.kept
+
+    def test_keep_data_still_removes_bin(self, inst, write_config) -> None:
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        make_fake_frps(inst.bin_dir)
+        execute_uninstall(plan_uninstall(inst, keep_data=True))
+
+        assert inst.dir.exists()
+        assert not inst.bin_dir.exists()
+
+    def test_missing_instance_is_config_error(self, inst) -> None:
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.uninstall import plan_uninstall
+
+        # 夹具已经 ensure_dirs 过 `test`，这里用一个从未创建过的实例名
+        ghost = Instance(name="ghost", instances_root=inst.instances_root, data_home=inst.data_home)
+        with pytest.raises(ConfigError, match="实例不存在"):
+            plan_uninstall(ghost)
+
+    def test_multi_instance_rules(self, inst, write_config) -> None:
+        """多实例共用二进制时默认拒绝删 bin；--keep-bin / --all 各自放行。"""
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.uninstall import plan_uninstall
+        from frpsctl.errors import UsageError
+
+        write_config(BASIC_CONFIG)
+        other = Instance(name="web", instances_root=inst.instances_root, data_home=inst.data_home)
+        other.ensure_dirs()
+
+        with pytest.raises(UsageError, match="共用二进制目录"):
+            plan_uninstall(inst)
+        assert plan_uninstall(inst, keep_bin=True).remove_bin is False
+        plan_all = plan_uninstall(inst, all_instances=True)
+        assert {item.name for item in plan_all.instances} == {"test", "web"}
+        assert plan_all.remove_unit_templates is True
+
+    def test_running_instance_is_refused_without_force(self, inst, write_config) -> None:
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        report = lc.start(health_timeout=3)
+        try:
+            assert report.pid > 0
+            with pytest.raises(OwnershipConflict, match="正在运行"):
+                execute_uninstall(plan_uninstall(inst))
+            assert inst.dir.exists(), "拒绝之后数据必须完好"
+        finally:
+            lc.stop()
+
+    def test_force_stops_running_instance_then_removes(self, inst, write_config) -> None:
+        from frpsctl.core.platform import pid_alive
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        started = lc.start(health_timeout=3)
+
+        report = execute_uninstall(plan_uninstall(inst), force=True)
+
+        assert not pid_alive(started.pid), "--force 必须先停止实例"
+        assert not inst.dir.exists()
+        assert report.stopped, "停止动作必须出现在报告里"
+
+    def test_corrupted_state_is_refused(self, inst, write_config) -> None:
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        inst.state.write_text("{broken", "utf-8")
+        with pytest.raises(ConfigError, match="损坏"):
+            execute_uninstall(plan_uninstall(inst))
+
+    def test_foreign_state_is_refused(self, inst, write_config) -> None:
+        """pid 存活但身份不符（pid 复用嫌疑）——绝不碰，也绝不删数据。"""
+        from frpsctl.core.platform import proc_start_time
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        inst.state.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "start_time": (proc_start_time(os.getpid()) or 0) + 1,
+                    "binary": "/bin/true",
+                    "config": str(inst.config),
+                }
+            ),
+            "utf-8",
+        )
+        with pytest.raises(OwnershipConflict, match="身份校验不通过"):
+            execute_uninstall(plan_uninstall(inst))
+        assert inst.dir.exists()
+
+    def test_shared_template_is_not_a_warning(self, inst, write_config, tmp_path) -> None:
+        """多实例：卸一个**从未用过 systemd** 的实例，共享模板不该触发假警告。
+
+        回归（review 实测复现）：判定条件曾是 `template_path.exists()`，而模板
+        是全部实例共享的——多实例机器上（这里 web 实例装过模板）卸一个没用过
+        systemd 的实例会得到"需要 root 才能停用 frps unit"的假警告，
+        训练用户忽略警告。修复后判定走 `is_active()/is_enabled()`（本实例 unit
+        的真实状态），且 `remove_templates=False`（未覆盖全部实例）。
+        """
+        import shutil as _shutil
+
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        if _shutil.which("systemctl") is None:
+            pytest.skip("没有 systemctl：该路径按 available=False 静默跳过")
+        write_config(BASIC_CONFIG)
+        other = Instance(name="web", instances_root=inst.instances_root, data_home=inst.data_home)
+        other.ensure_dirs()
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        (unit_dir / "frps@.service").write_text("[Unit]\n", "utf-8")
+
+        # 多实例共用一个根：删二进制必须显式保留（plan 的规则），单实例不受影响
+        plan = plan_uninstall(inst, keep_bin=True)
+        report = execute_uninstall(plan, unit_dir=unit_dir)
+
+        assert not any("frps@test" in item for item in report.warnings), report.warnings
+
+    def test_unit_cleanup_degrades_visibly(self, inst, write_config, tmp_path, monkeypatch) -> None:
+        """本实例 unit 处于 enabled 但权限不足：不静默跳过，警告里给出命令。
+
+        用 `is_enabled` 做注入而不是 `is_active`：后者会被 `resolve_owner()`
+        用来判定所有权（实例会变成"systemd 托管"而被预检拒绝）——测试要注入的
+        是"清理阶段需要停用"，不是"所有权归属"。
+        """
+        import shutil as _shutil
+
+        from frpsctl.core.systemd import Systemd
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        if _shutil.which("systemctl") is None:
+            pytest.skip("没有 systemctl：该路径按 available=False 静默跳过")
+        write_config(BASIC_CONFIG)
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        (unit_dir / "frps@.service").write_text("[Unit]\n", "utf-8")
+        monkeypatch.setattr(Systemd, "is_enabled", lambda _self: True)
+
+        plan = plan_uninstall(inst, keep_data=True, keep_bin=True)
+        report = execute_uninstall(plan, unit_dir=unit_dir)
+
+        assert any("frps@test" in item for item in report.warnings), report.warnings
+
+    def test_keep_all_still_not_empty_when_instance_exists(self, inst, write_config) -> None:
+        """`--keep-data --keep-bin` 仍有"停用 unit"可能要做——不得判成空计划。
+
+        回归：`is_empty` 只看数据与二进制时，这个组合会直接输出"没有可卸载的
+        内容"并跳过 unit 停用——unit 静默留在系统里（降级不可见）。
+        """
+        from frpsctl.core.uninstall import plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        plan = plan_uninstall(inst, keep_data=True, keep_bin=True)
+        assert plan.is_empty is False
+
+    def test_external_config_override_is_reported(self, inst, write_config, tmp_path) -> None:
+        """`--config` 指向实例目录之外：卸载后如实提示它未被删除。"""
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        external = tmp_path / "external.toml"
+        external.write_text(BASIC_CONFIG, "utf-8")
+        patched = Instance(
+            name=inst.name,
+            instances_root=inst.instances_root,
+            data_home=inst.data_home,
+            config_override=external,
+        )
+        patched.dir.mkdir(parents=True, exist_ok=True)
+
+        report = execute_uninstall(plan_uninstall(patched))
+
+        assert external.exists(), "外部配置文件不属于实例目录，不能删"
+        assert any(str(external) in item for item in report.warnings), report.warnings
+
+    def test_race_window_start_is_aborted_without_force(
+        self, inst, write_config, monkeypatch
+    ) -> None:
+        """竞态：预检（STOPPED）与停止之间实例被并发启动——非 force 必须中止。
+
+        回归（review）：`_ensure_stopped` 此前无条件停止运行态，理由是"预检已
+        授权"——但两次检查之间存在时间窗口，实例可能在窗口里被启动；无 --force
+        的卸载绝不能因为"预检时它是停的"就越权停服务。
+        """
+        from frpsctl.core.lifecycle import State, StatusReport
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        real_status = Lifecycle.status
+        calls = {"n": 0}
+
+        def fake_status(self):
+            calls["n"] += 1
+            if calls["n"] == 1:  # 预检：停着
+                return real_status(self)
+            return StatusReport(  # 停止阶段复核：被启动了
+                instance=self.inst.name,
+                owner=Owner.DIRECT,
+                state=State.RUNNING,
+                pid=os.getpid(),
+            )
+
+        monkeypatch.setattr(Lifecycle, "status", fake_status)
+        with pytest.raises(OwnershipConflict, match="被启动"):
+            execute_uninstall(plan_uninstall(inst))
+        assert inst.dir.exists(), "中止之后数据必须完好"
+
+    def test_race_window_systemd_active_is_aborted_without_force(
+        self, inst, write_config, monkeypatch
+    ) -> None:
+        """同上，但窗口里出现的是 systemd active（另一种运行态）。"""
+        from frpsctl.core.lifecycle import State, StatusReport
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        write_config(BASIC_CONFIG)
+        real_status = Lifecycle.status
+        calls = {"n": 0}
+
+        def fake_status(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_status(self)
+            return StatusReport(
+                instance=self.inst.name,
+                owner=Owner.SYSTEMD,
+                state=State.SYSTEMD_ACTIVE,
+            )
+
+        monkeypatch.setattr(Lifecycle, "status", fake_status)
+        with pytest.raises(OwnershipConflict, match="systemd 托管"):
+            execute_uninstall(plan_uninstall(inst))
+        assert inst.dir.exists()

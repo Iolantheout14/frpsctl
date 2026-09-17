@@ -1681,3 +1681,57 @@ class TestGlobalOptionPlacement:
         assert "No such option" not in result.output
         status = runner.invoke(app, ["--json", "status"])
         assert json.loads(status.stdout)["state"] == "STOPPED"
+
+
+class TestUninstallCommand:
+    """`frpsctl uninstall`：确认门、`--json` 约束与安全拒绝（§21）。
+
+    破坏性命令的 CLI 契约有三条不可动摇：默认要确认、`--json` 不许隐式确认、
+    运行中的实例必须拒绝（退出码 11——脚本据此区分"没动"与"卸了"）。
+    """
+
+    def test_json_without_yes_is_usage_error(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        init = runner.invoke(app, ["init", "--no-input", "--bind-port", "17001", "--dashboard-port", "0"])
+        assert init.exit_code == 0, init.output
+        result = runner.invoke(app, ["uninstall", "--json"])
+        assert result.exit_code == 2, result.output
+        assert "--yes" in result.output
+
+    def test_cancel_leaves_everything(self, cli_env, monkeypatch) -> None:
+        import io as _io
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--bind-port", "17002", "--dashboard-port", "0"])
+        monkeypatch.setattr("sys.stdin", _io.StringIO("n\n"))
+        result = runner.invoke(app, ["uninstall"])
+        assert result.exit_code == 0, result.output
+        assert "已取消" in result.output
+        assert (cli_env / "instances" / "default" / "frps.toml").exists()
+        assert (cli_env / "data" / "bin" / "frps").exists()
+
+    def test_yes_uninstalls_instance_and_bin(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--bind-port", "17003", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["uninstall", "--yes"])
+        assert result.exit_code == 0, result.output
+        assert "已删除" in result.output
+        assert not (cli_env / "instances" / "default").exists()
+        assert not (cli_env / "data" / "bin").exists()
+
+    def test_running_instance_is_refused_with_11(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--bind-port", "17004", "--dashboard-port", "0"])
+        start = runner.invoke(app, ["start", "--health-timeout", "3"])
+        assert start.exit_code == 0, start.output
+        try:
+            result = runner.invoke(app, ["uninstall", "--yes"])
+            assert result.exit_code == 11, result.output
+            assert "正在运行" in result.output
+        finally:
+            runner.invoke(app, ["stop"])
+
+    def test_all_with_nothing_is_a_clean_noop(self, cli_env) -> None:
+        """--all 且没有任何实例：清理残留二进制（或什么都不做），不报错。"""
+        result = runner.invoke(app, ["uninstall", "--all", "--yes"])
+        assert result.exit_code == 0, result.output

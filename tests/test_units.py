@@ -2612,3 +2612,66 @@ class TestSystemdOwnerDetection:
         assert any("--state=active" in call for call in calls), calls
         assert not any("is-active" in call for call in calls), "不需要逐个问 is-active"
         assert not any("show" in call for call in calls), "空列表时不该调用 show"
+
+
+class TestSystemdDisableOnly:
+    """`disable()`（只停用、不删共享模板）——多实例卸载依赖它。
+
+    `uninstall()` 会删 `frps@.service` 模板，而模板是所有实例共享的：多实例
+    机器上卸载一个实例只能 `disable --now`，删模板会连累其他实例。
+    """
+
+    @pytest.fixture
+    def systemd(self, inst, tmp_path):
+        from frpsctl.core.systemd import Systemd
+
+        return Systemd(inst, unit_dir=tmp_path / "systemd")
+
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    @pytest.fixture
+    def as_root(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    def test_disable_only_stops_instance_unit(self, systemd, recorded, as_root) -> None:
+        systemd.disable()
+        assert ["systemctl", "disable", "--now", systemd.unit_name] in recorded
+        assert all("daemon-reload" not in call for call in recorded), "disable 不应做 daemon-reload"
+
+    def test_is_enabled_reads_systemd_state(self, systemd, monkeypatch) -> None:
+        """`is_enabled()` 判定"本实例的 unit 是否开机自启"（不是看共享模板）。
+
+        systemctl 的返回被 mock 成三态：不存在 / enabled / disabled。
+        """
+        import subprocess as _sp
+
+        def fake_run(argv, **kwargs):
+            if argv[1:2] == ["cat"]:
+                exists = fake_run.exists
+                return _sp.CompletedProcess(argv, 0 if exists else 1, stdout="", stderr="")
+            if argv[1:2] == ["is-enabled"]:
+                return _sp.CompletedProcess(argv, 0, stdout=fake_run.state + "\n", stderr="")
+            return _sp.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(
+            "shutil.which", lambda name: "/usr/bin/systemctl" if name == "systemctl" else None
+        )
+        unit_dir = systemd.unit_dir
+        unit_dir.mkdir(parents=True, exist_ok=True)
+
+        fake_run.exists, fake_run.state = False, "enabled"
+        assert systemd.is_enabled() is False, "unit 不存在时必须是 False"
+        fake_run.exists, fake_run.state = True, "enabled"
+        assert systemd.is_enabled() is True
+        fake_run.exists, fake_run.state = True, "disabled"
+        assert systemd.is_enabled() is False

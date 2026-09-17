@@ -58,7 +58,12 @@ class TestReadmeConsistency:
         assert not unknown, f"README 引用了不存在的命令：{sorted(unknown)}"
 
     def test_env_vars_match_both_ways(self) -> None:
-        """README 环境变量表 vs 代码里的 `FRPSCTL_*` 读取——双向一致。"""
+        """README 环境变量表 vs 实际读取点——双向一致。
+
+        读取点不止 Python：`install.sh` 也读 `FRPSCTL_INSTALL_REF / _URL`
+        （在线安装的版本固定与镜像），必须一并纳入，否则文档如实写它们会被
+        守卫误判成"幽灵环境变量"（v0.2.5 实测）。
+        """
         code: set[str] = set()
         for path in (ROOT / "src").rglob("*.py"):
             code |= set(
@@ -66,6 +71,7 @@ class TestReadmeConsistency:
                     r'os\.environ(?:\.get)?\(?"?(FRPSCTL_[A-Z_]+)', path.read_text("utf-8")
                 )
             )
+        code |= set(re.findall(r"(FRPSCTL_[A-Z_]+)", (ROOT / "install.sh").read_text("utf-8")))
         documented = set(re.findall(r"\| `(FRPSCTL_[A-Z_]+)`", README.read_text("utf-8")))
         assert not (code - documented), f"README 环境变量表缺：{sorted(code - documented)}"
         assert not (documented - code), f"README 有幽灵环境变量：{sorted(documented - code)}"
