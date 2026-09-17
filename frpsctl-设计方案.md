@@ -2476,13 +2476,17 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/login` `/api/logout` | 口令登录（下发会话 Cookie + CSRF）/ 登出；**login 是唯一免认证入口** |
-| GET | `/api/status` | 进程状态 + 三层健康 + dashboard 统计（统计不可得为 null） |
-| GET | `/api/clients` `/api/proxies` `/api/traffic` | v2 数据（自动翻页；traffic 为 7 天日粒度） |
+| GET | `/api/session` | 会话状态：归还 CSRF（刷新页面后内存丢失 → 用它恢复，否则所有变更都 403） |
+| GET | `/api/status` | 进程状态 + 三层健康（含 L3 告警文本）+ dashboard 统计（统计不可得为 null） |
+| GET | `/api/clients` `/api/proxies` `/api/traffic` | v2 数据（自动翻页；traffic 为 7 天日粒度，超 50 个代理时带 `truncated` / `total`） |
 | GET | `/api/config` | 配置树（**打码值 + masked 标记**，原文永不下发） |
+| GET | `/api/config/history` | 快照列表（只读 meta.json，**不读快照里的配置原文**） |
+| GET | `/api/config/history/{steps}/diff` | 某快照 vs 当前配置的**打码 diff**（回滚前的"看差异"；与 `config diff --steps` 同一实现） |
 | GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`） |
-| POST | `/api/config/preview` | 多键变更 → 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
-| POST | `/api/config/apply` | 按 `preview_id` 应用；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
-| POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口 |
+| GET | `/favicon.ico` | 204（页面内嵌 data URI 图标；这条是给旧工具收尾的） |
+| POST | `/api/config/preview` | 多键变更（`changes`）+ 删除键（`unsets`）→ 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
+| POST | `/api/config/apply` | 按 `preview_id` 应用（含删除）；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
+| POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口（数值参数做范围校验，越界/布尔一律 400） |
 
 错误映射：`FrpsctlError.exit_code` → HTTP（用法/配置 400、未运行/冲突 409、
 权限 403、dashboard 不可达/健康未过 502）——响应只含 `message` 与 `hint`，
@@ -2500,9 +2504,11 @@ frp 的教训（user/password 双空 = 完全不鉴权，§3.3）是本项目全
 | 会话劫持 | 256 位随机 token；Cookie `HttpOnly` + `SameSite=Strict`；TTL 8h（内存态） |
 | CSRF | 一切变更请求要求 `X-CSRF-Token`（登录下发，仅存浏览器内存） |
 | 口令爆破 | 来源级失败限速（60s/5 次）；冷却与错口令**响应完全一致** |
+| 反代部署下的爆破误伤 | `--trusted-proxy`（默认**关**）：开启后按 `X-Forwarded-For` **最后一跳**限速；不开启时该头完全不被读取——伪造它既不能绕开限速、也不能制造新来源 |
 | 时序侧信道 | `hmac.compare_digest` |
+| 内存放大（失败来源 / 会话表） | 两张输入驱动的表都**有上限**：失败来源 1024（驱逐最早失败者）、会话 32（驱逐最早到期者） |
 | 配置泄露 | 界面/API 只出打码值；欲看明文用 CLI `--reveal` |
-| 前端供应链 | 单文件、零外部资源；CSP `default-src 'none'` + `connect-src 'self'` |
+| 前端供应链 | 单文件、零外部资源；CSP `default-src 'none'` + `connect-src 'self'`；`tests/test_web_frontend.py` 静态守卫（禁 innerHTML 家族、禁外部引用、JS 语法 `node --check`） |
 
 ### 18.4 systemd 托管
 
@@ -2536,6 +2542,9 @@ Web 端到端测试（真 frps + frpc）第一次调用"下线代理"就暴露�
 | HTTPS | 不做：默认回环明文即可；远程访问建议反向代理终结 TLS（文档已说明） |
 | 配置的"全文编辑器" | 不做：表单式逐键编辑 + 预览 diff 更安全（原文不回传浏览器） |
 | 强制下线在线代理 | 做不到：frp 没有该 API（§18.6）；停掉对端 frpc 是唯一途径 |
+| 前端行为测试（DOM 级） | 不做**测试框架**：引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产。语法与静态纪律由 `tests/test_web_frontend.py` 守卫（`node --check` + 禁 innerHTML/外部资源 + CSS 变量对齐），行为正确性由 HTTP 层全路由测试 + 真机冒烟覆盖；已知残余风险是"UI 逻辑分支只有人工点得到" |
+| CSP 去 `'unsafe-inline'`（nonce 化） | 暂不做：单文件内联脚本需要服务端渲染时注入 nonce，收益是纵深防御（当前无任何注入点），成本是前端从"静态文件直发"变成"每请求改写"。已记账，等有真实动机再动 |
+| 配置表单的结构化数组编辑器 | 暂不做：`allowPorts` 这类数组目前按 JSON 文本编辑（有 `parse_scalar` 兜底与预览 diff 兜底）；等实际使用中确认痛点再设计 |
 
 ### 18.8 发布前回归 review（第八轮）
 
@@ -2666,6 +2675,93 @@ JS 经 `node --check` 语法验证通过。
 验收中顺手强化两处守卫：CI 的 Web 冒烟断言升级为"history 必须能读到真实快照"
 （空列表不再能骗过它）；release.yml 的产物自检集合加入 `core/diagnostics.py`
 与 `web/static/index.html`（丢前端 = 页面 500 而 CLI 测试全绿）。
+
+---
+
+## 20. 第七轮全量迭代（v0.2.4：Web 体验与前端守卫）
+
+本轮聚焦 Web 管理台的优化与增强、易用性、可用性、美观性。方法仍是**完整通读
+全部源码、测试与文档（无截断）后逐条核对**——这一轮暴露出一个此前从未被
+正视的断层：
+
+> **后端能力已经齐了，前端没有把它们全部用出来；而前端本身在 CI 里几乎零防护。**
+
+证据都在代码里（不是推测）：`index.html` 的 `logScroll` 恒为 true（日志永远
+自动滚底）、API 已下发打码值而前端丢弃、`state_corrupted` / `version_hint` /
+`plugin_warning` 三个后端字段前端从未使用、traffic 超 50 代理静默截断（CLI
+会告警）、`history` 接口长期不进 §18.2 API 表；而全部测试与冒烟只走 HTTP——
+**一处 JS 语法错误会让整站白屏而 CI 全绿**。
+
+### 20.1 修复（5 条，含一条测试盲区）
+
+| # | 问题 | 根因 | 根治方式 |
+|---|------|------|---------|
+| 1 | 前端无任何自动化保护 | 测试与冒烟都只走 HTTP，从不执行 JS | `tests/test_web_frontend.py`：逐 `<script>` 块 `node --check` + 静态纪律守卫（禁 innerHTML 家族 / 禁外部资源 / CSS 变量双向对齐 / 亮色主题覆盖检查） |
+| 2 | 配置页切换视图丢草稿 | 每次切回都 `loadConfig()` 清空 dirty | `configLoaded` 标志：已加载不重载；"重新加载（丢弃修改）"是显式动作且二次确认 |
+| 3 | 日志永远自动滚底 | `logScroll` 定义后从未被改写，条件恒真 | 真实滚动监听维护"跟随/暂停"状态并显示在标题栏；滚到底部自动恢复 |
+| 4 | 清理离线记录后不刷新 | `pruneOffline` 成功路径没有后续刷新 | 成功后 `refreshLists()` |
+| 5 | 会话表无上限 | 惰性清理只处理过期；持有口令者可反复登录 | `MAX_SESSIONS = 32`，驱逐最早到期者（与失败来源表同一护栏纪律） |
+
+### 20.2 新增（把后端已有能力交付到界面）
+
+| 能力 | 落点 |
+|------|------|
+| 回滚前"查看差异" | `snapshot_diff` 下沉 core（CLI `config diff` 与 `GET /api/config/history/{steps}/diff` 唯一实现）；历史表逐行"查看差异"，回滚从盲操作变为可预览 |
+| Web 删除键 | `plan_change_many` + `apply_sets(unsets=…)`：改与删合成**一次事务**（一份快照、一次重启）；同键冲突是用法错误 |
+| Web 新增键 | 配置表单底部添加任意键（预览/校验/危险组合拦截与 CLI 同一套）——此前新增必须回 CLI |
+| 单代理流量曲线 | 点击代理行展开该代理 7 天曲线（数据与 CLI `traffic <name>` 同源） |
+| 操作进行中状态 | start/stop/restart/回滚/应用期间按钮禁用 + 状态徽章"操作中…"；in-flight 守卫防轮询叠加（start 最长 10 秒，此前零反馈） |
+| 状态面板补齐 | 损坏横幅（含处置指引）、版本告警、L3 插件告警（`plugin_warning` 此前未下发）、systemd 行、流量截断提示 |
+| 双主题 | `prefers-color-scheme` 自动 + 手动切换（localStorage）；未手动选择时跟随系统实时变化；图表颜色改由 CSS 变量控制 |
+| 界面打磨 | diff 语法高亮、图表 hover 数值与合计、实时速率文本、表格数字右对齐、状态 tag、错误 toast 常驻、内嵌 favicon（`/favicon.ico` → 204）、窄屏菜单折叠 |
+
+### 20.3 工程
+
+- 设计文档 §18.2 补上 `/api/session`、`/api/config/history`、
+  `/api/config/history/{steps}/diff`（长期 drift），并新增
+  `tests/test_docs.py::TestApiDocConsistency`——**API 表 ↔ 路由双向核对**，
+  与命令表守卫同一条纪律；
+- 快照动作文案 `set many:` → `edit many:`（混合变更语义更准确，快照记账同步）；
+- §18.7 边界新增三项明确记账：不做 DOM 级前端测试框架（残余风险如实标注）、
+  CSP nonce 化暂缓的理由、结构化数组编辑器暂缓的理由。
+
+### 20.4 统计与边界（明确记账）
+
+统计：修复 **7 条**（实施期 5 条 + 发布前 review 2 条）、新增 8 项能力、
+新增 **35 条**测试（510 → 545；非契约 515），覆盖率 85%，前端单文件
+650 → 984 行。
+
+| 项 | 说明 |
+|----|------|
+| UI 逻辑分支的人工覆盖 | 语法/纪律已自动化，但"点击某按钮后 DOM 变化"仍只有人工点得到——不引入 jsdom 是刻意的（见 §18.7） |
+| `allowPorts` 等数组仍按 JSON 文本编辑 | `parse_scalar` 与预览 diff 兜底；结构化编辑器等真实痛点 |
+| 前端单文件会继续变大（本轮 650 → 984 行） | 拆分需要构建链，与"零外部资源"冲突；在行数带来实际维护痛点前不拆 |
+
+### 20.5 发布前回归 review
+
+方法同历次（§17.10 / §17.11 / §19.4）：**全部 diff 逐行审查 + 对抗性实测 +
+测试基建复查**。对抗面集中在两处新代码——core 的混合变更入口与 984 行的
+单文件前端。
+
+发现并修复 **2 条真实缺陷**：
+
+| # | 问题 | 复现 | 修复 |
+|---|------|------|------|
+| 1 | `plan_change_many` 把字符串当列表**逐字符迭代**：`unsets="ab"` 静默删掉 `a` 与 `b` 两个键（与 `policy._strict_list` 同型的经典陷阱）；`changes="bindPort"` 则在解包处抛裸 `ValueError` | 对抗性实测复现（"删掉的键: ('a','b')"） | 输入归一化单点化到 `plan_change_many`（`_normalize_pairs` / `_normalize_keys`）：字符串 / 字典 / 生成器一律用法错误；`apply_sets` 改为直接透传原始参数——"字符串当列表"没有第二个藏身处 |
+| 2 | `snapshot_diff` / `rollback_to` 的 `steps < 1` 被 `max(0, steps-1)` **静默归一**成"一步"——参数笔误变成另一个动作（v0.2.3 修过 CLI 侧，core 侧一直敞着） | 代码审查 + 边界实测 | 两个 core 入口都加 `steps >= 1` 防御（与 CLI 的 `min=1` 同一条纪律），各自新增回归用例 |
+
+另有三条**加固**（非缺陷，但成本极低而静默失败风险真实）：
+
+- **JS id 交叉守卫**进 `test_web_frontend.py`：`$("id")` 引用 ↔ HTML 定义
+  **双向核对**（当前 47/47 完全一致）——`node --check` 抓不到"id 拼错 =
+  运行时 null = 白屏"，这条守卫把该盲区关掉；
+- **柱状图柱宽 clamp**（`Math.max(1.5, …)`）：点数异常变多时负宽度会静默不渲染；
+- **前端脚本真实执行烟测**（一次性，node + 最小 DOM stub）：主脚本顶层与
+  boot 异步路径完整执行无异常、`humanBytes` / `humanDuration` 的 7 组取值
+  逐一对齐——覆盖语法检查抓不到的未定义变量 / TDZ 类错误。
+
+残余风险如实记账：DOM 级行为（点击后的界面变化）仍只能人工验证（§18.7 的
+不做项），而 id 缺失这类"用户可见的白屏风险"已被自动化覆盖。
 
 ---
 
