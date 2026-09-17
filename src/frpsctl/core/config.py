@@ -37,6 +37,7 @@ from ..errors import (
     TemplateSyntaxRejected,
     UsageError,
 )
+from .diagnostics import trace
 
 __all__ = [
     "ChangePlan",
@@ -52,6 +53,8 @@ __all__ = [
     "flatten_tree",
     "plan_set",
     "plan_set_many",
+    "plan_unset",
+    "parse_scalar",
     "reject_template_syntax",
     "validate_text",
     "mask_tree",
@@ -136,9 +139,7 @@ def mask_tree(value: Any, *, prefix: str = "", reveal: bool = False) -> Any:
     if isinstance(value, list):
         return [mask_tree(item, prefix=prefix, reveal=reveal) for item in value]
     if not reveal and prefix and is_secret_key(prefix):
-        from ..cli.ui import mask_secret
-
-        return mask_secret(value)
+        return mask_value(value)
     return value
 
 
@@ -261,10 +262,8 @@ def _mask_fragment(text: str, prefix: str) -> str:
 
 
 def _mask_scalar(raw: str) -> str:
-    """打码一个标量值的文本形态（保留首尾便于核对，见 `mask_secret`）。"""
-    from ..cli.ui import mask_secret
-
-    return mask_secret(raw.strip().strip('"'))
+    """打码一个标量值的文本形态（保留首尾便于核对，见 `mask_value`）。"""
+    return mask_value(raw.strip().strip('"'))
 
 
 def _mask_assignment_value(raw: str) -> str:
@@ -515,6 +514,10 @@ def parse_scalar(raw: str) -> Any:
 
     只做**保守**转换：bool / int / float / 内联数组 / 内联表 / 字符串。
     不做通配求值，也不接受裸的中文标点——写错就报错（ADR-7）。
+
+    裸文本（不匹配以上任何形态）按**去首尾空白后的字符串**处理：TOML 里
+    未经引号包裹的值不允许首尾空白，而 CLI 参数/管道输入意外夹带空格的
+    可能性远高于"有意的首尾空格字符串"；要保留空格请显式写 `'" x "'`。
     """
     text = raw.strip()
     lowered = text.lower()
@@ -537,7 +540,7 @@ def parse_scalar(raw: str) -> Any:
         return float(text)
     except ValueError:
         pass
-    return raw
+    return text
 
 
 @dataclass(frozen=True)
@@ -643,6 +646,37 @@ def plan_set_many(path: Path, changes: Any) -> MultiChangePlan:
         after=after,
         text=text,
         diff=diff_texts(original, text, path.name),
+    )
+
+
+def plan_unset(path: Path, dotted: str) -> ChangePlan:
+    """删除单个键的内存补丁（`config unset`），不落盘。
+
+    语义 = "让这个键回落到 frp 的默认值"。只删目标键：同表的其他键、注释与
+    排版原样保留；表被删空时留下合法的空表头。
+
+    键不存在时抛 `ConfigKeyMissing`（配置错误 3）**而不是静默 noop**：拼错键名
+    却拿到"删除成功"，会让人以为清掉了某个设置，而它从未存在——与 `config get`
+    对不存在的键报错同一条原则（ADR-7：不猜测）。
+    """
+    doc = load_config(path)
+    parts = _validate_dotted(dotted)
+    node: Any = doc
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            raise ConfigKeyMissing(dotted)
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        raise ConfigKeyMissing(dotted)
+    before = node[parts[-1]]
+    del node[parts[-1]]
+    text = tomlkit.dumps(doc)
+    return ChangePlan(
+        dotted=dotted,
+        before=before,
+        after=None,
+        text=text,
+        diff=diff_texts(path.read_text("utf-8"), text, path.name),
     )
 
 
@@ -758,8 +792,6 @@ def validate_text(
                 "-c",
                 str(candidate),
             ]
-            from ..cli.ui import trace
-
             trace(f"执行权威校验：{' '.join(argv)}")
             proc = subprocess.run(
                 argv,

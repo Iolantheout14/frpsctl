@@ -46,7 +46,15 @@ from .instance import Instance
 from .lifecycle import Lifecycle, State
 from .lock import instance_lock
 
-__all__ = ["ChangeOutcome", "apply_set", "apply_sets", "apply_edit", "rollback_to", "config_snapshot"]
+__all__ = [
+    "ChangeOutcome",
+    "apply_set",
+    "apply_sets",
+    "apply_unset",
+    "apply_edit",
+    "rollback_to",
+    "config_snapshot",
+]
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,9 @@ class ChangeOutcome:
 
     `noop=True` 表示候选值与现值相同（`config set` 的幂等语义、`config edit`
     的无改动早退）：没有任何字节被写入，CLI 应据此渲染"无需变更"而不是 diff。
+
+    `dry_run=True` 表示只做了校验与 diff 生成（`config set --dry-run`）：
+    同样零落盘、零快照；`applied` 恒为 False。
     """
 
     dotted: str
@@ -68,6 +79,7 @@ class ChangeOutcome:
     plugin_warning: str | None = None
     note: str = ""
     noop: bool = False
+    dry_run: bool = False
 
 
 def config_snapshot(inst: Instance, *, action: str, detail: str = "") -> Path:
@@ -111,6 +123,7 @@ def apply_set(
     restart: bool = True,
     health_timeout: float = 10.0,
     restore_lifecycle: Lifecycle | None = None,
+    dry_run: bool = False,
 ) -> ChangeOutcome:
     """`config set` 的唯一入口：候选生成（plan）与落盘在**同一把实例锁**内。
 
@@ -118,6 +131,9 @@ def apply_set(
     两个并发变更会互相覆盖（后写入者的完整文本覆盖前者的改动），且两边都报
     成功。`noop`（现值等于目标值）同样在锁内判定，避免"判定时无变更、落盘时
     已有变更"的竞态。
+
+    `dry_run=True` 时走完全相同的校验（语义 + `frps verify` + 危险组合），
+    但不写文件、不产生快照、不重启——用于"改之前先看一眼"。
     """
     with instance_lock(inst.lock):
         plan = cfg.plan_set(inst.config, dotted, raw)
@@ -132,6 +148,16 @@ def apply_set(
                 rolled_back=False,
                 noop=True,
             )
+        if dry_run:
+            return _dry_run_check(
+                inst,
+                lifecycle=lifecycle,
+                dotted=dotted,
+                new_text=plan.text,
+                diff=plan.diff,
+                before=plan.before,
+                after=plan.after,
+            )
         return _apply_locked(
             inst,
             dotted=dotted,
@@ -143,6 +169,50 @@ def apply_set(
             restart=restart,
             health_timeout=health_timeout,
             restore_lifecycle=restore_lifecycle,
+        )
+
+
+def apply_unset(
+    inst: Instance,
+    *,
+    dotted: str,
+    lifecycle: Lifecycle,
+    restart: bool = True,
+    health_timeout: float = 10.0,
+    restore_lifecycle: Lifecycle | None = None,
+    dry_run: bool = False,
+) -> ChangeOutcome:
+    """`config unset` 的唯一入口：与 `apply_set` 同一套锁边界与落盘闭环。
+
+    删除同样是"读-改-写"，因此候选生成（`plan_unset`）必须在锁内；落盘后走
+    完全相同的校验 → 备份 → 替换 → 重启 → 失败回滚。危险组合检查自动覆盖
+    （例如删掉 `webServer.password` 后"非回环 + 无凭据"会被拒绝）。
+    """
+    with instance_lock(inst.lock):
+        plan = cfg.plan_unset(inst.config, dotted)
+        if dry_run:
+            return _dry_run_check(
+                inst,
+                lifecycle=lifecycle,
+                dotted=dotted,
+                new_text=plan.text,
+                diff=plan.diff,
+                before=plan.before,
+                after=None,
+            )
+        return _apply_locked(
+            inst,
+            dotted=dotted,
+            new_text=plan.text,
+            change_diff=plan.diff,
+            before=plan.before,
+            after=None,
+            lifecycle=lifecycle,
+            restart=restart,
+            health_timeout=health_timeout,
+            restore_lifecycle=restore_lifecycle,
+            snapshot_action=f"unset {dotted}",
+            snapshot_detail=plan.diff[:2000],
         )
 
 
@@ -207,6 +277,7 @@ def apply_sets(
     health_timeout: float = 10.0,
     restore_lifecycle: Lifecycle | None = None,
     expected_current: str | None = None,
+    dry_run: bool = False,
 ) -> ChangeOutcome:
     """**多键**变更（`frpsctl web` 的配置表单）：锁内合并补丁 + 一次闭环。
 
@@ -237,6 +308,16 @@ def apply_sets(
                 restarted=False,
                 rolled_back=False,
                 noop=True,
+            )
+        if dry_run:
+            return _dry_run_check(
+                inst,
+                lifecycle=lifecycle,
+                dotted=dotted_label,
+                new_text=plan.text,
+                diff=plan.diff,
+                before=plan.before,
+                after=plan.after,
             )
         return _apply_locked(
             inst,
@@ -316,6 +397,46 @@ def rollback_to(
 # ---------------------------------------------------------------------------
 # 落盘闭环（只接受已生成的候选文本）
 # ---------------------------------------------------------------------------
+
+
+def _dry_run_check(
+    inst: Instance,
+    *,
+    lifecycle: Lifecycle,
+    dotted: str,
+    new_text: str,
+    diff: str,
+    before: object,
+    after: object,
+) -> ChangeOutcome:
+    """dry-run：跑完全部真实校验，但**零落盘、零快照、零重启**。
+
+    校验集合与落盘路径完全一致（版本门槛 → 语义 → `frps verify` → 危险组合），
+    否则用户会带着"dry-run 通过"的错觉去掉 `--dry-run`，然后在真实执行时撞上
+    一个 dry-run 没做过的检查。
+
+    与 `--no-restart` 的区别：那个是"写了但不生效"（文件已变），这个是什么都不写。
+    """
+    lifecycle.binary_version()  # 版本门槛（不达标即抛，退出码 4）
+    binary = lifecycle.binary()
+    cfg.validate_text(
+        new_text,
+        binary=binary,
+        workdir=inst.dir,
+        uses_unsafe=cfg.needs_unsafe_flag(new_text),
+    )
+    _reject_dangerous_combination(new_text)
+    return ChangeOutcome(
+        dotted=dotted,
+        before=before,
+        after=after,
+        diff=diff,
+        applied=False,
+        restarted=False,
+        rolled_back=False,
+        dry_run=True,
+        note="dry-run：校验通过，未写入（去掉 --dry-run 后执行才会生效）",
+    )
 
 
 def _apply_locked(
