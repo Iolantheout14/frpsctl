@@ -70,10 +70,19 @@
 
 ```
 frpsctl                          命令行程序（pip/pipx 安装）
-├── 主命令集                      init / start / stop / restart / status / log
-├── 配置子命令                    config get|set|edit|diff|rollback
-├── 运维子命令                    install / service / doctor / kick
-└── 可选：插件服务                独立进程，多用户鉴权与端口白名单（§11）
+├── 二进制与配置                  install / init / verify
+├── 生命周期                      start / stop / restart / status / log
+├── 配置子命令                    config get|set|unset|edit|list|diff|rollback
+│                                 （set 支持 --dry-run / --stdin / --prompt）
+├── 观测与运维                    clients / proxies / traffic / instances / doctor / prune
+├── systemd 集成                  service install|uninstall|status|logs
+├── 服务端插件                    plugin init|check|serve
+│                                 plugin user set|remove|list（策略结构化编辑）
+│                                 plugin service install|uninstall|status
+└── Web 管理台                    web serve / web service install|uninstall|status
+                                  web password show
+
+可选：插件服务与 Web 管理台都是独立进程，由各自的 systemd unit 守护。
 ```
 
 外部依赖只有四个纯 Python 包（`typer` / `pydantic` / `tomlkit` / `httpx`），其余全部走标准库。
@@ -388,21 +397,32 @@ resolve_owner(instance):
 │ frpsctl (Python 3.11+)                                            │
 │                                                                   │
 │  cli/            Typer 命令层（薄：只做参数解析与输出渲染）          │
-│   ├─ lifecycle_cmd.py   init / start / stop / restart / status / log
-│   ├─ config_cmd.py      config get|set|edit|diff|rollback         │
-│   ├─ service_cmd.py     install / service / kick                  │
-│   └─ doctor_cmd.py      doctor                                    │
+│   ├─ __init__.py   全部命令（按 install/init、config、plugin、     │
+│   │                web、观测类命令分组；实现即文档 §7.2 的命令表）  │
+│   ├─ context.py    全局选项 → AppContext、异常 → 退出码映射        │
+│   └─ ui.py         人读/JSON 渲染（--verbose 委托 core.diagnostics）│
+│                                                                   │
+│  web/            浏览器界面（与 cli/ 平级的又一个前端，§18）       │
+│   ├─ server.py     ThreadingHTTPServer：路由/安全头/CSRF           │
+│   ├─ api.py        JSON API（只调 core）+ 错误 → HTTP 映射         │
+│   ├─ auth.py       会话 / CSRF / 失败限速                          │
+│   └─ static/index.html   单文件前端（零外部资源）                  │
+│                                                                   │
+│  plugin/         服务端插件（§11）：协议解析 / 裁决 / 配额 / 审计   │
 │                                                                   │
 │  core/                                                            │
 │   ├─ instance.py   实例布局与全局选项（--instance / --root）        │
 │   ├─ platform.py   pid_alive / proc_start_time / proc_cmdline      │
-│   ├─ lock.py       flock 实例级互斥                                │
+│   ├─ lock.py       flock 实例级互斥（同线程可重入）                 │
 │   ├─ lifecycle.py  所有权探测 + 状态机 + 启动早退检测               │
 │   ├─ config.py     tomlkit 无损补丁 + 原子写 + 备份历史             │
+│   ├─ transaction.py 变更事务（锁内读-改-写、CAS、自动回滚）         │
 │   ├─ admin.py      Admin API 客户端（只走 v2，§ADR-3）             │
 │   ├─ release.py    二进制下载 + sha256 强校验                      │
-│   ├─ systemd.py    unit 渲染与 systemctl 委托                      │
-│   └─ doctor.py     体检与安全 lint                                 │
+│   ├─ systemd.py    unit 渲染与 systemctl 委托（frps/插件/web）      │
+│   ├─ doctor.py     体检与安全 lint                                 │
+│   ├─ logs.py       日志路径解析与 tail（CLI 与 web 共用）           │
+│   └─ diagnostics.py 进程级诊断开关（--verbose，core 不依赖 cli）    │
 │                                                                   │
 │  errors.py  统一异常 → 退出码映射（§7.3）                          │
 └──────────┬──────────────────────────────────┬─────────────────────┘
@@ -513,22 +533,37 @@ class Instance:
 
 | 命令 | 语义 | 关键行为 |
 |------|------|---------|
-| `frpsctl install [--version 0.71.0] [--force] [--only-download]` | 获取 frps 二进制 | 下载 → **强校验 sha256** → 落盘为 `frps-<version>` → `-v` 复验 → 换软链（§8.6.1）。`< 0.70.0` 直接拒绝 |
-| `frpsctl init` | 交互式生成配置 | 强制随机口令、`tls.force=true`、引导设置 `allowPorts`；已存在则要求 `--force` 并先备份 |
+| `frpsctl install [--version V] [--force] [--only-download] [--mirror U] [--with-frpc]` | 获取 frps 二进制 | 下载 → **强校验 sha256** → 落盘为 `frps-<version>` → `-v` 复验 → 换软链（§8.6.1）。`< 0.70.0` 直接拒绝 |
+| `frpsctl init [--no-input] [--force] [--bind-port P] [--dashboard-port P] [--allow-ports S]` | 交互式生成配置 | 强制随机口令、`tls.force=true`、引导设置 `allowPorts`；已存在则要求 `--force` 并先备份 |
 | `frpsctl verify [--file P]` | 双保险校验 | pydantic 语义校验 + `frps verify`；用临时副本，不动线上文件 |
-| `frpsctl start [--foreground]` | 启动 | verify → 加锁 → 派生进程 → **早退检测** → 写 state → 健康检查 |
-| `frpsctl stop [--force] [--timeout 10]` | 停止 | SIGTERM → 轮询确认退出 → 超时 SIGKILL；身份不符则拒绝 |
-| `frpsctl restart [--health-timeout 10] [--timeout 10]` | 重启 | stop → start → 健康检查。**没有 `--no-rollback`**：重启不读配置，也就没有"新旧版本"可比，自动回滚只属于配置变更路径（`config set` / `edit` / `rollback`） |
-| `frpsctl status [--watch]` | 状态聚合 | `owner / 状态 / pid / 版本 / 运行时长 / 客户端 / 各类型代理 / 今日流量 / 健康` |
-| `frpsctl config get <key>` | 读单键 | 点分路径，如 `transport.tls.force` |
-| `frpsctl config set <key> <value> [--no-restart]` | 写单键 | 走 §9 事务闭环 |
-| `frpsctl config edit` | `$EDITOR` 编辑 | 保存后走同一闭环 |
-| `frpsctl config diff` | 当前 vs 上一份快照 | unified diff |
-| `frpsctl config rollback [N]` | 回滚到 N 份之前 | 同样走闭环 |
-| `frpsctl log [-f] [-n 100]` | 看日志 | tail `log.to`；缺失时回退到 startup 日志 |
-| `frpsctl service install\|uninstall\|status` | systemd 集成 | 渲染 unit + `daemon-reload` + `enable`（需 root，明确提示） |
-| `frpsctl doctor [--json]` | 体检 | §8.7 检查项，按 severity 输出 |
-| `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；frp 不支持强制下线在线代理 |
+| `frpsctl start [--foreground] [--health-timeout S]` | 启动 | verify → 加锁 → 派生进程 → **早退检测** → 写 state → 健康检查 |
+| `frpsctl stop [--force] [--timeout S]` | 停止 | SIGTERM → 轮询确认退出 → 超时 SIGKILL；身份不符则拒绝 |
+| `frpsctl restart [--health-timeout S] [--timeout S]` | 重启 | stop → start → 健康检查。**没有 `--no-rollback`**：重启不读配置，也就没有"新旧版本"可比，自动回滚只属于配置变更路径 |
+| `frpsctl status [--watch] [--interval S]` | 状态聚合 | `owner / 状态 / pid / 版本 / 运行时长 / listen / dashboard / 健康 / 客户端 / 各类型代理 / 今日流量`；`--watch --json` 为 NDJSON |
+| `frpsctl log [-f] [-n N]` | 看日志 | 纯 Python tail `log.to`；缺失时回退到 startup 日志（轮转后自动重开） |
+| `frpsctl config get <key> [--reveal]` | 读单键 | 点分路径；敏感值默认打码（`--reveal` 显式取明文） |
+| `frpsctl config set <key> <value> [--no-restart] [--dry-run] [--stdin] [--prompt]` | 写单键 | 走 §9 事务闭环；`--dry-run` 只校验并展示 diff；`--stdin`/`--prompt` 让敏感值不进 argv；`--health-timeout S` |
+| `frpsctl config unset <key> [--no-restart] [--dry-run]` | 删键回落默认 | 与 set 同一闭环；键不存在报配置错误(3) |
+| `frpsctl config list [--prefix P] [--tree]` | 列出全部键 | 值自动打码；`--tree` 按表分组缩进 |
+| `frpsctl config edit [--yes]` | `$EDITOR` 编辑 | 保存后走同一闭环（锁内 CAS：编辑期间被并发修改则拒绝草稿） |
+| `frpsctl config diff [--steps N]` | 当前 vs 第 N 新快照 | unified diff（打码） |
+| `frpsctl config rollback [N]` | 回滚到 N 份之前 | 同样走闭环；`N ≥ 1` |
+| `frpsctl service install\|uninstall\|status` | frps 的 systemd 集成 | 渲染 `frps@.service` + `daemon-reload` + `enable`（需 root；安装前四项部署体检） |
+| `frpsctl service logs [-f] [-n N]` | journald 集成 | unit 级日志（启动失败 / OOM / 权限拒绝），与 `log` 互补 |
+| `frpsctl doctor [--json]` | 体检 | §8.7 检查项（含 Web 口令文件权限），按 severity 输出；有 ERROR 时退出码 1 |
+| `frpsctl clients [--json]` | 在线客户端列表 | v2 `/api/v2/clients`，**自动翻页取全量** |
+| `frpsctl proxies [--type T] [--json]` | 代理列表 | v2 `/api/v2/proxies`（嵌套 `spec/status` 形状），自动翻页 |
+| `frpsctl traffic [name] [--json]` | 近 7 天流量历史 | 无参 = 全部代理逐日汇总；单代理失败记空不拖垮整体（离线 = 404 无数据） |
+| `frpsctl instances [--health] [--json]` | 多实例一行式概览 | 默认只读本地状态；`--health` 额外做三层探测 |
+| `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；**不存在**强制下线在线代理的 API（§18.6） |
+| `frpsctl plugin init [--force]` | 生成策略模板 | fail-closed 默认；0600 原子写 |
+| `frpsctl plugin check [--bind B]` | 离线校验策略 | 载入 + 回环校验 + 典型裁决试算 |
+| `frpsctl plugin serve [--bind B] [--path P]` | 插件服务（前台） | 只允许绑回环；SIGTERM 优雅退出并刷审计；生产用 `plugin service install` 守护 |
+| `frpsctl plugin user set\|remove\|list` | 策略用户的结构化编辑 | 只改显式给出的字段；写入前同 `plugin check` 判据复验；未知键保留 |
+| `frpsctl plugin service install\|uninstall\|status` | 插件的 systemd 集成 | `Restart=always`（登录单点）+ 四项体检 |
+| `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速 |
+| `frpsctl web service install\|uninstall\|status` | 管理台的 systemd 集成 | 0600 口令文件（明文不进 unit）+ 四项体检；`--trusted-proxy` 可写入 unit |
+| `frpsctl web password show [--json]` | 读回管理台口令 | 显式索取明文；权限过宽时向 stderr 告警 |
 
 ### 7.3 退出码
 
@@ -2554,6 +2589,83 @@ JS 经 `node --check` 语法验证通过。
 - **契约补充**：C10 锁定 v2 traffic 端点的"无数据 = 404"语义（Web 前端容错的
   前提），0.70.0 上同样成立；`AdminClient.proxy_traffic` 的解析与名称转义补单测；
 - 交叉核对：命令（39 条路径）/ 环境变量 / 退出码三向一致，无幽灵命令。
+
+---
+
+## 19. 第六轮全量迭代（v0.2.3：边界根治与六项新能力）
+
+本轮以"全量通读 + 疑点实测"的方式复核全部源码、测试与两篇文档，聚焦便捷性、
+易用性、稳定性、可靠性、功能性五轴。统计：修复 **5 条**真实缺陷（含 1 条可
+造成不可逆动作），新增 **6 项能力**、**75 条测试**（435 → 510），覆盖率
+82% → **85%**。
+
+### 19.1 修复（根因清单）
+
+| # | 问题 | 根因 | 根治方式 |
+|---|------|------|---------|
+| 1 | Web `stop` 负 timeout **立即 SIGKILL** | `_float` 宽松解析——CLI 侧 v0.2.0 已修，Web 是同一缺陷的镜像 | `_bounded_float` / `_bounded_int`：越界与非数值一律 400；回归断言"进程必须仍存活" |
+| 2 | systemd + 损坏 state.json 误报 STOPPED | 损坏分支在所有权探测**之前**直接返回 | 状态判定以 owner 为先（systemd 下 state.json 本不参与判定）；并收口"检查之后才损坏"的 TOCTOU |
+| 3 | 失败来源表无上限 + 反代误伤 | 来源固定为对端地址（反代下全部同源）；表只按窗口清理 | 1024 上限（驱逐最早失败者）+ `--trusted-proxy`（只信 XFF 最后一跳，默认关） |
+| 4 | `rollback -1` 静默归一成"回滚 1 步" | `max(0, steps-1)` 吞掉非法输入 | Click `min=1` → 用法错误(2) |
+| 5 | L2 失败详情被 L3 覆盖 | `detail` 单变量被后写的层覆盖 | 各层详情合并；L2 失败也渲染原因（控制面是恢复顺序上的第一层） |
+
+### 19.2 新增能力
+
+| 能力 | 动机 | 落点 |
+|------|------|------|
+| `config unset <key>` | 配置闭环缺"删除"（恢复默认只能手编） | `plan_unset` + `apply_unset`（同一锁与闭环） |
+| `config set --dry-run` | CLI 无预览；Web 已有两段式 | `_dry_run_check`：跑全量校验（含 verify 与危险组合），零落盘零快照 |
+| `--stdin` / `--prompt` | 敏感值进 argv = shell 历史 + `/proc/<pid>/cmdline` 泄露 | `_resolve_value_input`（三源互斥，空值拒绝） |
+| `traffic [name]` | `proxy_traffic` 早已实现却没有 CLI 出口 | 逐日汇总 / 单代理明细；404=无数据（C10 语义精确化到客户端层） |
+| `plugin user set/remove/list` | 策略是安全单点，手写 JSON 易错 | raw dict 编辑 + 同 `plugin check` 判据复验 + 未知键保留 |
+| `web password show` + 历史回滚 UI | 口令遗忘无出路；Web 只能回滚一步 | `GET /api/config/history`（只读 meta.json）+ 前端卡片按 steps 回滚 |
+
+### 19.3 工程
+
+- `tests/test_docs.py`：README 命令 / 环境变量 / 退出码 ↔ 代码 ↔ 设计文档
+  §7.2 的**双向一致性守卫**——把发布前的一次性核对变成 CI 常态；
+- `core/` 反向依赖 `cli/` 的 8 处全部清除（`core/diagnostics.py` 承接诊断开关，
+  打码统一 `config.mask_value`）；
+- 死代码清理（零调用即删）、CI 加入 Python 3.14、Web/插件监听 backlog 64。
+
+### 19.4 发布前回归 review
+
+方法：对本轮全部 diff 做逐行审查 + 对抗性实测（unset 的数组表 / 子表 / 内联表 /
+唯一键边界、traffic 以 mock dashboard 端到端对照 README 示例、布尔与空白参数、
+并发锁不变量），并复查测试质量、workflow YAML 与工作区残留。发现并修复
+**5 条**（2 条为真实缺陷），新增 **5 条**回归用例（505 → 510）：
+
+| # | 问题 | 性质 | 修复 |
+|---|------|------|------|
+| 1 | `{"timeout": true}` 被当作 1.0 秒静默接受 | 新代码内部不一致（`_bounded_int` 已排除 bool） | `_bounded_float` 显式排除 bool |
+| 2 | `plugin user set/remove` 的读-改-写无锁 | **真实缺陷**（两个并发调用互相覆盖，与第四轮 `config set` 并发丢失同形态） | 读写包进实例锁 + "锁内保存"不变量测试 |
+| 3 | `parse_scalar` 对裸文本返回未 strip 的原文 | 既有 quirk（TOML 裸值不允许首尾空白） | 返回 strip 后文本；`'" x "'` 引号形式仍可保留空格 |
+| 4 | 纯空白的位置参数绕过空值检查 | **真实缺陷**（配合 #3 会把空串写进配置） | 空检查改 `text.strip()` |
+| 5 | `--prompt` 无输入时抛裸 `EOFError` | 异常契约（映射成"未分类错误(1)"） | 收口为用法错误(2) 并提示改用 `--stdin` |
+
+其余为整理：死变量 `ui._MASK`、函数内 `import math`、`config.__all__` 补齐
+（`plan_unset` / `parse_scalar`）、`status()` 的三元表达式改显式 if。对抗性
+实测全部通过：unset 五类边界、traffic 端到端（人读输出与 README 示例逐字符
+一致）、sdist 干净安装、两份 workflow 的 YAML 解析、diff 调试残留扫描。
+
+### 19.5 发布前最终验收（v0.2.3）
+
+方法同 §17.12 / §18.9：**验证发布产物本身 + 复刻 CI 全套**。结论：**可发布**。
+
+| 项 | 结果 |
+|----|------|
+| wheel / sdist（`frpsctl-0.2.3`） | 干净安装通过；**47 条命令路径 help 失败 0**（全命令树遍历） |
+| wheel 自检（release.yml 的 required 集合，本轮强化） | `py.typed` / `diagnostics.py` / web 前端资源齐全（42 条目） |
+| tag 一致性 / 前端资源 | `v0.2.3` == `__version__`；静态页可读（26,987 字符） |
+| CI 复刻：ruff / 覆盖率门禁（80%） | 全绿 / 84.88% |
+| 全量（含契约 0.71 + 真 frpc 插件契约） | **510 passed / 0 skipped** |
+| CLI 冒烟（12 步，含 dry-run / unset / traffic） | 通过 |
+| Web 冒烟（含 history 的**真实快照**：set / unset 两条记录与 steps 语义） | 通过 |
+| 无二进制降级 / 0.70.0 下界矩阵 | 3 passed / 23 skipped / 26 passed |
+
+验收中顺手强化两处守卫：CI 的 Web 冒烟断言升级为"history 必须能读到真实快照"
+（空列表不再能骗过它）；release.yml 的产物自检集合加入 `core/diagnostics.py`
+与 `web/static/index.html`（丢前端 = 页面 500 而 CLI 测试全绿）。
 
 ---
 

@@ -3,6 +3,67 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3] - 2026-09-17
+
+全量通读后的根治性迭代：Web 参数边界、systemd 交叉状态、限速来源模型、分层
+倒置，以及六项新能力（config unset / traffic / plugin user / web password /
+配置历史回滚 / dry-run 与 stdin 输入通道）。
+
+### 修复
+
+- **Web 动作接口的负参数会立即 SIGKILL**：`/api/actions/stop` 的 `timeout` 走
+  宽松解析，`-1` 让等待循环一次都不执行、直接升级 SIGKILL——与 CLI 侧
+  `stop --timeout -1`（v0.2.0 修复）是同一缺陷的镜像。现在全部动作参数做范围
+  校验（越界 / 非数值 → 400），并有一条测试断言"进程必须仍存活"。
+- **`status` 在 systemd 托管 + 损坏 state.json 时误报 STOPPED**：损坏分支完全
+  不探测 unit，而 systemd 下 state.json 本就不参与判定（direct → systemd 迁移
+  的残留即可触发）。现在 systemd 实例照常报告；非 systemd 仍报"不可判定"。
+  同时给 status 的"永不异常"承诺补上 TOCTOU 收口（损坏检查与读取之间的竞态）。
+- **认证失败限速的来源模型**：来源表加上限（1024，防慢速内存放大）；反代部署
+  下所有请求同源、攻击者 5 次失败即可连带锁住管理员 → 新增
+  `web serve --trusted-proxy`（默认关；开启后按 `X-Forwarded-For` 最后一跳
+  限速，`web service install` 亦可写入 unit）。
+- **`config rollback -1` / `config diff --steps 0` 静默归一**：步数必须 ≥ 1
+  （用法错误 2），参数笔误不再变成另一个动作。
+- 健康 detail 在 L2 与 L3 同时失败时只显示 L3 的信息 → 现在汇总两层，且
+  L2 失败时也会渲染失败原因（控制面是恢复顺序上的第一层）。
+- 发布前回归 review 追加修复：Web 动作参数的**布尔值**（`{"timeout": true}`
+  曾被当作 1.0 秒静默接受）；`plugin user set/remove` 的读-改-写**没有锁**
+  （两个并发调用互相覆盖——与第四轮 `config set` 并发丢失同形态，现与 config
+  写共用实例锁）；**首尾空白**（`parse_scalar` 此前保留未 strip 的原文，现按
+  TOML 裸值语义去空白；纯空白的值一律拒绝）；`--prompt` 在无输入时抛裸
+  `EOFError`（现为用法错误并提示改用 `--stdin`）。
+
+### 新增
+
+- `frpsctl config unset <key>`：删键回落 frp 默认值，与 `config set` 同一事务
+  闭环（校验 → 快照 → 重启 → 失败自动回滚）；键不存在报配置错误(3)。
+- `frpsctl config set --dry-run`：跑完全部真实校验（含 `frps verify` 与危险组合
+  拦截）但零落盘、零快照——CLI 版的"预览"；`config unset` 同样支持。
+- `config set --stdin / --prompt`：敏感值不再必须走 argv（shell 历史与
+  `/proc/<pid>/cmdline`）；三种值来源互斥。
+- `frpsctl traffic [name]`：近 7 天流量历史（无参 = 全部代理逐日汇总；离线
+  代理 404 = 无数据，单代理失败不拖垮整体）。
+- `frpsctl plugin user set|remove|list`：策略的结构化编辑（写入前同
+  `plugin check` 判据复验、0600 原子写、未知键原样保留）。
+- `frpsctl web password show`：读回 `web service install` 生成的口令（权限
+  过宽时向 stderr 告警）。
+- Web 管理台的"历史与回滚"卡片：列出快照（时间 / 动作 / 步数）并可回滚到
+  任意一份；新接口 `GET /api/config/history` 只读 meta.json，不下发快照原文。
+
+### 工程
+
+- **分层倒置根治**：`core/` 不再反向 import `cli/`（此前 8 处
+  `cli.ui.trace` / `mask_secret`）——诊断开关下沉为 `core/diagnostics.py`，
+  打码统一走 `config.mask_value`。
+- 死代码清理（零调用即删）：`lock.held_locks`、`plugin.server.serve` /
+  `wait_ready`、`WebSettings.password`（构造后从未被读，容易误以为生效）。
+- 新增 `tests/test_docs.py`：README 命令 / 环境变量 / 退出码与设计文档命令面的
+  **双向一致性守卫**——文档 drift 从此在 CI 里直接暴露；同步刷新设计文档
+  §1.3 / §5 / §7.2。
+- CI 矩阵加入 Python 3.14；Web 与插件的监听 backlog 设为 64（过载行为可预期）。
+- 新增 75 条测试（435 → 510；非契约 480），覆盖率 82% → **85%**。
+
 ## [0.2.2] - 2026-09-17
 
 Web 管理台（内置界面）与 `kick` 语义修正。

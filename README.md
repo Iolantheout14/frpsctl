@@ -388,6 +388,21 @@ alice.alice-ssh              alice      tcp     6000   online   0      0 B / 0 B
 $ frpsctl proxies --type http      # 只看某类型
 ```
 
+近 7 天的流量历史（日粒度；数据源与 Web 趋势图相同）：
+
+```console
+$ frpsctl traffic                  # 全部代理逐日汇总
+date                  in         out
+2026-09-16       1.2 MiB     3.4 MiB
+2026-09-17       0.4 MiB     1.1 MiB
+合计             1.6 MiB     4.5 MiB
+
+$ frpsctl traffic alice.alice-ssh  # 单个代理的明细
+```
+
+离线或已删除的代理在数据源上返回 404 = 无数据（不是错误）；单个代理查询失败
+也不拖垮整体。
+
 `prune` 清理离线代理记录；在线代理无法从服务端强制下线（frp 没有该 API，
 见"清理离线记录"一节）。
 
@@ -427,6 +442,10 @@ $ frpsctl config set maxPortsPerClient 30
 
 ```bash
 frpsctl config set bindPort 8000 --no-restart   # 只写不重启（输出会提示"尚未生效"）
+frpsctl config set bindPort 8000 --dry-run      # 只校验并展示 diff，不写入、不重启
+frpsctl config set webServer.password --prompt  # 敏感值隐藏输入（不进 argv / shell 历史）
+frpsctl config set webServer.password --stdin   # 或从管道读：echo -n "$PW" | frpsctl ...
+frpsctl config unset maxPortsPerClient          # 删键回落 frp 默认值（同一事务闭环）
 frpsctl config list                             # 列出全部键（值自动打码）
 frpsctl config list --prefix webServer          # 只看某张表
 frpsctl config list --tree                      # 按表分组缩进展示
@@ -438,6 +457,10 @@ frpsctl config diff                             # 当前 vs 上一份快照
 frpsctl config rollback                         # 回滚到上一份
 frpsctl config rollback 3                       # 回滚到 3 份之前
 ```
+
+> `--dry-run` 与 `--no-restart` 的区别：前者**什么都不写**（只校验+预览），
+> 后者已经落盘、只是没有重启；`config unset` 删除不存在的键会报配置错误(3)
+> ——拼错键名的"成功删除"会让人以为清掉了某个设置。
 
 **机密保护**：`config get` 默认打码（`SU***56` 形式，保留首尾便于核对是不是同一个
 值），`--json` 与所有 diff 输出同样打码。要看明文必须 `--reveal`。
@@ -582,6 +605,20 @@ frpsctl plugin init      # 生成策略模板（0600，默认 fail-closed）
 frpsctl plugin check     # 离线校验 + 试算典型裁决
 frpsctl plugin serve     # 启动（只允许绑回环）
 ```
+
+策略里的用户可以用命令维护——不必手写 JSON（写入前用与 `plugin check` 相同的
+判据复验，0600 原子写，`_comment` 等自定义字段原样保留）：
+
+```bash
+frpsctl plugin user list                               # 用户与权限摘要（不显示策略级凭据）
+frpsctl plugin user set alice --ports 6000-6010 --max-proxies 5
+frpsctl plugin user set alice --no-random-port         # 只改这一个字段，其余保持
+frpsctl plugin user set bob --names ""                 # 空串 = 删除该字段（不限名称）
+frpsctl plugin user remove alice
+```
+
+> 插件服务在启动时载入策略：改完记得重启它才生效
+> （`systemctl restart frpsctl-plugin@<实例>`）。
 
 `plugin check` 让你在部署前就看到"策略会怎么判"：
 
@@ -758,6 +795,22 @@ sudo frpsctl web service uninstall
 
 > `web service install` 同样需要 `frpsctl` 位于系统路径（不能被 `ProtectHome`
 > 挡住）——与插件服务的部署要求一致。
+
+配置页里还有**历史与回滚**：列出最近 10 份快照（时间 / 动作 / 步数），可回滚到
+任意一份（接口 `GET /api/config/history` 只读快照的元数据，**不下发配置原文**
+——快照是含 token 与口令的完整副本）。
+
+生成的口令随时可以取回（权限过宽时会告警）：
+
+```bash
+frpsctl web password show
+```
+
+**在反向代理后运行**（`--allow-non-loopback` + Nginx 等）时加 `--trusted-proxy`：
+登录失败限速按 `X-Forwarded-For` 的**最后一跳**区分来源。默认关闭时该头完全
+不被读取；开启的前提是"前面确实有一层会重写该头的可信代理"——否则攻击者的
+失败会与管理员同源，5 次失败就能把管理员锁在冷却之外。
+`web service install --trusted-proxy` 会把该标志写进 unit。
 
 ## 用 systemd 托管
 
@@ -1146,14 +1199,15 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 435 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（405 条）
-.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 83%）
+.venv/bin/pytest                       # 全部 510 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（480 条）
+.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 85%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
 
-CI（Linux，Python 3.11/3.12/3.13）还包含：ruff、覆盖率门禁、真 frp 0.71.0 契约层、
-**真 frp 0.70.0 下界契约矩阵**、无二进制降级路径、端到端冒烟。
+CI（Linux，Python 3.11/3.12/3.13/3.14）还包含：ruff、覆盖率门禁、真 frp 0.71.0
+契约层、**真 frp 0.70.0 下界契约矩阵**、无二进制降级路径、端到端冒烟与
+Web 管理台冒烟、**文档一致性守卫**（README/设计文档 vs 代码的三向核对）。
 
 ### 测试分六层
 
@@ -1203,6 +1257,8 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **`max_proxies` 计数需配 `admin_url`** | 不配时只在插件进程内计数（重启归零、多实例各算各的），`plugin check` 会告警 |
 | **frps 没有热重载** | 改配置必然重启，因此 `config set` 的设计目标就是"失败了要能退回去" |
 | **systemd 模式下 pid 文件不参与判定** | 所有权委托 systemctl；`install` 换版本后需 `systemctl restart` |
+| **Web 管理台不限制并发连接数** | 单机管理工具的取舍（请求线程随连接创建，监听 backlog 64）；公网暴露请在前置反代上做限流 |
+| **`--trusted-proxy` 只信 X-Forwarded-For 的最后一跳** | 前提是前面确实有一层会重写该头的可信代理；直连部署不要开启 |
 
 ---
 
