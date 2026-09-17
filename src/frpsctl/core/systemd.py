@@ -38,16 +38,20 @@ from .instance import Instance
 __all__ = [
     "Systemd",
     "PluginService",
+    "WebService",
     "UNIT_TEMPLATE_PATH",
     "SYSTEMD_UNIT_DIR",
     "DEFAULT_SERVICE_USER",
     "render_unit",
     "render_plugin_unit",
+    "render_web_unit",
+    "generate_web_password",
 ]
 
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frps@.service"
 PLUGIN_UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frpsctl-plugin@.service"
+WEB_UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frpsctl-web@.service"
 
 #: 渲染用的 unit 模板（§12.2）。占位符：%i（systemd 实例说明符）与三个具名参数。
 UNIT_TEMPLATE = """\
@@ -116,6 +120,46 @@ ReadWritePaths={workdir}
 WantedBy=multi-user.target
 """
 
+#: Web 管理台的 unit 模板。`Restart=on-failure`（不是 always）——管理台崩了
+#: 要拉起来，但它是交互工具而非登录单点，正常停止（systemctl stop）不该自启。
+#: 口令从 `--password-file`（0600）读取，绝不写进 unit 命令行（unit 文件 0644）。
+WEB_UNIT_TEMPLATE = """\
+[Unit]
+Description=frpsctl web console (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+ExecStart={exec_start} --instance %i web serve --bind {bind} --password-file {password_file}{extra}
+WorkingDirectory={workdir}
+Restart=on-failure
+RestartSec=2
+
+# 加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths={workdir}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def generate_web_password() -> str:
+    """生成 Web 管理台口令（24 字符，与 `init` 的 dashboard 口令同量级）。
+
+    单点实现：`web serve` 的启动口令与 `web service install` 的口令文件
+    用的是同一个生成器。
+    """
+    import secrets
+
+    return secrets.token_urlsafe(18)
+
 
 def render_unit(
     *,
@@ -163,6 +207,33 @@ def render_plugin_unit(
         workdir=workdir,
         user=user,
         group=group or user,
+    )
+
+
+def render_web_unit(
+    *,
+    exec_start: str,
+    bind: str,
+    password_file: Path,
+    workdir: Path,
+    user: str = DEFAULT_SERVICE_USER,
+    group: str | None = None,
+    allow_non_loopback: bool = False,
+) -> str:
+    """渲染 Web 管理台 unit 模板。
+
+    口令走 `--password-file`（0600），**绝不写进 unit 命令行**——unit 文件是
+    0644，写明文等于向本机所有用户公开管理台。`--allow-non-loopback` 只在
+    绑定地址非回环时渲染出来（CLI 层已要求显式开关）。
+    """
+    return WEB_UNIT_TEMPLATE.format(
+        exec_start=exec_start,
+        bind=bind,
+        password_file=password_file,
+        workdir=workdir,
+        user=user,
+        group=group or user,
+        extra=" --allow-non-loopback" if allow_non_loopback else "",
     )
 
 
@@ -677,6 +748,173 @@ class Systemd:
     def uninstall(self) -> None:
         """停用并删除模板。**需要 root**。"""
         self._require_root("卸载 systemd unit")
+        self._run("disable", "--now", self.unit_name)
+        if self.template_path.exists():
+            self.template_path.unlink()
+        self._run_checked("daemon-reload")
+
+    # --- 内部 ----------------------------------------------------------
+
+    def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess:
+        return _systemctl(*args, timeout=timeout)
+
+    def _run_checked(self, *args: str) -> None:
+        _systemctl_checked(*args)
+
+    @staticmethod
+    def _require_root(action: str) -> None:
+        _require_root(action)
+
+
+@dataclass
+class WebService:
+    """Web 管理台的 systemd 集成（`frpsctl web service install`）。
+
+    与 `PluginService` 同一套体检与委托；差异有三：
+
+    - `Restart=on-failure`：管理台是交互工具（不是登录单点），正常停止不自启；
+    - 安装时生成 **0600 的口令文件**并移交给服务用户（unit 只引用路径）；
+    - 绑定非回环时 unit 会带 `--allow-non-loopback`（CLI 层要求显式开关）。
+    """
+
+    inst: Instance
+    unit_dir: Path = SYSTEMD_UNIT_DIR
+
+    # --- 单元名 --------------------------------------------------------
+
+    @property
+    def unit_name(self) -> str:
+        return f"frpsctl-web@{self.inst.name}.service"
+
+    @property
+    def template_path(self) -> Path:
+        return self.unit_dir / "frpsctl-web@.service"
+
+    @property
+    def password_file(self) -> Path:
+        """登录口令文件（实例目录内，0600）。卸载时**保留**（它是数据不是 unit）。"""
+        return self.inst.dir / "web-password"
+
+    @property
+    def available(self) -> bool:
+        return shutil.which("systemctl") is not None and self.unit_dir.exists()
+
+    # --- 查询 ----------------------------------------------------------
+
+    def is_active(self) -> bool:
+        if not self.available:
+            return False
+        if self._run("cat", "--no-pager", self.unit_name).returncode != 0:
+            return False
+        return self._run("is-active", self.unit_name).stdout.strip() == "active"
+
+    def main_pid(self) -> int | None:
+        out = self._run("show", "-p", "MainPID", "--value", self.unit_name)
+        text = out.stdout.strip()
+        return int(text) if text.isdigit() and int(text) > 0 else None
+
+    # --- 变更 ----------------------------------------------------------
+
+    def start(self) -> None:
+        self._require_root("启动 Web 管理台")
+        self._run_checked("start", self.unit_name)
+
+    def stop(self) -> None:
+        self._require_root("停止 Web 管理台")
+        self._run_checked("stop", self.unit_name)
+
+    def restart(self) -> None:
+        self._require_root("重启 Web 管理台")
+        self._run_checked("restart", self.unit_name)
+
+    # --- 安装 ----------------------------------------------------------
+
+    def install_template(
+        self,
+        *,
+        exec_start: Path,
+        bind: str = "127.0.0.1:8787",
+        force: bool = False,
+        user: str = DEFAULT_SERVICE_USER,
+        group: str | None = None,
+    ) -> tuple[Path, str]:
+        """安装 `frpsctl-web@.service` 并准备口令文件。**需要 root**。
+
+        返回 `(unit 路径, 首次生成的口令)`——口令只在**本次生成**时非空，
+        供 CLI 打印一次；已存在时返回空串（重装不重打）。
+        """
+        self._require_root("安装 Web 管理台 unit")
+        if self.template_path.exists() and not force:
+            raise UsageError(
+                f"{self.template_path} 已存在",
+                hint="确认要覆盖请加 --force（会覆盖同名的自定义 unit）",
+            )
+
+        accounts = _account_ids(user, group)
+        if accounts is None:
+            raise UsageError(
+                f"系统用户或组不存在：{user}/{group or user}",
+                hint=(
+                    "先创建专用用户（推荐）："
+                    f"sudo useradd --system --no-create-home --shell /usr/sbin/nologin {user}；"
+                    "或用 --user / --group 指定已有账户"
+                ),
+            )
+        uid, gid = accounts
+
+        problem = _access_problem(exec_start, uid=uid, gid=gid)
+        if problem is not None:
+            raise UsageError(
+                f"服务用户 {user!r} 无法执行 frpsctl：{problem}",
+                hint=(
+                    "pipx 默认装在 ~/.local/bin，会被 unit 的 ProtectHome=true 挡住；"
+                    "请改装到系统路径（`sudo pipx install --global frpsctl` 或 "
+                    "`sudo pip install frpsctl`），或调整权限"
+                ),
+            )
+        for label, path in (("frpsctl", exec_start), ("实例目录", self.inst.dir)):
+            home_prefix = _protect_home_conflict(path)
+            if home_prefix is not None:
+                raise UsageError(
+                    f"{label}位于 {home_prefix} 下（{path}），会被 unit 的 ProtectHome=true 挡住",
+                    hint=(
+                        "把 frpsctl 与数据放到系统路径：`sudo pipx install --global frpsctl` "
+                        "且用 `sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl ...`"
+                    ),
+                )
+
+        # 口令文件：不存在则生成（0600）。unit 只引用路径，明文不进 unit。
+        from .config import atomic_write
+
+        password_plain = ""
+        if not self.password_file.exists():
+            password_plain = generate_web_password()
+            atomic_write(self.password_file, password_plain + "\n", mode=0o600)
+
+        _hand_over_instance(self.inst, uid=uid, gid=gid)
+        # 口令文件要能被服务用户读（_hand_over_instance 只处理目录与配置）
+        with contextlib.suppress(OSError):
+            os.chown(self.password_file, uid, gid)
+
+        content = render_web_unit(
+            exec_start=str(exec_start.resolve()),
+            bind=bind,
+            password_file=self.password_file.resolve(),
+            workdir=self.inst.dir.resolve(),
+            user=user,
+            group=group,
+            allow_non_loopback=not is_loopback(bind),
+        )
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        self.template_path.write_text(content, "utf-8")
+        self.template_path.chmod(0o644)
+        self._run_checked("daemon-reload")
+        self._run_checked("enable", self.unit_name)
+        return self.template_path, password_plain
+
+    def uninstall(self) -> None:
+        """停用并删除 unit 模板。**需要 root**。口令文件保留（数据不属于 unit）。"""
+        self._require_root("卸载 Web 管理台 unit")
         self._run("disable", "--now", self.unit_name)
         if self.template_path.exists():
             self.template_path.unlink()

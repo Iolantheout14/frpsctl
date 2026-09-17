@@ -18,15 +18,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..errors import UsageError
+
 __all__ = [
     "DashboardInfo",
     "ListenInfo",
     "PluginTarget",
     "is_loopback",
+    "parse_bind",
     "parse_dashboard",
     "parse_listen",
     "parse_plugin_targets",
 ]
+
+
+def parse_bind(bind: str, *, default_port: int) -> tuple[str, int]:
+    """解析 `host:port` / `[v6]:port` / 裸 host 为 `(host, port)`。
+
+    插件服务与 Web 管理台共用这一份解析（此前两处各写一份 host/port 属性，
+    非法端口的报错行为也不一致）。端口非法时抛用法错误(2) 而不是让裸
+    `ValueError` 冒到顶层。
+    """
+    text = bind.strip()
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        port_text = rest.lstrip(":")
+        host = host or "127.0.0.1"
+    elif ":" in text:
+        host, _, port_text = text.rpartition(":")
+    else:
+        return text or "127.0.0.1", default_port
+    if not port_text:
+        return host, default_port
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise UsageError(f"无法解析监听地址端口：{bind!r}") from None
+    if not (0 <= port <= 65535):
+        raise UsageError(f"监听端口越界（0..65535）：{bind!r}")
+    return host, port
 
 
 def is_loopback(addr: str) -> bool:

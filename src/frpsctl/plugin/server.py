@@ -55,21 +55,15 @@ class ServerSettings:
 
     @property
     def host(self) -> str:
-        text = self.bind
-        if text.startswith("["):
-            return text[1 : text.index("]")] if "]" in text else text
-        return text.rsplit(":", 1)[0] if ":" in text else text
+        from ..core.healthcheck import parse_bind
+
+        return parse_bind(self.bind, default_port=8080)[0]
 
     @property
     def port(self) -> int:
-        text = self.bind
-        if text.startswith("[") and "]" in text:
-            rest = text[text.index("]") + 1 :]
-            return int(rest.lstrip(":")) if rest.lstrip(":") else 8080
-        if ":" in text:
-            tail = text.rsplit(":", 1)[1]
-            return int(tail) if tail else 8080
-        return 8080
+        from ..core.healthcheck import parse_bind
+
+        return parse_bind(self.bind, default_port=8080)[1]
 
 
 def _make_handler(engine: DecisionEngine, settings: ServerSettings):

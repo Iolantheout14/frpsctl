@@ -40,6 +40,7 @@ from ..errors import (
 
 __all__ = [
     "ChangePlan",
+    "MultiChangePlan",
     "atomic_write",
     "config_flags",
     "validate_candidate",
@@ -50,10 +51,12 @@ __all__ = [
     "needs_unsafe_flag",
     "flatten_tree",
     "plan_set",
+    "plan_set_many",
     "reject_template_syntax",
     "validate_text",
     "mask_tree",
     "mask_diff",
+    "mask_value",
     "SECRET_KEYS",
     "is_secret_key",
 ]
@@ -94,6 +97,23 @@ def is_secret_key(dotted: str) -> bool:
         or lowered.endswith(_SECRET_SUFFIXES)
         or lowered in _BARE_SECRETS
     )
+
+
+_MASK = "***"
+
+
+def mask_value(value: object) -> str:
+    """打码单个敏感值（保留首尾各两字符便于核对是不是同一个值）。
+
+    全项目唯一实现：`cli.ui.mask_secret` 与 Web 管理台都委托到这里——
+    两处各写一份打码逻辑迟早出现"一处遮、一处漏"。
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return "(empty)"
+    if len(text) <= 4:
+        return _MASK
+    return f"{text[:2]}{_MASK}{text[-2:]}"
 
 
 def mask_tree(value: Any, *, prefix: str = "", reveal: bool = False) -> Any:
@@ -535,6 +555,48 @@ class ChangePlan:
         return self.before is not _MISSING and self.before == self.after
 
 
+@dataclass(frozen=True)
+class MultiChangePlan:
+    """多键变更的内存补丁结果（Web 配置表单用）。
+
+    `first before/after` 是逐键的旧值与新值（`dict`，键为点分路径）——
+    供调用方展示"改了哪些键"；`is_noop` 在所有键都未变时为真。
+    """
+
+    changes: tuple[tuple[str, str], ...]
+    before: dict[str, Any]
+    after: dict[str, Any]
+    text: str
+    diff: str
+
+    @property
+    def is_noop(self) -> bool:
+        return self.before == self.after
+
+
+def _validate_dotted(dotted: str) -> list[str]:
+    """键名合法性（与 plan_set 同一判据）。"""
+    if not dotted or dotted.startswith(".") or dotted.endswith("."):
+        raise UsageError(f"非法键名：{dotted!r}", hint="使用点分路径，如 transport.tls.force")
+    return dotted.split(".")
+
+
+def _set_one(doc: Any, dotted: str, raw: str) -> tuple[Any, Any]:
+    """对文档就地做一次定点赋值；返回 `(旧值或 None, 新值)`。
+
+    解析候选值 → 语义校验 → 模板语法检查 → 定点赋值。任何一步失败都在这里
+    抛错，调用方（plan_set / plan_set_many）的线上文件零影响。
+    """
+    parts = _validate_dotted(dotted)
+    value = parse_scalar(raw)
+    reject_template_syntax(value, dotted=dotted)
+    validate_candidate(parts, value)
+    table = ensure_table(doc, *parts[:-1])
+    before = table.get(parts[-1], _MISSING)
+    table[parts[-1]] = value
+    return (None if before is _MISSING else before, value)
+
+
 def plan_set(path: Path, dotted: str, raw: str) -> ChangePlan:
     """只做内存补丁，不落盘（§8.4）。
 
@@ -545,26 +607,42 @@ def plan_set(path: Path, dotted: str, raw: str) -> ChangePlan:
     比 frps verify 更好读（"bindPort 必须是 1..65535 的整数"），而且能在**根本
     没碰文件之前**就失败。
     """
-    if not dotted or dotted.startswith(".") or dotted.endswith("."):
-        raise UsageError(f"非法键名：{dotted!r}", hint="使用点分路径，如 transport.tls.force")
-
     doc = load_config(path)
-    parts = dotted.split(".")
-    value = parse_scalar(raw)
-    reject_template_syntax(value, dotted=dotted)
-    validate_candidate(parts, value)
-
-    table = ensure_table(doc, *parts[:-1])
-    before = table.get(parts[-1], _MISSING)
-    table[parts[-1]] = value
-
+    before, after = _set_one(doc, dotted, raw)
     text = tomlkit.dumps(doc)
     return ChangePlan(
         dotted=dotted,
-        before=None if before is _MISSING else before,
-        after=value,
+        before=before,
+        after=after,
         text=text,
         diff=diff_texts(path.read_text("utf-8"), text, path.name),
+    )
+
+
+def plan_set_many(path: Path, changes: Any) -> MultiChangePlan:
+    """对**多个键**做一次内存补丁（Web 配置表单：一次提交 → 一次重启）。
+
+    与 `plan_set` 同一套校验与定点赋值；所有键作用在**同一个文档**上，
+    因此一次 dumps 就是合并结果。同一键重复出现时后者覆盖前者。
+    """
+    items: list[tuple[str, str]] = [(str(k), str(v)) for k, v in changes]
+    original = path.read_text("utf-8")
+    if not items:
+        return MultiChangePlan(changes=(), before={}, after={}, text=original, diff="")
+    doc = load_config(path)
+    before: dict[str, Any] = {}
+    after: dict[str, Any] = {}
+    for dotted, raw in items:
+        old, new = _set_one(doc, dotted, raw)
+        before[dotted] = old
+        after[dotted] = new
+    text = tomlkit.dumps(doc)
+    return MultiChangePlan(
+        changes=tuple(items),
+        before=before,
+        after=after,
+        text=text,
+        diff=diff_texts(original, text, path.name),
     )
 
 

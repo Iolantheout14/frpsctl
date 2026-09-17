@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,7 +46,7 @@ from .instance import Instance
 from .lifecycle import Lifecycle, State
 from .lock import instance_lock
 
-__all__ = ["ChangeOutcome", "apply_set", "apply_edit", "rollback_to", "config_snapshot"]
+__all__ = ["ChangeOutcome", "apply_set", "apply_sets", "apply_edit", "rollback_to", "config_snapshot"]
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,62 @@ def apply_edit(
             restart=restart,
             health_timeout=health_timeout,
             restore_lifecycle=restore_lifecycle,
+        )
+
+
+def apply_sets(
+    inst: Instance,
+    *,
+    changes: Sequence[tuple[str, str]],
+    lifecycle: Lifecycle,
+    restart: bool = True,
+    health_timeout: float = 10.0,
+    restore_lifecycle: Lifecycle | None = None,
+    expected_current: str | None = None,
+) -> ChangeOutcome:
+    """**多键**变更（`frpsctl web` 的配置表单）：锁内合并补丁 + 一次闭环。
+
+    与 `apply_set` 的区别只有"一次改几个键"：所有键作用在同一个文档上，
+    只产生**一份快照、一次重启**。同一键重复出现时后者覆盖前者。
+
+    `expected_current` 提供时做 CAS（与 `apply_edit` 同一语义）：
+    预览与落盘之间文件被并发修改 → 拒绝而不是覆盖。Web 的"预览 diff →
+    确认应用"两段式交互依赖它。
+    """
+    items = [(str(k), str(v)) for k, v in changes]
+    dotted_label = ", ".join(key for key, _ in items) or "(空变更)"
+    with instance_lock(inst.lock):
+        current = cfg.read_config_text(inst.config)
+        if expected_current is not None and current != expected_current:
+            raise ConfigError(
+                "配置文件在预览期间被其他操作修改，变更已丢弃",
+                hint="请刷新页面后重新提交（以最新内容为基准）",
+            )
+        plan = cfg.plan_set_many(inst.config, items)
+        if plan.is_noop:
+            return ChangeOutcome(
+                dotted=dotted_label,
+                before=plan.before,
+                after=plan.after,
+                diff="",
+                applied=False,
+                restarted=False,
+                rolled_back=False,
+                noop=True,
+            )
+        return _apply_locked(
+            inst,
+            dotted=dotted_label,
+            new_text=plan.text,
+            change_diff=plan.diff,
+            before=plan.before,
+            after=plan.after,
+            lifecycle=lifecycle,
+            restart=restart,
+            health_timeout=health_timeout,
+            restore_lifecycle=restore_lifecycle,
+            snapshot_action=f"set many: {dotted_label}",
+            snapshot_detail=plan.diff[:2000],
         )
 
 
