@@ -666,6 +666,126 @@ class TestPlanUnset:
             cfg.plan_unset(path, ".bindPort")
 
 
+class TestPlanChangeMany:
+    """`plan_change_many`：set + unset 的混合内存补丁（Web 配置表单的候选生成）。
+
+    它是"改两项 + 删一项 = 一次事务"的关键：所有操作作用在同一个文档上，
+    一次 dumps 就是合并结果——拆成两次调用会重启两次。
+    """
+
+    def test_mixed_set_and_unset_in_one_document(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\nmaxPortsPerClient = 20\n", "utf-8")
+
+        plan = cfg.plan_change_many(
+            path, changes=[("bindPort", "8000")], unsets=["maxPortsPerClient"]
+        )
+
+        assert plan.before == {"bindPort": 7000, "maxPortsPerClient": 20}
+        assert plan.after == {"bindPort": 8000, "maxPortsPerClient": None}
+        assert plan.deletes == ("maxPortsPerClient",)
+        assert plan.is_noop is False
+        assert "bindPort = 8000" in plan.text
+        assert "maxPortsPerClient" not in plan.text
+        assert "-maxPortsPerClient = 20" in plan.diff
+        # 只做内存补丁：线上文件一字未动
+        assert path.read_text("utf-8") == "bindPort = 7000\nmaxPortsPerClient = 20\n"
+
+    def test_conflict_between_set_and_unset_is_usage_error(self, tmp_path) -> None:
+        """同一键既赋值又删除：两边的意图互相矛盾，必须拒绝而不是静默取其一。"""
+        from frpsctl.errors import UsageError
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(UsageError, match="同时赋值与删除"):
+            cfg.plan_change_many(path, changes=[("bindPort", "8000")], unsets=["bindPort"])
+
+    def test_missing_unset_key_is_config_error(self, tmp_path) -> None:
+        """删除不存在的键 = 配置错误(3)（与 `plan_unset` 同一条语义）。"""
+        from frpsctl.errors import ConfigKeyMissing
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(ConfigKeyMissing):
+            cfg.plan_change_many(path, changes=[], unsets=["webServer.port"])
+
+    def test_unset_only_is_a_real_change(self, tmp_path) -> None:
+        """只删除也是有效变更（`is_noop` 为假，after 为 None）。"""
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\nmaxPortsPerClient = 20\n", "utf-8")
+
+        plan = cfg.plan_change_many(path, changes=[], unsets=["maxPortsPerClient"])
+
+        assert plan.is_noop is False
+        assert plan.after["maxPortsPerClient"] is None
+
+    def test_noop_when_nothing_changes(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+
+        plan = cfg.plan_change_many(path, changes=[("bindPort", "7000")], unsets=[])
+
+        assert plan.is_noop is True
+        assert plan.diff == ""
+
+    def test_empty_change_is_a_noop_plan(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+
+        plan = cfg.plan_change_many(path, changes=[], unsets=[])
+
+        assert plan.text == "bindPort = 7000\n"
+        assert plan.before == {} and plan.after == {}
+
+    def test_plan_set_many_delegates(self, tmp_path) -> None:
+        """`plan_set_many` 是纯 set 形态的兼容入口——行为必须与混合版一致。"""
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+
+        plan = cfg.plan_set_many(path, [("bindPort", "8000")])
+
+        assert plan.after["bindPort"] == 8000
+        assert plan.deletes == ()
+
+    def test_string_unsets_is_rejected(self, tmp_path) -> None:
+        """字符串 unsets 会被**逐字符迭代**（"ab" → 删掉 a 与 b）——必须报错。
+
+        对抗性实测复现：`plan_change_many(path, changes=[], unsets="ab")` 曾
+        静默删掉两个单字符键。与 `policy._strict_list` 的教训同型："看似能跑"
+        的输入必须在边界变成用法错误。
+        """
+        from frpsctl.errors import UsageError
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\na = 1\nb = 2\n", "utf-8")
+        with pytest.raises(UsageError, match="unsets 必须是键名数组"):
+            cfg.plan_change_many(path, changes=[], unsets="ab")
+        assert path.read_text("utf-8") == "bindPort = 7000\na = 1\nb = 2\n"
+
+    def test_string_changes_is_rejected(self, tmp_path) -> None:
+        """`changes` 传字符串同样拒绝（旧实现会解包失败成裸 ValueError）。"""
+        from frpsctl.errors import UsageError
+
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        with pytest.raises(UsageError, match="changes 必须"):
+            cfg.plan_change_many(path, changes="bindPort")
+        with pytest.raises(UsageError, match="changes 必须"):
+            cfg.plan_change_many(path, changes={"bindPort": "8000"})
+
+    def test_tuple_inputs_are_accepted(self, tmp_path) -> None:
+        """list / tuple 两种容器都接受（核心内部一律用 tuple 传参）。"""
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\nmaxPortsPerClient = 20\n", "utf-8")
+
+        plan = cfg.plan_change_many(
+            path, changes=[["bindPort", "8000"]], unsets=("maxPortsPerClient",)
+        )
+
+        assert plan.after == {"bindPort": 8000, "maxPortsPerClient": None}
+        assert plan.deletes == ("maxPortsPerClient",)
+
+
 class TestGetValue:
     def test_missing_key_raises(self, tmp_path) -> None:
         path = tmp_path / "frps.toml"

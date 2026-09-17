@@ -179,6 +179,26 @@ class TestAuthManager:
         with auth._lock:
             assert len(auth._failures) <= MAX_TRACKED_SOURCES
 
+    def test_sessions_are_bounded(self) -> None:
+        """会话表必须有上限：反复用正确口令登录不能持续推高内存。
+
+        失败的登录不会创建会话，因此这条的触发前提是"持有口令"——威胁模型低，
+        但它与来源表是同一类"输入驱动的表必须有界"问题，护栏成本只有几行。
+        """
+        from frpsctl.web.auth import MAX_SESSIONS
+
+        auth = AuthManager("pw")
+        seen = []
+        for _ in range(MAX_SESSIONS + 10):
+            session = auth.login("pw", source="127.0.0.1")
+            assert session is not None
+            seen.append(session.token)
+        with auth._lock:
+            assert len(auth._sessions) <= MAX_SESSIONS
+        # 驱逐的是最早到期的会话（TTL 相同 → 先开先出），最新的一定还在
+        assert auth.check_session(seen[-1]) is not None
+        assert auth.check_session(seen[0]) is None
+
 
 class TestTrustedProxy:
     """反向代理部署下的来源识别（文档推荐的部署方式，此前完全不可用）。
@@ -278,6 +298,7 @@ class TestApiAuthBoundary:
             ("/api/traffic", "GET"),
             ("/api/config", "GET"),
             ("/api/config/history", "GET"),
+            ("/api/config/history/1/diff", "GET"),
             ("/api/logs", "GET"),
             ("/api/session", "GET"),
             ("/api/config/preview", "POST"),
@@ -477,6 +498,53 @@ class TestApiData:
         assert status == 200
         assert payload["lines"] == ["line-2\n", "line-3\n"]
 
+    def test_traffic_reports_truncation(self, web, monkeypatch) -> None:
+        """超过 `TRAFFIC_MAX_PROXIES` 时如实汇报截断——CLI 会告警，Web 不能静默。"""
+        from frpsctl.core.admin import TRAFFIC_MAX_PROXIES, V2Proxy
+
+        class _FakeAdmin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def list_proxies(self):
+                return [V2Proxy(name=f"p{i}", type="tcp") for i in range(TRAFFIC_MAX_PROXIES + 5)]
+
+            def proxy_traffic(self, name: str):
+                return []
+
+        monkeypatch.setattr("frpsctl.web.api._admin", lambda _ctx: _FakeAdmin())
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/traffic")
+        assert status == 200
+        assert payload["truncated"] is True
+        assert payload["total"] == TRAFFIC_MAX_PROXIES + 5
+        assert len(payload["proxies"]) == TRAFFIC_MAX_PROXIES
+
+    def test_favicon_is_no_content(self, web) -> None:
+        """`/favicon.ico` 返回 204（页面内嵌 data URI 图标；这里是旧工具收尾）。"""
+        status, payload, _ = Client(web).call("/favicon.ico")
+        assert status == 204
+
+    def test_health_payload_carries_plugin_warning(self) -> None:
+        """`_health` 必须透出 L3 告警：插件 fail-closed，客户端将无法登录。"""
+        from frpsctl.core.health import HealthLayer, HealthReport
+        from frpsctl.web.api import _health
+
+        report = HealthReport(
+            l1_process=HealthLayer.OK,
+            l2_control=HealthLayer.OK,
+            l3_plugin=HealthLayer.FAIL,
+            detail="frpsctl 127.0.0.1:8080",
+        )
+        payload = _health(report)
+        assert payload is not None
+        assert payload["plugin_warning"], "L3 失败没有下发告警文本"
+        assert _health(None) is None
+
 
 class TestActionParameterValidation:
     """动作接口的参数范围校验。
@@ -573,6 +641,48 @@ class TestConfigHistory:
         assert status == 200
         assert payload["entries"][0]["steps"] == 1  # 元数据坏了不影响列表
 
+    def test_diff_endpoint_masks_secrets(self, web) -> None:
+        """`GET /api/config/history/{steps}/diff`：回滚前看差异（打码后下发）。
+
+        回滚是危险操作，看不到"会改什么"就确认等于盲操作——CLI 的
+        `config diff --steps` 一直有这个能力，Web 必须同等。
+        """
+        from frpsctl.core.transaction import config_snapshot
+
+        inst = web.ctx.inst
+        config_snapshot(inst, action="set bindPort")
+        inst.config.write_text(
+            'bindPort = 18000\n[auth]\ntoken = "rotated-secret-xyz"\n'
+            '[webServer]\naddr = "127.0.0.1"\nport = 0\n',
+            "utf-8",
+        )
+
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/config/history/1/diff")
+        assert status == 200, payload
+        assert payload["steps"] == 1
+        assert payload["snapshot"].startswith("0001")
+        assert "-bindPort = 17000" in payload["diff"]
+        assert "+bindPort = 18000" in payload["diff"]
+        # 机密（新 token）绝不出现在差异里
+        assert "rotated-secret-xyz" not in payload["diff"]
+        assert "test-token" not in payload["diff"]
+
+    def test_diff_endpoint_rejects_bad_steps(self, web) -> None:
+        client = Client(web)
+        client.login()
+        for bad in ("abc", "0", "-1"):
+            status, payload, _ = client.call(f"/api/config/history/{bad}/diff")
+            assert status == 400, (bad, status, payload)
+
+    def test_diff_endpoint_without_snapshots_is_400(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/config/history/1/diff")
+        assert status == 400
+        assert "快照" in payload["error"]
+
 
 class TestConfigEditFlow:
     """预览 → 应用（含 CAS）——Web 配置编辑的核心链路。"""
@@ -663,6 +773,54 @@ class TestConfigEditFlow:
         )
         assert status == 200
         assert payload["noop"] is True
+
+    def test_preview_and_apply_with_unsets(self, web) -> None:
+        """删除键与修改可以在同一次预览/应用里（`config unset` 的 Web 形态）。"""
+        import tomllib
+
+        make_fake_frps(web.ctx.inst.bin_dir)
+        client = Client(web)
+        client.login()
+
+        status, preview, _ = client.call(
+            "/api/config/preview",
+            method="POST",
+            body={"changes": [["bindPort", "18030"]], "unsets": ["webServer.port"]},
+        )
+        assert status == 200, preview
+        deleted = [item for item in preview["keys"] if item["deleted"]]
+        assert [item["key"] for item in deleted] == ["webServer.port"]
+        assert deleted[0]["after"] is None
+
+        status, applied, _ = client.call(
+            "/api/config/apply", method="POST", body={"preview_id": preview["preview_id"]}
+        )
+        assert status == 200, applied
+        assert applied["applied"] is True
+        parsed = tomllib.loads(web.ctx.inst.config.read_text("utf-8"))
+        assert parsed["bindPort"] == 18030
+        assert "port" not in parsed["webServer"], "删除的键仍在配置里"
+
+    def test_preview_requires_something_to_change(self, web) -> None:
+        """changes 与 unsets 都空 → 400（空事务没有意义）。"""
+        client = Client(web)
+        client.login()
+        for body in ({"changes": []}, {"unsets": []}, {}):
+            status, payload, _ = client.call("/api/config/preview", method="POST", body=body)
+            assert status == 400, (body, status, payload)
+
+    def test_preview_rejects_conflicting_set_and_unset(self, web) -> None:
+        """同一键既赋值又删除 → 400，且线上文件零影响。"""
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call(
+            "/api/config/preview",
+            method="POST",
+            body={"changes": [["bindPort", "18040"]], "unsets": ["bindPort"]},
+        )
+        assert status == 400
+        assert "同时赋值与删除" in payload["error"]
+        assert "bindPort = 17000" in web.ctx.inst.config.read_text("utf-8")
 
 
 # ---------------------------------------------------------------------------

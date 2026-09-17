@@ -114,3 +114,61 @@ class TestDesignDocConsistency:
         # 允许"位置参数"形态（如 `frpsctl config get <key>` 里的 get 已是子命令；
         # 而 `frpsctl plugin check` 等都在 paths 里）。剩下的都是真幽灵。
         assert not ghosts, f"设计文档引用了不存在的子命令：{ghosts}"
+
+
+# ---------------------------------------------------------------------------
+# Web API 表（§18.2）——v0.2.4 发现 `GET /api/config/history` 与 `/api/session`
+# 长期只在代码里、API 表里没有。与命令表同一条纪律：接口面变了，文档必须跟。
+# ---------------------------------------------------------------------------
+
+
+def _api_code_routes() -> tuple[set[str], set[str]]:
+    """从 web 层源码提取路由：`(精确路由, 前缀路由)`。
+
+    路由写在 `path == "..."` / `path.startswith("...")` 里（server 层用
+    `parsed.path`）。前缀路由以 `/api/actions/` 这类形态存在，文档里写作
+    `` `/api/actions/{start,stop,...}` ``。
+    """
+    api_src = (ROOT / "src/frpsctl/web/api.py").read_text("utf-8")
+    server_src = (ROOT / "src/frpsctl/web/server.py").read_text("utf-8")
+    exact = set(re.findall(r'path == "(/api/[^"]+)"', api_src))
+    exact |= set(re.findall(r'parsed\.path == "(/api/[^"]+)"', server_src))
+    prefix = set(re.findall(r'path\.startswith\("(/api/[^"]+)"\)', api_src))
+    return exact, prefix
+
+
+def _doc_api_tokens() -> set[str]:
+    """§18.2 表格里反引号包裹的 API 路径（query 部分去掉）。"""
+    design = DESIGN.read_text("utf-8")
+    match = re.search(r"### 18\.2 API 契约(.*?)### 18\.3", design, re.S)
+    assert match is not None, "找不到设计文档 §18.2"
+    tokens = set(re.findall(r"`(/api/[^`]+)`", match.group(1)))
+    return {token.split("?")[0] for token in tokens}
+
+
+def _prefix_matches(prefix: str, token: str) -> bool:
+    """前缀路由（如 `/api/actions/`）能否解释文档里的花括号形态。"""
+    return re.match(re.escape(prefix) + r"\{[^}]*\}", token) is not None
+
+
+class TestApiDocConsistency:
+    def test_code_routes_are_documented(self) -> None:
+        """代码里的每条 API 路由都必须在 §18.2 表里出现（防"只加接口不改文档"）。"""
+        exact, prefix = _api_code_routes()
+        doc = _doc_api_tokens()
+        missing = sorted(route for route in exact if route not in doc)
+        assert not missing, f"§18.2 未记录的 API 路由：{missing}"
+        for candidate in prefix:
+            assert any(_prefix_matches(candidate, token) for token in doc), (
+                f"§18.2 未记录前缀路由：{candidate}（应写作 `{candidate}{{...}}`）"
+            )
+
+    def test_documented_routes_exist_in_code(self) -> None:
+        """§18.2 里的每个 API 路径都必须能在代码里找到（防幽灵接口）。"""
+        exact, prefix = _api_code_routes()
+        ghosts = sorted(
+            token
+            for token in _doc_api_tokens()
+            if token not in exact and not any(_prefix_matches(prefix_route, token) for prefix_route in prefix)
+        )
+        assert not ghosts, f"§18.2 引用了不存在的 API 路由：{ghosts}"

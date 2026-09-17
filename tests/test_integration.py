@@ -723,7 +723,7 @@ class TestApplySets:
         assert data["maxPortsPerClient"] == 30
         assert len(inst.history_entries()) == 1, "多键变更只应产生一份快照"
         meta = json.loads((inst.history_entries()[0] / "meta.json").read_text("utf-8"))
-        assert meta["action"].startswith("set many:"), meta
+        assert meta["action"].startswith("edit many:"), meta
 
     def test_cas_rejects_when_file_changed(self, inst, write_config) -> None:
         """`expected_current` 不匹配 → 拒绝（预览与落盘之间的并发保护）。"""
@@ -755,6 +755,91 @@ class TestApplySets:
         )
         assert outcome.noop is True
         assert not inst.history_entries()
+
+    def test_unsets_apply_in_same_transaction(self, inst, write_config) -> None:
+        """删除键与赋值混在同一次事务：一份快照、一次落盘、键真的消失。
+
+        Web 的"改两项 + 删一项"必须是**一次**操作——拆成两个事务会重启两次，
+        中间那次还可能撞上危险组合检查。
+        """
+        from frpsctl.core.transaction import apply_sets
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        outcome = apply_sets(
+            inst,
+            changes=[("bindPort", "18012")],
+            unsets=["webServer.user"],
+            lifecycle=lc,
+            restart=False,
+        )
+
+        assert outcome.applied is True
+        data = tomllib.loads(inst.config.read_text("utf-8"))
+        assert data["bindPort"] == 18012
+        assert "user" not in data["webServer"]
+        assert len(inst.history_entries()) == 1, "混合变更只应产生一份快照"
+
+    def test_conflicting_set_and_unset_is_usage_error(self, inst, write_config) -> None:
+        """同一键既赋值又删除 → 用法错误，且线上文件零影响。"""
+        from frpsctl.core.transaction import apply_sets
+        from frpsctl.errors import UsageError
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        with pytest.raises(UsageError, match="同时赋值与删除"):
+            apply_sets(
+                inst,
+                changes=[("bindPort", "18013")],
+                unsets=["bindPort"],
+                lifecycle=lc,
+                restart=False,
+            )
+        assert "bindPort = 17000" in inst.config.read_text("utf-8")
+
+    def test_snapshot_diff_matches_cli_semantics(self, inst, write_config) -> None:
+        """`snapshot_diff`：与"第 N 新快照"比较；无快照/越界是配置错误。
+
+        它是 CLI `config diff` 与 Web `history/{steps}/diff` 的**唯一**实现，
+        因此边界错误（无快照、越界）也在这里钉死。
+        """
+        from frpsctl.core.transaction import apply_set, snapshot_diff
+        from frpsctl.errors import ConfigError
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        with pytest.raises(ConfigError, match="没有配置快照"):
+            snapshot_diff(inst, steps=1)
+
+        apply_set(inst, dotted="bindPort", raw="18014", lifecycle=lc, restart=False)
+        result = snapshot_diff(inst, steps=1)
+        assert result.snapshot.name.startswith("0001")
+        assert "-bindPort = 17000" in result.diff
+        assert "+bindPort = 18014" in result.diff
+
+        with pytest.raises(ConfigError, match="只找到 1 份快照"):
+            snapshot_diff(inst, steps=2)
+
+    def test_steps_below_one_is_usage_error(self, inst, write_config) -> None:
+        """`max(0, steps-1)` 会把 0/-1 静默归一成"回滚/比较一步"——必须拒绝。
+
+        与 CLI 的 `min=1` 约束同一条纪律（v0.2.3）：参数笔误不能变成另一个动作。
+        core 入口独立防御，未来的新调用方不会踩到静默归一。
+        """
+        from frpsctl.core.transaction import apply_set, rollback_to, snapshot_diff
+        from frpsctl.errors import UsageError
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        apply_set(inst, dotted="bindPort", raw="18015", lifecycle=lc, restart=False)
+
+        for bad in (0, -1):
+            with pytest.raises(UsageError, match="必须 >= 1"):
+                snapshot_diff(inst, steps=bad)
+            with pytest.raises(UsageError, match="必须 >= 1"):
+                rollback_to(inst, steps=bad, lifecycle=lc, restart=False)
 
 
 class TestHealthTick:

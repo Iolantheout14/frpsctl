@@ -112,6 +112,15 @@ jobs:
               with urllib.request.urlopen(req, timeout=10) as resp:
                   return json.load(resp)
 
+          def post(path, body):
+              req = urllib.request.Request(
+                  base + path, method="POST",
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json", "Cookie": cookie, "X-CSRF-Token": csrf},
+              )
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  return json.load(resp)
+
           status = call("/api/status")
           assert status["state"] == "STOPPED", status
           assert call("/api/session")["csrf"] == csrf
@@ -122,9 +131,18 @@ jobs:
           # 端到端冒烟里的 config set 会留下快照：history 必须真的读得到
           # （只断言"是列表"的话，空列表也能骗过这层守卫）。
           assert any(str(e.get("action", "")).startswith("set ") for e in history["entries"]), history
+          # 回滚前的"看差异"：先经 API 改一个键（实例未运行 → 只写不重启），
+          # 再断言差里真的出现它。
+          preview = post("/api/config/preview", {"changes": [["maxPortsPerClient", "35"]]})
+          applied = post("/api/config/apply", {"preview_id": preview["preview_id"]})
+          assert applied["applied"] is True, applied
+          diff = call("/api/config/history/1/diff")
+          assert "maxPortsPerClient" in diff["diff"], diff
+          favicon = urllib.request.urlopen(base + "/favicon.ico", timeout=10)
+          assert favicon.status == 204
           html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
           assert "frpsctl 管理台" in html
-          print("web 冒烟通过：login / session / status / config / history / 静态页")
+          print("web 冒烟通过：login / session / status / config / history / diff / favicon / 静态页")
           EOF
           kill "$WEB_PID"
           wait "$WEB_PID" 2>/dev/null || true
