@@ -40,7 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..errors import ChangeRolledBack, ConfigError, FrpsctlError
+from ..errors import ChangeRolledBack, ConfigError, FrpsctlError, UsageError
 from . import config as cfg
 from .instance import Instance
 from .lifecycle import Lifecycle, State
@@ -48,11 +48,13 @@ from .lock import instance_lock
 
 __all__ = [
     "ChangeOutcome",
+    "SnapshotDiff",
     "apply_set",
     "apply_sets",
     "apply_unset",
     "apply_edit",
     "rollback_to",
+    "snapshot_diff",
     "config_snapshot",
 ]
 
@@ -272,6 +274,7 @@ def apply_sets(
     inst: Instance,
     *,
     changes: Sequence[tuple[str, str]],
+    unsets: Sequence[str] = (),
     lifecycle: Lifecycle,
     restart: bool = True,
     health_timeout: float = 10.0,
@@ -279,17 +282,21 @@ def apply_sets(
     expected_current: str | None = None,
     dry_run: bool = False,
 ) -> ChangeOutcome:
-    """**多键**变更（`frpsctl web` 的配置表单）：锁内合并补丁 + 一次闭环。
+    """**多键**变更（Web 配置表单）：锁内合并补丁 + 一次闭环。
 
-    与 `apply_set` 的区别只有"一次改几个键"：所有键作用在同一个文档上，
-    只产生**一份快照、一次重启**。同一键重复出现时后者覆盖前者。
+    与 `apply_set` 的区别只有"一次改几个键"：所有键（赋值与删除）作用在同一个
+    文档上，只产生**一份快照、一次重启**。`unsets` 是 `config unset` 的语义
+    （删键回落默认），与 `changes` 混在同一个事务里——UI 的"改两项 + 删一项"
+    必须是一次操作，拆开会重启两次。
 
     `expected_current` 提供时做 CAS（与 `apply_edit` 同一语义）：
     预览与落盘之间文件被并发修改 → 拒绝而不是覆盖。Web 的"预览 diff →
     确认应用"两段式交互依赖它。
+
+    输入形状（changes / unsets）的归一化与防御在 `plan_change_many` 里
+    **单点完成**——这里直接透传原始参数，不再自己解包（`for k, v in "ab"`
+    这类"字符串当列表"的静默错误因此没有第二个藏身处）。
     """
-    items = [(str(k), str(v)) for k, v in changes]
-    dotted_label = ", ".join(key for key, _ in items) or "(空变更)"
     with instance_lock(inst.lock):
         current = cfg.read_config_text(inst.config)
         if expected_current is not None and current != expected_current:
@@ -297,7 +304,9 @@ def apply_sets(
                 "配置文件在预览期间被其他操作修改，变更已丢弃",
                 hint="请刷新页面后重新提交（以最新内容为基准）",
             )
-        plan = cfg.plan_set_many(inst.config, items)
+        plan = cfg.plan_change_many(inst.config, changes, unsets)
+        labels = [key for key, _ in plan.changes] + [f"-{key}" for key in plan.deletes]
+        dotted_label = ", ".join(labels) or "(空变更)"
         if plan.is_noop:
             return ChangeOutcome(
                 dotted=dotted_label,
@@ -330,7 +339,7 @@ def apply_sets(
             restart=restart,
             health_timeout=health_timeout,
             restore_lifecycle=restore_lifecycle,
-            snapshot_action=f"set many: {dotted_label}",
+            snapshot_action=f"edit many: {dotted_label}",
             snapshot_detail=plan.diff[:2000],
         )
 
@@ -359,7 +368,11 @@ def rollback_to(
                 "没有可回滚的配置快照",
                 hint="快照在每次 `config set` / `config edit` 时自动创建于 config-history/",
             )
-        index = max(0, steps - 1)
+        if steps < 1:
+            # 与 CLI 的 min=1 约束同一条纪律：`max(0, steps-1)` 会把 -1/0 静默
+            # 归一成"回滚一步"，参数笔误变成另一个动作（v0.2.3 的修复原则）。
+            raise UsageError(f"回滚步数必须 >= 1：{steps}")
+        index = steps - 1
         if index >= len(entries):
             raise ConfigError(
                 f"只找到 {len(entries)} 份快照，无法回滚 {steps} 步",
@@ -392,6 +405,46 @@ def rollback_to(
             snapshot_action=f"rollback {steps}",
             snapshot_detail=f"目标快照 {target.parent.name}",
         )
+
+
+@dataclass(frozen=True)
+class SnapshotDiff:
+    """一次"当前 vs 第 N 新快照"的比较结果。
+
+    `snapshot` 是快照目录（`config-history/NNNN-.../`），`diff` 是**未打码**的
+    unified diff——打码由展示层负责（CLI 与 Web 都用 `config.mask_diff`）。
+    """
+
+    snapshot: Path
+    diff: str
+
+
+def snapshot_diff(inst: Instance, *, steps: int) -> SnapshotDiff:
+    """取"当前配置 vs 第 N 新快照"的 diff（`config diff --steps N` 的唯一实现）。
+
+    下沉到 core 的原因：CLI 的 `config diff` 与 Web 的"查看差异"必须给出**同一份**
+    语义（同一份快照、同一套边界错误、同一锁边界），两处各写一遍迟早漂移。
+    锁内读两份文本：锁外读时"选中的快照"与"当前文本"可能来自不同时刻，
+    展示的差异与真实状态不符（并发 `config set` 正在推进历史的窗口）。
+    """
+    with instance_lock(inst.lock):
+        entries = inst.history_entries()
+        if not entries:
+            raise ConfigError("没有配置快照", hint="快照在每次 config set / edit 时自动创建")
+        if steps < 1:
+            raise UsageError(f"快照步数必须 >= 1：{steps}")
+        index = steps - 1
+        if index >= len(entries):
+            raise ConfigError(f"只找到 {len(entries)} 份快照")
+        snapshot = entries[index] / "frps.toml"
+        if not snapshot.exists():
+            raise ConfigError(f"快照不完整：{snapshot}")
+        snapshot_text = snapshot.read_text("utf-8")
+        current_text = cfg.read_config_text(inst.config)
+    return SnapshotDiff(
+        snapshot=snapshot.parent,
+        diff=cfg.diff_texts(snapshot_text, current_text, "frps.toml"),
+    )
 
 
 # ---------------------------------------------------------------------------

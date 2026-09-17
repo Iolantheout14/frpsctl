@@ -53,6 +53,7 @@ __all__ = [
     "flatten_tree",
     "plan_set",
     "plan_set_many",
+    "plan_change_many",
     "plan_unset",
     "parse_scalar",
     "reject_template_syntax",
@@ -562,8 +563,12 @@ class ChangePlan:
 class MultiChangePlan:
     """多键变更的内存补丁结果（Web 配置表单用）。
 
-    `first before/after` 是逐键的旧值与新值（`dict`，键为点分路径）——
-    供调用方展示"改了哪些键"；`is_noop` 在所有键都未变时为真。
+    `before/after` 是逐键的旧值与新值（`dict`，键为点分路径）——供调用方展示
+    "改了哪些键"；被删除的键 `after` 为 `None` 且出现在 `deletes` 里。
+    `is_noop` 在所有键都未变时为真。
+
+    ⚠️ `dumps` 只调用**一次**：set 与 unset 作用在同一个文档上，因此一次变更
+    只产生一份快照、一次重启——把删除做成"先删再 set"两次调用会破坏这个性质。
     """
 
     changes: tuple[tuple[str, str], ...]
@@ -571,6 +576,8 @@ class MultiChangePlan:
     after: dict[str, Any]
     text: str
     diff: str
+    #: 被删除的键（`config unset` 语义：回落 frp 默认值）。
+    deletes: tuple[str, ...] = ()
 
     @property
     def is_noop(self) -> bool:
@@ -625,13 +632,82 @@ def plan_set(path: Path, dotted: str, raw: str) -> ChangePlan:
 def plan_set_many(path: Path, changes: Any) -> MultiChangePlan:
     """对**多个键**做一次内存补丁（Web 配置表单：一次提交 → 一次重启）。
 
-    与 `plan_set` 同一套校验与定点赋值；所有键作用在**同一个文档**上，
-    因此一次 dumps 就是合并结果。同一键重复出现时后者覆盖前者。
+    是 `plan_change_many` 的纯 set 形态（保留为独立入口，语义更直白）。
     """
-    items: list[tuple[str, str]] = [(str(k), str(v)) for k, v in changes]
+    return plan_change_many(path, changes, ())
+
+
+def _delete_one(doc: Any, dotted: str) -> Any:
+    """对文档就地删除一个键；返回被删的值（键不存在抛 `ConfigKeyMissing`）。
+
+    与 `plan_unset` 同一条语义：键不存在是配置错误(3)，而不是静默 noop——
+    拼错键名的"成功删除"会让人以为清掉了某个设置（ADR-7：不猜测）。
+    """
+    parts = _validate_dotted(dotted)
+    node: Any = doc
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            raise ConfigKeyMissing(dotted)
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        raise ConfigKeyMissing(dotted)
+    before = node[parts[-1]]
+    del node[parts[-1]]
+    return before
+
+
+def _normalize_pairs(raw: Any) -> list[tuple[str, str]]:
+    """把 `changes` 归一化成 `(key, value)` 列表；形状错误抛用法错误。
+
+    **拒绝字符串**：`for key, value in "ab"` 会解包失败（裸 ValueError），
+    而 `for key in "ab"` 这类形态在别处会**逐字符迭代**——"看似能跑"的输入
+    必须在边界变成明确报错（与 `plugin/policy.py` 的 `_strict_list` 同一条纪律）。
+    """
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise UsageError(f"changes 必须是 (键, 值) 的数组，实际是 {type(raw).__name__}")
+    out: list[tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), str(item[1])))
+        else:
+            raise UsageError(f"无法识别的变更条目：{item!r}（应为 (key, value)）")
+    return out
+
+
+def _normalize_keys(raw: Any) -> list[str]:
+    """把 `unsets` 归一化成键名列表；**字符串会被逐字符迭代，必须拒绝**。"""
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise UsageError(f"unsets 必须是键名数组，实际是 {type(raw).__name__}")
+    return [str(item) for item in raw]
+
+
+def plan_change_many(
+    path: Path,
+    changes: Any,
+    unsets: Any = (),
+) -> MultiChangePlan:
+    """对多个键做一次**混合**内存补丁：赋值（set）与删除（unset）在同一个文档上。
+
+    为什么要混合形态而不是两个入口相加：删除与赋值作用于**同一份文档**，
+    一次 `dumps` 就是合并结果——Web 的"改两个键 + 删一个键"因此只产生一份
+    快照、一次重启（§9 的事务语义）；分成两次调用会重启两次，中间那次还可能
+    因为"只删了口令"撞上危险组合检查而被拒绝。
+
+    同一键同时出现在 set 与 unset 里是用法错误：两边的意图互相矛盾，静默取
+    其一都会让人以为变更生效了。
+
+    输入在**这里**统一归一化与防御（`apply_sets` 直接透传原始参数）：
+    所有入口共用一套形状检查，"传字符串当列表"这类静默错误没有藏身处。
+    """
+    items = _normalize_pairs(changes)
+    delete_keys = _normalize_keys(unsets)
+    conflict = {key for key, _ in items} & set(delete_keys)
+    if conflict:
+        raise UsageError(f"同一个键不能同时赋值与删除：{', '.join(sorted(conflict))}")
     original = path.read_text("utf-8")
-    if not items:
+    if not items and not delete_keys:
         return MultiChangePlan(changes=(), before={}, after={}, text=original, diff="")
+
     doc = load_config(path)
     before: dict[str, Any] = {}
     after: dict[str, Any] = {}
@@ -639,6 +715,9 @@ def plan_set_many(path: Path, changes: Any) -> MultiChangePlan:
         old, new = _set_one(doc, dotted, raw)
         before[dotted] = old
         after[dotted] = new
+    for dotted in delete_keys:
+        before[dotted] = _delete_one(doc, dotted)
+        after[dotted] = None
     text = tomlkit.dumps(doc)
     return MultiChangePlan(
         changes=tuple(items),
@@ -646,6 +725,7 @@ def plan_set_many(path: Path, changes: Any) -> MultiChangePlan:
         after=after,
         text=text,
         diff=diff_texts(original, text, path.name),
+        deletes=tuple(delete_keys),
     )
 
 
@@ -660,16 +740,7 @@ def plan_unset(path: Path, dotted: str) -> ChangePlan:
     对不存在的键报错同一条原则（ADR-7：不猜测）。
     """
     doc = load_config(path)
-    parts = _validate_dotted(dotted)
-    node: Any = doc
-    for part in parts[:-1]:
-        if not isinstance(node, dict) or part not in node:
-            raise ConfigKeyMissing(dotted)
-        node = node[part]
-    if not isinstance(node, dict) or parts[-1] not in node:
-        raise ConfigKeyMissing(dotted)
-    before = node[parts[-1]]
-    del node[parts[-1]]
+    before = _delete_one(doc, dotted)
     text = tomlkit.dumps(doc)
     return ChangePlan(
         dotted=dotted,
