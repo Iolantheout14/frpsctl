@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import signal
-import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -37,7 +36,7 @@ from .engine import DecisionEngine
 from .policy import PluginPolicy
 from .types import PluginRequest, PluginResponse, UnknownOp
 
-__all__ = ["PluginServer", "ServerSettings", "serve"]
+__all__ = ["PluginServer", "ServerSettings"]
 
 #: 单个请求超过这个耗时就在日志里点名——它是"插件拖慢登录"的唯一线索。
 SLOW_REQUEST_MS = 200.0
@@ -242,6 +241,10 @@ class PluginServer:
         handler = _make_handler(self.engine, self.settings)
         self._httpd = ThreadingHTTPServer((self.settings.host, self.settings.port), handler)
         self._httpd.daemon_threads = True
+        # backlog 上限（同 web/server.py）：插件是登录单点，过载时宁可让多出的
+        # 连接被内核拒绝，也不要无限排队——frp 侧对插件请求没有超时，排队中的
+        # 请求会一直占着客户端的登录链路。
+        self._httpd.request_queue_size = 64
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="frpsctl-plugin", daemon=True)
         self._thread.start()
 
@@ -260,7 +263,8 @@ class PluginServer:
         `close()`（含刷盘）。
 
         退出语义：**先 `close()`（含审计刷盘），再把 `KeyboardInterrupt` 放出去**，
-        由调用方决定怎么收尾（CLI 打印审计摘要，`serve()` 直接冒到顶层）。
+        由调用方决定怎么收尾（CLI 捕获它并打印审计摘要）。关闭只发生在这里
+        ——调用方不得重复 `close()`。
         """
         if self._httpd is None:
             self.start()
@@ -318,25 +322,3 @@ def _raise_keyboard_interrupt(_signum: int, _frame: object) -> None:
     `ValueError`，因此调用方需要判断；这里用最小的可调用体，不做任何多余动作。
     """
     raise KeyboardInterrupt
-
-
-def serve(policy: PluginPolicy, settings: ServerSettings) -> None:
-    """CLI 入口：前台运行直到中断。
-
-    运行期**不再** `try/except KeyboardInterrupt` + `finally: close()`：那与
-    `PluginServer.serve_forever()` 内部的 `finally: self.close()` 重复关闭，
-    真实行为依赖 `AuditLog.close()` 的 `_closed` 标志兜底。关闭只留一处。
-    """
-    PluginServer(policy, settings).serve_forever()
-
-
-def wait_ready(host: str, port: int, *, timeout: float = 5.0) -> bool:
-    """探活辅助（CLI `plugin check` 与测试共用）。"""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.3):
-                return True
-        except OSError:
-            time.sleep(0.05)
-    return False
