@@ -23,14 +23,14 @@ from enum import Enum
 from pathlib import Path
 
 from ..errors import FrpsctlError
-from .config import config_flags
+from .config import config_flags, needs_unsafe_flag
 from .health import HealthLayer, probe_plugins
 from .healthcheck import is_loopback, parse_dashboard, parse_plugin_targets
 from .instance import Instance
-from .lifecycle import Lifecycle, Owner, State
+from .lifecycle import Lifecycle, Owner, ProcessRef, State
 from .lock import is_locked
 from .schema import PORT_FIELDS
-from .version import MINIMUM_VERSION, read_binary_version, upgrade_hint
+from .version import MINIMUM_VERSION, Version, read_binary_version, upgrade_hint
 
 __all__ = ["Severity", "Finding", "DoctorReport", "run_doctor"]
 
@@ -71,21 +71,41 @@ class DoctorReport:
 
 
 def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
-    """跑完全部检查项，返回报告（不抛异常，除致命的环境问题外）。"""
+    """跑完全部检查项，返回报告（不抛异常，除致命的环境问题外）。
+
+    所有权与版本只探测一次并传给各检查项：它们本来就是"体检开始时的快照"，
+    重复探测既慢（每次 `systemctl` / `frps -v` 都要 fork）又可能自相矛盾。
+    """
     findings: list[Finding] = []
     lc = Lifecycle(inst, binary=binary)
+    owner, state, ref = lc.state_with_owner()
+    version = _read_version(lc)
 
-    findings.extend(_check_binary(lc, inst))
-    findings.extend(_check_config(lc, inst))
+    findings.extend(_check_binary(lc, inst, version=version))
+    findings.extend(_check_config(lc, inst, version=version))
     findings.extend(_check_permissions(inst))
     findings.extend(_check_dashboard(inst))
     findings.extend(_check_hardening(inst))
-    findings.extend(_check_ports(inst, lc))
-    findings.extend(_check_ownership(inst, lc))
+    findings.extend(_check_ports(inst, state=state, ref=ref))
+    findings.extend(_check_ownership(inst, owner=owner, state=state, ref=ref))
     findings.extend(_check_lock(inst))
     findings.extend(_check_plugins(inst))
 
     return DoctorReport(instance=inst.name, findings=findings)
+
+
+def _read_version(lc: Lifecycle) -> Version | None:
+    """读一次二进制版本（**裸读**，不做 §3.6 门槛判定）。
+
+    门槛判定是 `_check_binary` 的展示逻辑：若在这里用 `lc.binary_version()`
+    （自带门槛校验），`< 0.70.0` 会抛 `UnsupportedVersion` 被吞成 None，最终
+    报成"无法读取版本 / 可能不是官方 frps"——而真因是"版本太低"。错误诊断
+    把用户引向完全错误的方向（第五轮 review 实测复现）。
+    """
+    try:
+        return read_binary_version(lc.binary())
+    except FrpsctlError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +113,9 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
 # ---------------------------------------------------------------------------
 
 
-def _check_binary(lc: Lifecycle, inst: Instance) -> list[Finding]:
+def _check_binary(
+    lc: Lifecycle, inst: Instance, *, version: Version | None
+) -> list[Finding]:
     """二进制存在性、可执行性、版本与"运行版本 vs 磁盘版本"。
 
     刻意**不接收** `binary` 参数：那会诱导实现去读"用户传了什么"，而这里要检查的
@@ -104,18 +126,20 @@ def _check_binary(lc: Lifecycle, inst: Instance) -> list[Finding]:
         path = lc.binary()
     except FrpsctlError as exc:
         return [Finding("二进制", Severity.ERROR, exc.message, exc.hint or "")]
-
     if not path.exists():
         return [Finding("二进制", Severity.ERROR, f"不存在：{path}", "运行 `frpsctl install`")]
     if not path.stat().st_mode & stat.S_IXUSR:
         out.append(Finding("二进制", Severity.ERROR, f"不可执行：{path}", f"chmod 0755 {path}"))
-
-    try:
-        version = read_binary_version(path)
-    except FrpsctlError as exc:
-        return [Finding("二进制", Severity.ERROR, exc.message, exc.hint or "")]
-
-    if version.tuple < MINIMUM_VERSION:
+    if version is None:
+        out.append(
+            Finding(
+                "二进制版本",
+                Severity.ERROR,
+                f"无法读取版本：{path} -v 失败或超时",
+                "该二进制可能不是官方 frps，或无法执行",
+            )
+        )
+    elif version.tuple < MINIMUM_VERSION:
         out.append(
             Finding(
                 "二进制版本",
@@ -146,7 +170,7 @@ def _check_binary(lc: Lifecycle, inst: Instance) -> list[Finding]:
     return out
 
 
-def _check_config(lc: Lifecycle, inst: Instance) -> list[Finding]:
+def _check_config(lc: Lifecycle, inst: Instance, *, version: Version | None) -> list[Finding]:
     from .config import validate_text
 
     if not inst.config.exists():
@@ -156,19 +180,14 @@ def _check_config(lc: Lifecycle, inst: Instance) -> list[Finding]:
     except OSError as exc:
         return [Finding("配置", Severity.ERROR, f"无法读取：{exc}")]
 
+    if version is None or version.tuple < MINIMUM_VERSION:
+        return []  # 二进制问题已单独报过（含"版本低于门槛"），此处无法做权威校验
     try:
-        # binary_version() 在这里的作用不只是拿版本号：它会执行 §3.6 的版本门槛
-        # 校验（不达标即抛），因此不能因为"返回值用不上"就删掉。
-        lc.binary_version()
         binary = lc.binary()
     except FrpsctlError:
-        return []  # 二进制问题已单独报过，此处无法做权威校验
+        return []
 
-    uses_unsafe = False
-    with contextlib.suppress(Exception):
-        data = tomllib.loads(text)
-        source = (data.get("auth") or {}).get("tokenSource") or {}
-        uses_unsafe = str(source.get("type", "")).lower() == "exec"
+    uses_unsafe = needs_unsafe_flag(text)
 
     try:
         validate_text(text, binary=binary, workdir=inst.dir, uses_unsafe=uses_unsafe)
@@ -309,11 +328,13 @@ def _check_hardening(inst: Instance) -> list[Finding]:
     return out
 
 
-def _check_ports(inst: Instance, lc: Lifecycle) -> list[Finding]:
+def _check_ports(
+    inst: Instance, *, state: State, ref: ProcessRef | None
+) -> list[Finding]:
     """端口可绑定性探测（§8.7）。
 
     自己正在运行时占用端口是**正常**的，因此先判断实例状态，避免把
-    "我们自己占着"报成冲突。
+    "我们自己占着"报成冲突。状态由 `run_doctor` 一次性探测后传入。
     """
     out: list[Finding] = []
     try:
@@ -321,7 +342,6 @@ def _check_ports(inst: Instance, lc: Lifecycle) -> list[Finding]:
     except Exception:
         return out
 
-    state, ref = lc.state()
     ours_running = state is State.RUNNING and ref is not None
     bind_addr = str(data.get("bindAddr") or "0.0.0.0")
 
@@ -388,11 +408,11 @@ def _dig(data: dict, dotted: str):
     return node
 
 
-def _check_ownership(inst: Instance, lc: Lifecycle) -> list[Finding]:
-    """systemd 与 direct 冲突检测（R3）。"""
+def _check_ownership(
+    inst: Instance, *, owner: Owner, state: State, ref: ProcessRef | None
+) -> list[Finding]:
+    """systemd 与 direct 冲突检测（R3）。owner/state 由 run_doctor 单次探测传入。"""
     out: list[Finding] = []
-    owner = lc.resolve_owner()
-    state, ref = lc.state()
 
     if state is State.FOREIGN:
         out.append(

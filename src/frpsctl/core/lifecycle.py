@@ -18,6 +18,7 @@ import enum
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -259,7 +260,22 @@ class Lifecycle:
 
     def state(self) -> tuple[State, ProcessRef | None]:
         """状态判定表（§8.3）。"""
+        return self._state_from(self.resolve_owner())
+
+    def state_with_owner(self) -> tuple[Owner, State, ProcessRef | None]:
+        """一次探测同时拿到 owner 与 state。
+
+        为什么需要它：`resolve_owner()` 在 systemd 环境下要跑 2 个子进程
+        （`systemctl cat` + `is-active`），而 status / doctor 同时需要 owner 和
+        state——分两次调用既浪费一倍子进程，又让两次结果之间可能出现
+        TOCTOU（state 与 owner 自相矛盾）。
+        """
         owner = self.resolve_owner()
+        state, ref = self._state_from(owner)
+        return owner, state, ref
+
+    def _state_from(self, owner: Owner) -> tuple[State, ProcessRef | None]:
+        """状态判定表（接受已解析的 owner）。"""
         if owner is Owner.SYSTEMD:
             return State.SYSTEMD_ACTIVE, None
         ref = self.read_ref()
@@ -328,15 +344,24 @@ class Lifecycle:
 
     # --- start ---------------------------------------------------------
 
-    def start(self, *, health_timeout: float = 10.0) -> StartReport:
-        """启动流程（§8.3）。返回报告；失败抛对应异常。"""
+    def start(
+        self,
+        *,
+        health_timeout: float = 10.0,
+        on_health_tick: Callable[[float, HealthReport], None] | None = None,
+    ) -> StartReport:
+        """启动流程（§8.3）。返回报告；失败抛对应异常。
+
+        `on_health_tick(elapsed, report)` 是健康等待期的进度回调：`core/` 不打印，
+        由 CLI 决定怎么展示（`frpsctl start` 用它渲染逐轮进度）。
+        """
         self.inst.ensure_private()  # 状态与日志马上要落盘，先把目录收紧
         with instance_lock(self.inst.lock):
             if self.resolve_owner() is Owner.SYSTEMD:
                 # ADR-1：所有权是 systemd 时**委托 systemctl**，不碰 pid 文件。
                 # 直接拒绝（旧行为）会让"已被 systemd 纳管"的实例在 frpsctl 里
                 # 完全不可操作，与文档承诺的"全部委托"相矛盾。
-                return self._start_via_systemd()
+                return self._start_via_systemd(health_timeout, on_health_tick)
 
             ref = self.read_ref()
             if ref is not None and ref.is_ours():
@@ -379,7 +404,7 @@ class Lifecycle:
                 if not self._await_alive(proc.pid, STARTUP_GRACE):
                     raise StartupFailed(self._startup_tail())
                 self._write_state(proc, version=version)
-                health = self._await_health(health_timeout)
+                health = self._await_health(health_timeout, on_tick=on_health_tick)
                 if health.l1_process is HealthLayer.FAIL:
                     # 进程在早退检测窗口（STARTUP_GRACE）**之后**才死。这仍是
                     # "启动失败"（不是"起来了但不健康"）：进程已经不在，必须
@@ -542,11 +567,27 @@ class Lifecycle:
         with contextlib.suppress(OSError):
             self.inst.pidfile.write_text(f"{proc.pid}\n", "utf-8")
 
-    def _await_health(self, timeout: float) -> HealthReport:
-        """等待 L1 ∧ L2 通过；超时返回最后一次报告（由调用方决定如何处置）。"""
+    def _await_health(
+        self,
+        timeout: float,
+        *,
+        on_tick: Callable[[float, HealthReport], None] | None = None,
+    ) -> HealthReport:
+        """等待 L1 ∧ L2 通过；超时返回最后一次报告（由调用方决定如何处置）。
+
+        `on_tick(elapsed, report)` 在每次轮询前调用（首轮若已过 gate 则不触发）；
+        `core/` 不打印——它是 CLI 渲染进度的唯一通道。
+        """
         deadline = time.monotonic() + max(0.0, timeout)
+        started = time.monotonic()
         report = self.check_health()
         while not report.gate and time.monotonic() < deadline:
+            if on_tick is not None:
+                # 进度回调是**展示层**：它抛异常绝不能拖垮启动流程——在 start()
+                # 里那会触发 _reap_after_failure，把刚派生的 frps 误杀。实测
+                # 复现过：`2>&1 | head` 让 stderr 断开，回调抛 BrokenPipeError。
+                with contextlib.suppress(Exception):
+                    on_tick(time.monotonic() - started, report)
             if report.l1_process is HealthLayer.FAIL:
                 # 进程已经不在了：继续等不可能等出 gate=True，立即返回，
                 # 让调用方按"启动失败"收尾（`start` 会清理 state.json）。
@@ -659,12 +700,19 @@ class Lifecycle:
 
     # --- systemd 委托 ---------------------------------------------------
 
-    def _start_via_systemd(self) -> StartReport:
+    def _start_via_systemd(
+        self,
+        health_timeout: float,
+        on_health_tick: Callable[[float, HealthReport], None] | None = None,
+    ) -> StartReport:
         """委托 systemctl 启动，然后按三层健康检查确认结果。
 
         健康检查对 systemd 实例同样适用：`/healthz` 是 frps 自己提供的，与
         谁把它拉起来无关。版本从 unit 的 ExecStart 指向的二进制上读——pid 文件
         在 systemd 模式下不参与任何判定（ADR-1）。
+
+        `health_timeout` 由调用方传入（`start(health_timeout=...)`）：此前这里
+        硬编码 10 秒，导致 `--health-timeout` 对 systemd 实例**静默无效**。
         """
         from .systemd import Systemd
 
@@ -672,7 +720,7 @@ class Lifecycle:
         systemd.start()
         pid = systemd.main_pid()
         version = self.disk_version() or read_binary_version(self.binary())
-        health = self._await_health(10.0)
+        health = self._await_health(health_timeout, on_tick=on_health_tick)
         if pid is None:
             raise StartupFailed(
                 "systemd 报告启动成功，但拿不到 MainPID",
@@ -693,11 +741,12 @@ class Lifecycle:
         *,
         timeout: float = STOP_TIMEOUT,
         health_timeout: float = 10.0,
+        on_health_tick: Callable[[float, HealthReport], None] | None = None,
     ) -> StartReport:
         """stop → start。配置回滚由上层事务负责（§9 第 8 步）。"""
         with contextlib.suppress(NotRunning):
             self.stop(timeout=timeout)
-        return self.start(health_timeout=health_timeout)
+        return self.start(health_timeout=health_timeout, on_health_tick=on_health_tick)
 
     # --- status --------------------------------------------------------
 
@@ -722,8 +771,7 @@ class Lifecycle:
                 state_corrupted=True,
                 listen=listen,
             )
-        state, ref = self.state()
-        owner = self.resolve_owner()
+        owner, state, ref = self.state_with_owner()
 
         version_hint: str | None = None
         binary_version: str | None = None

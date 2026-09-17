@@ -16,7 +16,7 @@ import httpx
 
 from ..errors import AdminUnreachable, ApiVersionMismatch
 
-__all__ = ["AdminClient", "ProxyStat", "ServerInfo", "sum_proxy_types"]
+__all__ = ["AdminClient", "ProxyStat", "ServerInfo", "V2Proxy", "sum_proxy_types"]
 
 
 def _is_loopback_url(base_url: str) -> bool:
@@ -89,6 +89,55 @@ class ProxyStat:
             today_traffic_out=int(item.get("todayTrafficOut") or 0),
             cur_conns=int(item.get("curConns") or 0),
             last_start_time=str(item.get("lastStartTime") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class V2Proxy:
+    """`/api/v2/proxies` 的代理条目（**嵌套** `spec`/`status`，与 v1 形状不同）。
+
+    字段名在真机 v0.71.0 上实测（起真 frpc 建代理后抓取）：
+
+    ```json
+    {"name": "alice.test-tcp", "user": "alice", "clientID": "...",
+     "spec": {"type": "tcp", "tcp": {"remotePort": 26000, ...}},
+     "status": {"phase": "online", "todayTrafficIn": 0, "curConns": 0, ...}}
+    ```
+
+    端口在 `spec.<type>.remotePort` 下（http/https 走域名，没有该字段）；
+    状态在 `status.phase`（`online` / `offline`）——不是 v1 的顶层 `status` 字符串。
+    """
+
+    name: str = ""
+    user: str = ""
+    client_id: str = ""
+    type: str = ""
+    remote_port: int = 0
+    phase: str = ""
+    today_traffic_in: int = 0
+    today_traffic_out: int = 0
+    cur_conns: int = 0
+    last_start_at: int = 0
+
+    @classmethod
+    def from_api(cls, item: dict) -> V2Proxy:
+        spec = item.get("spec") or {}
+        status = item.get("status") or {}
+        ptype = str(spec.get("type") or "")
+        section = spec.get(ptype)
+        if not isinstance(section, dict):
+            section = {}
+        return cls(
+            name=str(item.get("name") or ""),
+            user=str(item.get("user") or ""),
+            client_id=str(item.get("clientID") or ""),
+            type=ptype,
+            remote_port=_as_int(section.get("remotePort")),
+            phase=str(status.get("phase") or ""),
+            today_traffic_in=_as_int(status.get("todayTrafficIn")),
+            today_traffic_out=_as_int(status.get("todayTrafficOut")),
+            cur_conns=_as_int(status.get("curConns")),
+            last_start_at=_as_int(status.get("lastStartAt")),
         )
 
 
@@ -208,6 +257,44 @@ class AdminClient:
         if isinstance(payload, dict) and isinstance(payload.get("total"), int):
             return int(payload["total"])
         return len(_page_items(payload))
+
+    # --- 全量列表（自动翻页） ------------------------------------------
+
+    def list_clients(self, *, page_size: int = 200) -> list[dict]:
+        """**全量**客户端列表（自动翻页）。
+
+        与 `clients()` 的区别：后者只取一页（默认 50 条，真机实测），用于
+        "看一眼"；本方法是 `frpsctl clients` 的实现，会把所有页拉全——
+        把分页片段当成全量是静默错误（§11.2.4 的教训）。
+        """
+        return self._paged("/api/v2/clients", page_size=page_size)
+
+    def list_proxies(self, *, user: str = "", page_size: int = 200) -> list[V2Proxy]:
+        """**全量**代理列表（v2 形状，自动翻页）。"""
+        params = {"user": user} if user else None
+        raw = self._paged("/api/v2/proxies", params=params, page_size=page_size)
+        return [V2Proxy.from_api(item) for item in raw]
+
+    def _paged(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        page_size: int = 200,
+        max_pages: int = 100,
+    ) -> list[dict]:
+        """逐页拉取直到 total 满足；带页数上限防止服务端异常时死循环。"""
+        items: list[dict] = []
+        for page in range(1, max_pages + 1):
+            query = dict(params or {})
+            query.update({"page": str(page), "page_size": str(page_size)})
+            payload = self._unwrap(self._get(path, params=query))
+            batch = _page_items(payload)
+            items.extend(batch)
+            total = payload.get("total") if isinstance(payload, dict) else None
+            if not batch or not isinstance(total, int) or len(items) >= total:
+                break
+        return items
 
     def proxy_count_for_user(self, user: str) -> int:
         """某用户当前的代理数（插件 `max_proxies` 配额用）。

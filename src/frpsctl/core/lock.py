@@ -117,6 +117,10 @@ def is_locked(path: Path) -> bool:
 
     本进程自己持有锁时返回 True——那确实意味着"有操作在进行"，而 doctor
     通常从另一个进程跑，所以这个语义在两种情形下都成立。
+
+    ⚠️ 这是**瞬时采样**：探测与释放之间锁状态随时可能变化（TOCTOU）。
+    调用方只能把它当"体检那一刻的线索"，绝不能用作任何决策依据——
+    真正的互斥永远由 `instance_lock` 自己保证。
     """
     resolved = _key(path)[0]
     with _registry_lock:

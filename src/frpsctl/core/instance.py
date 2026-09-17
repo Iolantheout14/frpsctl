@@ -37,6 +37,7 @@ __all__ = [
     "STARTUP_KEEP",
     "resolve_data_home",
     "resolve_instances_root",
+    "list_instances",
 ]
 
 #: 配置快照保留份数（§9 第 6 步）。
@@ -72,6 +73,33 @@ def validate_name(name: str) -> str:
             hint="只允许字母、数字、下划线、点、连字符，且以字母或数字开头（最长 64）",
         )
     return name
+
+
+def list_instances(root: Path, *, data_home: Path | None = None) -> list[Instance]:
+    """列出 `instances_root` 下的全部实例（按名字排序）。
+
+    判定标准只有两条：**直接子目录** + **名字合法**（与 `validate_name` 同一
+    套字符集）。不做"是否像实例"的猜测——目录里没有 frps.toml 也可能是刚建好
+    待初始化的实例，把它藏起来只会让人困惑。
+    """
+    if not root.is_dir():
+        return []
+    instances: list[Instance] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            validate_name(child.name)
+        except UsageError:
+            continue
+        instances.append(
+            Instance(
+                name=child.name,
+                instances_root=root,
+                data_home=data_home if data_home is not None else resolve_data_home(),
+            )
+        )
+    return instances
 
 
 @dataclass(frozen=True)
@@ -206,13 +234,21 @@ class Instance:
         return False
 
     def write_state(self, payload: dict) -> None:
-        """原子写 state.json。**这个文件不参与 is_ours() 的命令行比对来源**，
-        它只是记录"我们曾经启动过什么"。"""
-        tmp = self.state.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", "utf-8")
-        with contextlib.suppress(OSError):
-            tmp.chmod(0o600)
-        os.replace(tmp, self.state)
+        """原子写 state.json。
+
+        走与配置写入同一条 `atomic_write` 路径：此前是手写"固定名 tmp + replace"，
+        缺 fsync（掉电可能留下空/半截文件）、固定 tmp 名在并发下互踩、且重建文件
+        会把属主换回当前用户（systemd 部署把实例目录移交服务用户后，root 再跑
+        frpsctl 就会把 state 的属主夺回）。`state.json` 是所有权判定的权威来源，
+        它的落盘可靠性不该低于配置文件。
+        """
+        from .config import atomic_write
+
+        atomic_write(
+            self.state,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            mode=0o600,
+        )
 
     def clear_state(self) -> None:
         """清除陈旧状态。`missing_ok` 语义，重复调用安全。"""
@@ -233,8 +269,6 @@ class Instance:
             with contextlib.suppress(OSError):
                 if path.exists():
                     path.chmod(0o700)
-        with contextlib.suppress(OSError):
-            self.dir.chmod(0o700)
 
     def new_startup_log(self) -> Path:
         """新开一份启动日志，并修剪到最近 STARTUP_KEEP 份（ADR-5）。

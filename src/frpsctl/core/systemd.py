@@ -32,12 +32,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import FrpsctlError, PermissionRequired, UsageError
+from .healthcheck import is_loopback
 from .instance import Instance
 
-__all__ = ["Systemd", "UNIT_TEMPLATE_PATH", "SYSTEMD_UNIT_DIR", "DEFAULT_SERVICE_USER", "render_unit"]
+__all__ = [
+    "Systemd",
+    "PluginService",
+    "UNIT_TEMPLATE_PATH",
+    "SYSTEMD_UNIT_DIR",
+    "DEFAULT_SERVICE_USER",
+    "render_unit",
+    "render_plugin_unit",
+]
 
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frps@.service"
+PLUGIN_UNIT_TEMPLATE_PATH = SYSTEMD_UNIT_DIR / "frpsctl-plugin@.service"
 
 #: 渲染用的 unit 模板（§12.2）。占位符：%i（systemd 实例说明符）与三个具名参数。
 UNIT_TEMPLATE = """\
@@ -76,6 +86,36 @@ WantedBy=multi-user.target
 #: 默认服务用户：与 unit 模板、README 的部署示例保持一致。
 DEFAULT_SERVICE_USER = "frps"
 
+#: 插件服务的 unit 模板（§11.2：必须由 systemd 守护且 `Restart=always`——
+#: 插件是全部客户端登录的单点且 fail-closed，它挂掉 = 所有人登录不了）。
+PLUGIN_UNIT_TEMPLATE = """\
+[Unit]
+Description=frpsctl server plugin (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+ExecStart={exec_start} --instance %i plugin serve --policy {policy} --bind {bind} --path {handler_path}
+WorkingDirectory={workdir}
+# 插件是全部客户端登录的单点（fail-closed）：任何退出都必须被立刻拉起。
+Restart=always
+RestartSec=2
+
+# 加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# 实例目录同时是策略与审计文件（plugin-policy.json / plugin-audit.jsonl）的所在地
+ReadWritePaths={workdir}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
 
 def render_unit(
     *,
@@ -97,6 +137,227 @@ def render_unit(
         user=user,
         group=group or user,
     )
+
+
+def render_plugin_unit(
+    *,
+    exec_start: str,
+    bind: str,
+    handler_path: str,
+    policy: Path,
+    workdir: Path,
+    user: str = DEFAULT_SERVICE_USER,
+    group: str | None = None,
+) -> str:
+    """渲染插件 unit 模板。
+
+    `ExecStart` 写**具体路径**（不是 `frpsctl` 命令名）：systemd 不读 PATH。
+    pipx 默认装到 `~/.local/bin`，那条路径会被 `ProtectHome=true` 挡住——
+    由 `PluginService.install_template` 的体检在安装前拒绝并给出替代方案。
+    """
+    return PLUGIN_UNIT_TEMPLATE.format(
+        exec_start=exec_start,
+        bind=bind,
+        handler_path=handler_path,
+        policy=policy,
+        workdir=workdir,
+        user=user,
+        group=group or user,
+    )
+
+
+# ---------------------------------------------------------------------------
+# systemctl 原语（Systemd 与 PluginService 共用一份实现）
+# ---------------------------------------------------------------------------
+
+
+def _systemctl(*args: str, timeout: float = 10) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _systemctl_checked(*args: str) -> None:
+    proc = _systemctl(*args)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        # 用 FrpsctlError(1) 而不是 UsageError(2)：systemctl 执行失败不是
+        # "参数写错了"，脚本据此区分"重试可能有用"与"命令本身无效"。
+        raise FrpsctlError(
+            f"systemctl {' '.join(args)} 失败：{detail or proc.returncode}",
+            hint="确认 unit 名与权限；systemd 操作通常需要 root",
+        )
+
+
+def _require_root(action: str) -> None:
+    if os.geteuid() != 0:
+        raise PermissionRequired(f"{action}需要 root 权限", hint="用 sudo 重新运行该命令")
+
+
+@dataclass
+class PluginService:
+    """插件服务的 systemd 集成（`frpsctl plugin service install`）。
+
+    独立于 `Systemd`（unit 模板与生命周期语义不同：插件是独立进程、独立风险
+    面，README 要求 `Restart=always`），但复用同一套体检与 systemctl 委托。
+    模板 `frpsctl-plugin@.service`，实例名映射为 `%i`，与 `frps@.service` 对齐。
+    """
+
+    inst: Instance
+    unit_dir: Path = SYSTEMD_UNIT_DIR
+
+    # --- 单元名 --------------------------------------------------------
+
+    @property
+    def unit_name(self) -> str:
+        return f"frpsctl-plugin@{self.inst.name}.service"
+
+    @property
+    def template_path(self) -> Path:
+        return self.unit_dir / "frpsctl-plugin@.service"
+
+    @property
+    def available(self) -> bool:
+        return shutil.which("systemctl") is not None and self.unit_dir.exists()
+
+    # --- 查询 ----------------------------------------------------------
+
+    def is_active(self) -> bool:
+        if not self.available:
+            return False
+        if self._run("cat", "--no-pager", self.unit_name).returncode != 0:
+            return False
+        return self._run("is-active", self.unit_name).stdout.strip() == "active"
+
+    def main_pid(self) -> int | None:
+        out = self._run("show", "-p", "MainPID", "--value", self.unit_name)
+        text = out.stdout.strip()
+        return int(text) if text.isdigit() and int(text) > 0 else None
+
+    # --- 变更 ----------------------------------------------------------
+
+    def start(self) -> None:
+        self._require_root("启动插件服务")
+        self._run_checked("start", self.unit_name)
+
+    def stop(self) -> None:
+        self._require_root("停止插件服务")
+        self._run_checked("stop", self.unit_name)
+
+    def restart(self) -> None:
+        self._require_root("重启插件服务")
+        self._run_checked("restart", self.unit_name)
+
+    # --- 安装 ----------------------------------------------------------
+
+    def install_template(
+        self,
+        *,
+        exec_start: Path,
+        policy: Path,
+        bind: str = "127.0.0.1:8080",
+        handler_path: str = "/handler",
+        force: bool = False,
+        user: str = DEFAULT_SERVICE_USER,
+        group: str | None = None,
+    ) -> Path:
+        """安装 `frpsctl-plugin@.service` 并 `daemon-reload` + `enable`。**需要 root**。
+
+        与 frps 的 `service install` 同样做前置体检（账户 / 可执行性 / 家目录 /
+        策略文件），理由相同：装一个起不来的 unit 比不装更浪费时间，而错误
+        现场与安装动作相隔很远。
+        """
+        self._require_root("安装插件 unit")
+        if self.template_path.exists() and not force:
+            raise UsageError(
+                f"{self.template_path} 已存在",
+                hint="确认要覆盖请加 --force（会覆盖同名的自定义 unit）",
+            )
+
+        # 插件协议没有任何认证（§11.2.1）：非回环地址直接拒绝，与运行期同一条判据。
+        if not is_loopback(bind):
+            raise UsageError(
+                f"插件拒绝绑定非回环地址：{bind}",
+                hint=(
+                    "frp 的插件协议没有任何认证，任何能访问该端口的人都能伪造 "
+                    "Login/NewProxy 事件。请绑 127.0.0.1"
+                ),
+            )
+
+        accounts = _account_ids(user, group)
+        if accounts is None:
+            raise UsageError(
+                f"系统用户或组不存在：{user}/{group or user}",
+                hint=(
+                    "先创建专用用户（推荐）："
+                    f"sudo useradd --system --no-create-home --shell /usr/sbin/nologin {user}；"
+                    "或用 --user / --group 指定已有账户"
+                ),
+            )
+        uid, gid = accounts
+
+        problem = _access_problem(exec_start, uid=uid, gid=gid)
+        if problem is not None:
+            raise UsageError(
+                f"服务用户 {user!r} 无法执行 frpsctl：{problem}",
+                hint=(
+                    "pipx 默认装在 ~/.local/bin，会被 unit 的 ProtectHome=true 挡住；"
+                    "请改装到系统路径（`sudo pipx install --global frpsctl` 或 "
+                    "`sudo pip install frpsctl`），或调整权限"
+                ),
+            )
+        for label, path in (("frpsctl", exec_start), ("实例目录", self.inst.dir)):
+            home_prefix = _protect_home_conflict(path)
+            if home_prefix is not None:
+                raise UsageError(
+                    f"{label}位于 {home_prefix} 下（{path}），会被 unit 的 ProtectHome=true 挡住",
+                    hint=(
+                        "把 frpsctl 与数据放到系统路径：`sudo pipx install --global frpsctl` "
+                        "且用 `sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl ...`"
+                    ),
+                )
+        if not policy.exists():
+            raise UsageError(
+                f"策略文件不存在：{policy}",
+                hint="先运行 `frpsctl plugin init` 生成策略模板（或用 --policy 指定）",
+            )
+
+        _hand_over_instance(self.inst, uid=uid, gid=gid)
+
+        # 同 Systemd.install_template：全部 resolve——systemd 不接受相对路径。
+        content = render_plugin_unit(
+            exec_start=str(exec_start.resolve()),
+            bind=bind,
+            handler_path=handler_path,
+            policy=policy.resolve(),
+            workdir=self.inst.dir.resolve(),
+            user=user,
+            group=group,
+        )
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+        self.template_path.write_text(content, "utf-8")
+        self.template_path.chmod(0o644)
+        self._run_checked("daemon-reload")
+        self._run_checked("enable", self.unit_name)
+        return self.template_path
+
+    def uninstall(self) -> None:
+        """停用并删除插件 unit 模板。**需要 root**。"""
+        self._require_root("卸载插件 unit")
+        self._run("disable", "--now", self.unit_name)
+        if self.template_path.exists():
+            self.template_path.unlink()
+        self._run_checked("daemon-reload")
+
+    # --- 内部 ----------------------------------------------------------
+
+    def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess:
+        return _systemctl(*args, timeout=timeout)
+
+    def _run_checked(self, *args: str) -> None:
+        _systemctl_checked(*args)
+
+    @staticmethod
+    def _require_root(action: str) -> None:
+        _require_root(action)
 
 
 # ---------------------------------------------------------------------------
@@ -266,20 +527,43 @@ class Systemd:
 
         比对 `ExecStart` 里的 `-c <config>` 路径，而不是 unit 名——用户完全可能
         自建一个名字不同的 unit 指向我们的配置。
+
+        扫描范围是**全部 active service**，不按 unit 名过滤：此前 glob `frps*`
+        只能扫到以 frps 开头的 unit，自建 unit（例如 `my-tunnel.service`）指向
+        我们的配置时漏检，双起防护有洞。非 active 的 unit 不可能造成双起，
+        因此先让 systemd 用 `--state=active` 过滤（通常只剩几十个），再逐个
+        查 ExecStart。
         """
         if not self.available:
             return False
-        out = self._run("list-units", "--type=service", "--all", "--no-legend", "--plain", "frps*", timeout=5)
+        out = self._run(
+            "list-units",
+            "--type=service",
+            "--state=active",
+            "--no-legend",
+            "--plain",
+            timeout=5,
+        )
         for line in out.stdout.splitlines():
-            unit = line.split()[0] if line.split() else ""
-            if not unit:
-                continue
-            if self._run("is-active", unit, timeout=5).stdout.strip() != "active":
+            parts = line.split()
+            unit = parts[0] if parts else ""
+            if not unit or not unit.endswith(".service"):
                 continue
             show = self._run("show", "-p", "ExecStart", "--value", unit, timeout=5)
             if str(self.inst.config) in show.stdout:
                 return True
         return False
+
+    def journal_argv(self, *, lines: int = 100, follow: bool = False) -> list[str]:
+        """构造查看该 unit 日志的 journalctl argv（CLI 负责执行）。
+
+        分层约束：`core/` 不打印、不接管终端——这里只产出 argv。unit 级日志
+        （启动失败、OOM、权限拒绝）只在 journald 里，`frpsctl log` 看不到。
+        """
+        argv = ["journalctl", "-u", self.unit_name, "-n", str(lines), "--no-pager"]
+        if follow:
+            argv.append("-f")
+        return argv
 
     # --- 变更 ----------------------------------------------------------
 
@@ -369,10 +653,15 @@ class Systemd:
         _ensure_log_dir(log_dir, uid=uid, gid=gid)
         _hand_over_instance(self.inst, uid=uid, gid=gid)
 
+        # 全部 **resolve**：systemd 要求 ExecStart / WorkingDirectory / ReadWritePaths
+        # 是绝对路径。用户在 `--root ./instances` / `--binary ./bin/frps` 这类相对
+        # 输入下会渲染出 `ExecStart=bin/frps`——安装成功，`systemctl start` 才报
+        # "Executable path is not absolute"，错误现场与安装动作相隔很远（第五轮
+        # review 实测复现）。
         content = render_unit(
-            binary=str(binary),
-            config_dir=self.inst.instances_root,
-            log_dir=log_dir,
+            binary=str(binary.resolve()),
+            config_dir=self.inst.instances_root.resolve(),
+            log_dir=log_dir.resolve(),
             user=user,
             group=group,
         )
@@ -396,25 +685,11 @@ class Systemd:
     # --- 内部 ----------------------------------------------------------
 
     def _run(self, *args: str, timeout: float = 10) -> subprocess.CompletedProcess:
-        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
+        return _systemctl(*args, timeout=timeout)
 
     def _run_checked(self, *args: str) -> None:
-        proc = self._run(*args)
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).strip()
-            # 用 FrpsctlError(1) 而不是 UsageError(2)：systemctl 执行失败不是
-            # "参数写错了"，脚本据此区分"重试可能有用"与"命令本身无效"。
-            raise FrpsctlError(
-                f"systemctl {' '.join(args)} 失败：{detail or proc.returncode}",
-                hint="确认 unit 名与权限；systemd 操作通常需要 root",
-            )
+        _systemctl_checked(*args)
 
     @staticmethod
     def _require_root(action: str) -> None:
-        import os
-
-        if os.geteuid() != 0:
-            raise PermissionRequired(
-                f"{action}需要 root 权限",
-                hint="用 sudo 重新运行该命令",
-            )
+        _require_root(action)

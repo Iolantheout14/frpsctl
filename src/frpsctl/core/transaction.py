@@ -9,6 +9,27 @@ frps **没有热重载**，所以"改配置"和"重启"是同一件事。frpsctl
 **回滚判据只有 L1 ∧ L2**（§3.7）。L3 插件不可达永不触发回滚——否则插件临时
 抖动会让 frpsctl 把一份完全正确的配置回滚掉，而那份配置恰恰是用于修复问题的
 那一份。
+
+## 锁边界（v0.2.1 起由本模块保证）
+
+"改配置"是典型的**读-改-写**，而锁必须覆盖整段——包括"读"。此前 `plan_set`
+（读）在实例锁外、`apply_change`（写）在锁内，两个并发变更都基于同一份旧文本
+生成完整新文本，后写入者会**静默覆盖**前者（实测复现：两条命令都报成功，其中
+一个改动消失）。因此本模块只对外暴露三个入口，每个都在**同一把锁内**完成
+"读取 → 生成候选 → 落盘"：
+
+| 入口 | 场景 | 候选生成方式 |
+|------|------|-------------|
+| `apply_set` | `config set` | 锁内 `plan_set`（点分键 + 原值） |
+| `apply_edit` | `config edit` | 锁内 **CAS**：先确认文件仍是编辑开始时的内容 |
+| `rollback_to` | `config rollback` | 锁内选快照并读取 |
+
+`apply_edit` 的 CAS 是刻意的：编辑器交互不能持锁（用户可能编十分钟），所以
+草稿写回前必须确认"没有人在这段时间里改过文件"。不一致就拒绝并让人重新编辑
+——把草稿硬写下去等于覆盖别人的改动。
+
+`_apply_locked` 只接受**已生成的候选文本**，且内部仍会取锁（可重入）兜底：
+它是本模块私有的，公共入口已保证候选在锁内产出。
 """
 
 from __future__ import annotations
@@ -24,12 +45,16 @@ from .instance import Instance
 from .lifecycle import Lifecycle, State
 from .lock import instance_lock
 
-__all__ = ["ChangeOutcome", "apply_change", "rollback_to", "config_snapshot"]
+__all__ = ["ChangeOutcome", "apply_set", "apply_edit", "rollback_to", "config_snapshot"]
 
 
 @dataclass(frozen=True)
 class ChangeOutcome:
-    """一次变更的结果，供 CLI 渲染。"""
+    """一次变更的结果，供 CLI 渲染。
+
+    `noop=True` 表示候选值与现值相同（`config set` 的幂等语义、`config edit`
+    的无改动早退）：没有任何字节被写入，CLI 应据此渲染"无需变更"而不是 diff。
+    """
 
     dotted: str
     before: object
@@ -41,6 +66,7 @@ class ChangeOutcome:
     health_gate_ok: bool = True
     plugin_warning: str | None = None
     note: str = ""
+    noop: bool = False
 
 
 def config_snapshot(inst: Instance, *, action: str, detail: str = "") -> Path:
@@ -70,7 +96,172 @@ def config_snapshot(inst: Instance, *, action: str, detail: str = "") -> Path:
     return slot
 
 
-def apply_change(
+# ---------------------------------------------------------------------------
+# 公共入口（锁内完成"读 → 候选 → 写"）
+# ---------------------------------------------------------------------------
+
+
+def apply_set(
+    inst: Instance,
+    *,
+    dotted: str,
+    raw: str,
+    lifecycle: Lifecycle,
+    restart: bool = True,
+    health_timeout: float = 10.0,
+    restore_lifecycle: Lifecycle | None = None,
+) -> ChangeOutcome:
+    """`config set` 的唯一入口：候选生成（plan）与落盘在**同一把实例锁**内。
+
+    这是并发正确性的根因修复点：`plan_set` 是读-改-写里的"读"，放在锁外时
+    两个并发变更会互相覆盖（后写入者的完整文本覆盖前者的改动），且两边都报
+    成功。`noop`（现值等于目标值）同样在锁内判定，避免"判定时无变更、落盘时
+    已有变更"的竞态。
+    """
+    with instance_lock(inst.lock):
+        plan = cfg.plan_set(inst.config, dotted, raw)
+        if plan.is_noop:
+            return ChangeOutcome(
+                dotted=dotted,
+                before=plan.before,
+                after=plan.after,
+                diff="",
+                applied=False,
+                restarted=False,
+                rolled_back=False,
+                noop=True,
+            )
+        return _apply_locked(
+            inst,
+            dotted=dotted,
+            new_text=plan.text,
+            change_diff=plan.diff,
+            before=plan.before,
+            after=plan.after,
+            lifecycle=lifecycle,
+            restart=restart,
+            health_timeout=health_timeout,
+            restore_lifecycle=restore_lifecycle,
+        )
+
+
+def apply_edit(
+    inst: Instance,
+    *,
+    draft: str,
+    expected_current: str,
+    lifecycle: Lifecycle,
+    restart: bool = True,
+    health_timeout: float = 10.0,
+    restore_lifecycle: Lifecycle | None = None,
+) -> ChangeOutcome:
+    """`config edit` 的唯一入口：锁内 CAS 检查 + 落盘。
+
+    **为什么需要 CAS**：编辑器交互在锁外（不能持锁等用户编完），所以写回前
+    必须验证"当前文件仍等于编辑开始时的内容"（`expected_current`）。编辑期间
+    若有人 `config set`，草稿就基于过期文本——直接写入会覆盖别人的改动。
+    此时拒绝并丢弃草稿，让人以最新内容为基准重新编辑。
+
+    `draft` 与基准相同时返回 `noop=True`（"没有改动"），不产生快照。
+    """
+    with instance_lock(inst.lock):
+        current = cfg.read_config_text(inst.config)
+        if current != expected_current:
+            raise ConfigError(
+                "配置文件在编辑期间被其他操作修改，草稿已丢弃",
+                hint="请重新运行 `frpsctl config edit`（以最新内容为基准）",
+            )
+        if draft == expected_current:
+            return ChangeOutcome(
+                dotted="(edit)",
+                before="(edited)",
+                after="(edited)",
+                diff="",
+                applied=False,
+                restarted=False,
+                rolled_back=False,
+                noop=True,
+            )
+        diff = cfg.diff_texts(current, draft, inst.config.name)
+        return _apply_locked(
+            inst,
+            dotted="(edit)",
+            new_text=draft,
+            change_diff=diff,
+            before="(edited)",
+            after="(edited)",
+            lifecycle=lifecycle,
+            restart=restart,
+            health_timeout=health_timeout,
+            restore_lifecycle=restore_lifecycle,
+        )
+
+
+def rollback_to(
+    inst: Instance,
+    *,
+    steps: int,
+    lifecycle: Lifecycle,
+    restart: bool = True,
+    health_timeout: float = 10.0,
+    restore_lifecycle: Lifecycle | None = None,
+) -> ChangeOutcome:
+    """回滚到 N 份之前（`config rollback [N]`，默认 N=1）。
+
+    **复用同一闭环**，而不是简单 `cp` 覆盖：回滚目标同样要过 verify，
+    重启失败同样要能再回滚——否则回滚本身会把服务搞坏。
+
+    快照选择与读取同样在锁内：锁外选快照时，并发的 `config set` 会在"选定"
+    与"落盘"之间推进历史，回滚到的可能不是用户看到的那一份。
+    """
+    with instance_lock(inst.lock):
+        entries = inst.history_entries()
+        if not entries:
+            raise ConfigError(
+                "没有可回滚的配置快照",
+                hint="快照在每次 `config set` / `config edit` 时自动创建于 config-history/",
+            )
+        index = max(0, steps - 1)
+        if index >= len(entries):
+            raise ConfigError(
+                f"只找到 {len(entries)} 份快照，无法回滚 {steps} 步",
+                hint="用 `frpsctl config diff` 查看当前与最近快照的差异",
+            )
+        target = entries[index] / "frps.toml"
+        if not target.exists():
+            raise ConfigError(f"快照不完整，缺少 {target.name}：{target.parent}")
+
+        new_text = target.read_text("utf-8")
+        current_text = inst.config.read_text("utf-8") if inst.config.exists() else ""
+        diff = cfg.diff_texts(current_text, new_text, inst.config.name)
+
+        # "回滚前先把当前存一份"由 _apply_locked 在**实例锁内**完成（它本来就
+        # 要备份变更前的配置）。此前这里是单独一次 config_snapshot，导致一次
+        # 回滚产生**两份内容完全相同**的快照：10 份历史实际只够 5 次操作，
+        # `rollback N` 的计数里一半是重复项；而且那次快照发生在锁外，并发下
+        # 顺序不可靠。
+        return _apply_locked(
+            inst,
+            dotted=f"(rollback {steps} → {target.parent.name})",
+            new_text=new_text,
+            change_diff=diff,
+            before="(current)",
+            after=f"(snapshot {target.parent.name})",
+            lifecycle=lifecycle,
+            restart=restart,
+            health_timeout=health_timeout,
+            restore_lifecycle=restore_lifecycle,
+            snapshot_action=f"rollback {steps}",
+            snapshot_detail=f"目标快照 {target.parent.name}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 落盘闭环（只接受已生成的候选文本）
+# ---------------------------------------------------------------------------
+
+
+def _apply_locked(
     inst: Instance,
     *,
     dotted: str,
@@ -79,16 +270,17 @@ def apply_change(
     before: object,
     after: object,
     lifecycle: Lifecycle,
-    restart: bool = True,
-    health_timeout: float = 10.0,
-    restore_lifecycle: Lifecycle | None = None,
+    restart: bool,
+    health_timeout: float,
+    restore_lifecycle: Lifecycle | None,
     snapshot_action: str | None = None,
     snapshot_detail: str | None = None,
 ) -> ChangeOutcome:
     """把一份候选配置落盘，并按需重启 + 回滚。
 
-    调用方（CLI）负责生成 `new_text`（走 `config.plan_set`），本函数负责
-    第 4–9 步：校验 → 备份 → 替换 → 重启 → 健康检查 → 回滚。
+    第 4–9 步：校验 → 备份 → 替换 → 重启 → 健康检查 → 回滚。候选文本由调用方
+    （本模块的三个公共入口）在锁内生成；函数内部再取一次锁（可重入）作为兜底，
+    防止未来有人从锁外直接调用。
 
     `restore_lifecycle` 仅在测试中注入：回滚后的重启应当用**同一套**生命周期
     配置（否则测试会用一个"必定成功"的替身掩盖回滚失败的真实行为）。
@@ -108,7 +300,7 @@ def apply_change(
             new_text,
             binary=binary,
             workdir=inst.dir,
-            uses_unsafe=_uses_unsafe(new_text),
+            uses_unsafe=cfg.needs_unsafe_flag(new_text),
         )
 
         # 5b. 危险组合拦截（§10 硬约束 1）。
@@ -177,60 +369,6 @@ def apply_change(
             health_gate_ok=True,
             plugin_warning=report.health.plugin_warning,
         )
-
-
-def rollback_to(
-    inst: Instance,
-    *,
-    steps: int,
-    lifecycle: Lifecycle,
-    restart: bool = True,
-    health_timeout: float = 10.0,
-    restore_lifecycle: Lifecycle | None = None,
-) -> ChangeOutcome:
-    """回滚到 N 份之前（`config rollback [N]`，默认 N=1）。
-
-    **复用同一闭环**，而不是简单 `cp` 覆盖：回滚目标同样要过 verify，
-    重启失败同样要能再回滚——否则回滚本身会把服务搞坏。
-    """
-    entries = inst.history_entries()
-    if not entries:
-        raise ConfigError(
-            "没有可回滚的配置快照",
-            hint="快照在每次 `config set` / `config edit` 时自动创建于 config-history/",
-        )
-    index = max(0, steps - 1)
-    if index >= len(entries):
-        raise ConfigError(
-            f"只找到 {len(entries)} 份快照，无法回滚 {steps} 步",
-            hint="用 `frpsctl config diff` 查看当前与最近快照的差异",
-        )
-    target = entries[index] / "frps.toml"
-    if not target.exists():
-        raise ConfigError(f"快照不完整，缺少 {target.name}：{target.parent}")
-
-    new_text = target.read_text("utf-8")
-    current_text = inst.config.read_text("utf-8") if inst.config.exists() else ""
-    diff = cfg.diff_texts(current_text, new_text, inst.config.name)
-
-    # "回滚前先把当前存一份"由 apply_change 在**实例锁内**完成（它本来就要备份
-    # 变更前的配置）。此前这里是单独一次 config_snapshot，导致一次回滚产生
-    # **两份内容完全相同**的快照：10 份历史实际只够 5 次操作，`rollback N`
-    # 的计数里一半是重复项；而且那次快照发生在锁外，并发下顺序不可靠。
-    return apply_change(
-        inst,
-        dotted=f"(rollback {steps} → {target.parent.name})",
-        new_text=new_text,
-        change_diff=diff,
-        before="(current)",
-        after=f"(snapshot {target.parent.name})",
-        lifecycle=lifecycle,
-        restart=restart,
-        health_timeout=health_timeout,
-        restore_lifecycle=restore_lifecycle,
-        snapshot_action=f"rollback {steps}",
-        snapshot_detail=f"目标快照 {target.parent.name}",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -305,19 +443,3 @@ def _reject_dangerous_combination(text: str) -> None:
             f"拒绝写入危险配置：{problem}",
             hint=("请先设置 webServer.user 与 webServer.password，或把 webServer.addr 改回 127.0.0.1"),
         )
-
-
-def _uses_unsafe(text: str) -> bool:
-    import tomllib
-
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        return False
-    auth = data.get("auth")
-    if not isinstance(auth, dict):
-        return False  # `auth = "oops"` 这类类型错误交给 pydantic 报（退出码 3）
-    source = auth.get("tokenSource")
-    if not isinstance(source, dict):
-        return False
-    return str(source.get("type", "")).lower() == "exec"

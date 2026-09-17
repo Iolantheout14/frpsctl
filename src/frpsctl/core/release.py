@@ -136,24 +136,47 @@ class InstallResult:
 
 
 def _fetch(url: str, *, timeout: float = 60.0) -> bytes:
-    """取回一个 URL 的内容。优先用 curl——它自带镜像/代理/重定向的成熟处理。"""
-    if shutil.which("curl"):
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            proc = subprocess.run(
-                ["curl", "-fsSL", "--max-time", str(int(timeout)), "-o", str(tmp_path), url],
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode == 0:
-                return tmp_path.read_bytes()
-            raise OSError(proc.stderr.strip() or f"curl 退出码 {proc.returncode}")
-        finally:
-            tmp_path.unlink(missing_ok=True)
+    """取回一个 URL 的内容。
 
-    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
-        return resp.read()
+    优先用 curl——它自带镜像/代理/重定向的成熟处理，并且在终端上会**显示
+    下载进度**（14 MB 的二进制在弱网下静默等待，看起来像卡死）。
+
+    curl 失败时**回退到 urllib**：此前 curl 存在但失败（例如代理配置损坏、
+    TLS 太老）会让所有下载直接以一条错误结束，而 urllib 兜底代码永远不会被
+    执行。两个通道的错误都保留在最终异常里。
+    """
+    errors: list[str] = []
+    curl = shutil.which("curl")
+    if curl:
+        try:
+            return _fetch_with_curl(curl, url, timeout=timeout)
+        except OSError as exc:
+            errors.append(f"curl：{exc}")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            return resp.read()
+    except Exception as exc:  # noqa: BLE001 - urllib 的异常种类繁多，统一转成可读错误
+        errors.append(f"urllib：{exc}")
+    raise OSError("；".join(errors) if errors else "无可用下载方式（未找到 curl 且 urllib 失败）")
+
+
+def _fetch_with_curl(curl: str, url: str, *, timeout: float) -> bytes:
+    """curl 下载到临时文件再读回。
+
+    stderr **刻意不捕获**：让 curl 自己在终端画进度条（管道/重定向时它会自动
+    静默），错误信息也直接可见——捕获它们等于把唯一的进度反馈藏起来。
+    """
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv 由本函数构造，无 shell 拼接
+            [curl, "-fSL", "--max-time", str(int(timeout)), "-o", str(tmp_path), url],
+        )
+        if proc.returncode != 0:
+            raise OSError(f"退出码 {proc.returncode}")
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def download(asset: str, version: str, mirrors: tuple[str, ...] = DEFAULT_MIRRORS) -> bytes:
@@ -347,7 +370,9 @@ def install(
 def _place_binary(blob: bytes, *, member: str, dest: Path) -> None:
     """把 tar 里的一个成员解出来、复验、原子就位。"""
     payload = extract_frps(blob, member_name=member)
-    tmp = dest.with_name(f".{dest.name}.dl-{os.getpid()}")
+    # 临时名带线程 id（与 switch_symlink 一致）：只用 pid 时同一进程内两个线程
+    # 并发安装同一版本会互踩临时文件。
+    tmp = dest.with_name(f".{dest.name}.dl-{os.getpid()}-{threading.get_ident()}")
     try:
         tmp.write_bytes(payload)
         tmp.chmod(0o755)

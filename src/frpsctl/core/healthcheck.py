@@ -138,7 +138,11 @@ def parse_listen(config_path: Path) -> ListenInfo | None:
 
     返回 None 仅表示"配置不可读/不可解析"（文件缺失、语法错误）；**合法的
     空配置**仍返回默认值 `0.0.0.0:7000`——那是 frp 的生效值，不是"无监听"。
-    `bindPort` <= 0 视为无意义（返回 None）。
+
+    `bindPort <= 0` 同样回落到默认 7000：**实测确认**（真 frps 0.71.0，
+    `bindPort = 0` 启动日志为 `frps tcp listen on 127.0.0.1:7000`）——
+    与 `bindAddr` 的空值兜底是同一套 `Complete()` 逻辑，此前这里把它当作
+    "无意义/无监听"，会漏报一个真实在监听的端口。
     """
     try:
         raw = config_path.read_bytes()
@@ -153,7 +157,7 @@ def parse_listen(config_path: Path) -> ListenInfo | None:
     addr = str(data.get("bindAddr") or DEFAULT_BIND_ADDR)
     port = _as_int(data.get("bindPort"), DEFAULT_BIND_PORT)
     if port <= 0:
-        return None
+        port = DEFAULT_BIND_PORT
     return ListenInfo(addr=addr, port=port)
 
 

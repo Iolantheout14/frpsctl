@@ -46,6 +46,9 @@ __all__ = [
     "diff_texts",
     "ensure_table",
     "load_config",
+    "read_config_text",
+    "needs_unsafe_flag",
+    "flatten_tree",
     "plan_set",
     "reject_template_syntax",
     "validate_text",
@@ -401,6 +404,25 @@ def load_config(path: Path) -> tomlkit.TOMLDocument:
         raise ConfigError(f"配置文件 TOML 语法错误：{exc}") from None
 
 
+def read_config_text(path: Path) -> str:
+    """读配置原文。文件缺失/不可读都收口成 `ConfigError`（退出码 3）。
+
+    存在的意义：`read_text` 的裸 `FileNotFoundError` 冒到 CLI 会变成
+    "未分类错误(1)"——把"你还没 init"误报成"工具内部出错"。所有直接读配置
+    文本的调用点（`verify` / `config edit` / `config diff` / `start`）都必须
+    走这里；语义错误文案与 `load_config` 保持一致。
+    """
+    try:
+        return path.read_text("utf-8")
+    except FileNotFoundError:
+        raise ConfigError(
+            f"配置文件不存在：{path}",
+            hint="先运行 `frpsctl init` 生成，或用 --config 指定路径",
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"无法读取配置文件 {path}：{exc}") from None
+
+
 def get_value(doc: tomlkit.TOMLDocument, dotted: str) -> Any:
     """按点分路径取值；缺失抛 `ConfigKeyMissing`。"""
     node: Any = doc
@@ -409,6 +431,22 @@ def get_value(doc: tomlkit.TOMLDocument, dotted: str) -> Any:
             raise ConfigKeyMissing(dotted)
         node = node[part]
     return node
+
+
+def flatten_tree(value: Any, *, prefix: str = "") -> list[tuple[str, Any]]:
+    """把配置树摊平成 `(点分键, 值)` 列表（供 `config list`）。
+
+    数组与标量都按**叶子**处理（`allowPorts` 是一个整体，不展开成
+    `allowPorts.0.single`——那既不是 TOML 的键，也没法用于 `config set`）。
+    """
+    out: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            out.extend(flatten_tree(item, prefix=child))
+    elif prefix:
+        out.append((prefix, value))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +613,7 @@ def config_flags(*, uses_exec_token_source: bool = False) -> list[str]:
 
 
 def uses_exec_token_source(doc: Any) -> bool:
-    """配置是否用了会触发 `--allow-unsafe` 的 exec token 源。"""
+    """配置是否用了会触发 `--allow-unsafe` 的 exec token 源（接受已解析的文档）。"""
     try:
         source = get_value(doc, "auth.tokenSource")
     except FrpsctlError:
@@ -583,6 +621,28 @@ def uses_exec_token_source(doc: Any) -> bool:
     if not isinstance(source, dict):
         return False
     return str(source.get("type", "")).lower() == "exec"
+
+
+def needs_unsafe_flag(text: str) -> bool:
+    """配置**文本**是否需要 `--allow-unsafe TokenSourceExec`（§3.1）。
+
+    这是全项目唯一的"从文本判定"入口：`verify` / `start` / `doctor` / 变更事务
+    都调它。此前同一逻辑有四份手写副本（transaction / cli / doctor / 本模块），
+    任何一份漂移都会让 exec tokenSource 的配置在对应路径上被误拒或误放——
+    单点判定的意义就在这里。
+
+    解析失败一律返回 False：语法/类型错误交给 `frps verify` 与 pydantic 报
+    （各自的错误信息更准确），这里只负责"标志怎么构造"。
+    """
+    import tomllib
+
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return uses_exec_token_source(data)
 
 
 def validate_text(
