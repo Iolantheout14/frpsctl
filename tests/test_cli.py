@@ -330,15 +330,25 @@ class TestInitConfig:
         assert result.exit_code == 3, result.output
 
     def test_init_validates_generated_config(self, cli_env) -> None:
-        """生成即自检：非法端口必须在 init 阶段失败，且**不落盘**。
+        """非法端口必须在 init 阶段失败，且**不落盘**。
 
         回归：`init --bind-port 99999` 此前会成功生成一份必然被 verify 拒绝的
-        配置，把问题推迟到 start 才暴露。
+        配置，把问题推迟到 start 才暴露。范围约束现在由 Click 的 min/max 承担
+        （归入用法错误 2，与 `stop --timeout` 等数值选项一致）；
+        `cfg.validate_semantics(text)` 仍作为生成后的兜底自检保留。
         """
         result = runner.invoke(app, ["init", "--no-input", "--bind-port", "99999"])
-        assert result.exit_code == 3, result.output
-        assert "bindPort" in result.output
+        assert result.exit_code == 2, result.output
         assert not (cli_env / "instances" / "default" / "frps.toml").exists()
+
+    def test_bind_port_zero_is_usage_error(self, cli_env) -> None:
+        """`--bind-port 0` 直接归入用法错误(2)。
+
+        实测：frp 对 `bindPort = 0` 回落到默认 7000——写成 0 会得到"我设了 0
+        怎么监听 7000"的困惑。引导用户写真实端口，而不是悄悄回落。
+        """
+        result = runner.invoke(app, ["init", "--no-input", "--bind-port", "0"])
+        assert result.exit_code == 2, result.output
 
     def test_second_init_requires_force(self, cli_env) -> None:
         runner.invoke(app, ["init", "--no-input"])
@@ -377,6 +387,45 @@ class TestConfigSetValidation:
         result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "20"])
         assert result.exit_code == 0
         assert "无需变更" in result.output
+
+    def test_noop_set_reports_json(self, cli_env) -> None:
+        """`--json` 模式下 noop 也必须输出 JSON（此前会打印人读文本）。"""
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "20", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["noop"] is True
+        assert payload["applied"] is False
+
+    def test_edit_missing_config_is_a_config_error(self, cli_env, monkeypatch) -> None:
+        """配置不存在时 `config edit` 必须是配置错误(3)，而不是未分类错误(1)。
+
+        回归：直接 `read_text` 让裸 `FileNotFoundError` 冒到 CLI 顶层。
+        """
+        monkeypatch.setenv("EDITOR", "true")
+        result = runner.invoke(app, ["config", "edit"])
+        assert result.exit_code == 3, result.output
+        assert "配置文件不存在" in result.output
+
+    def test_editor_with_arguments_is_supported(self, cli_env, monkeypatch) -> None:
+        """`EDITOR="true --whatever"`（带参数写法）必须可用。
+
+        回归：此前把整个字符串当可执行文件路径 → `FileNotFoundError: 'true --whatever'`
+        → "未分类错误(1)"，而带参数的 EDITOR 是完全正常的配置方式。
+        """
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setenv("EDITOR", "true --wait --reuse-window")
+        result = runner.invoke(app, ["config", "edit"])
+        assert result.exit_code == 0, result.output
+        assert "没有改动" in result.output
+
+    def test_editor_with_unbalanced_quotes_is_usage_error(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setenv("EDITOR", "vi'm")
+        result = runner.invoke(app, ["config", "edit"])
+        assert result.exit_code == 2, result.output
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +595,270 @@ class TestStatusListen:
         result = runner.invoke(app, ["status", "--json"])
         payload = json.loads(result.stdout)
         assert payload["listen"] == {"addr": "0.0.0.0", "port": 17000}
+
+
+class _FakeAdminClient:
+    """AdminClient 的替身：只实现新命令用到的方法。"""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def __enter__(self) -> "_FakeAdminClient":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def list_clients(self) -> list[dict]:
+        return [
+            {
+                "key": "alice.abc123",
+                "user": "alice",
+                "hostname": "test-host",
+                "online": True,
+                "clientIP": "127.0.0.1",
+                "version": "0.71.0",
+            }
+        ]
+
+    def list_proxies(self) -> list:
+        from frpsctl.core.admin import V2Proxy
+
+        return [
+            V2Proxy(
+                name="alice.web",
+                user="alice",
+                type="tcp",
+                remote_port=6000,
+                phase="online",
+                cur_conns=2,
+                today_traffic_in=1024,
+                today_traffic_out=2048,
+            )
+        ]
+
+
+class TestClientsAndProxiesCommands:
+    def test_clients_requires_dashboard(self, cli_env) -> None:
+        """dashboard 未启用 → 退出码 7（与 kick 同一判据）。"""
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["clients"])
+        assert result.exit_code == 7, result.output
+
+    def test_clients_renders_rows(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        result = runner.invoke(app, ["clients"])
+        assert result.exit_code == 0, result.output
+        assert "alice" in result.stdout
+        assert "test-host" in result.stdout
+
+    def test_clients_json_shape(self, cli_env, monkeypatch) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        result = runner.invoke(app, ["clients", "--json"])
+        payload = json.loads(result.stdout)
+        assert payload["clients"][0]["user"] == "alice"
+
+    def test_proxies_renders_and_filters(self, cli_env, monkeypatch) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        result = runner.invoke(app, ["proxies"])
+        assert result.exit_code == 0, result.output
+        assert "alice.web" in result.stdout
+        assert "6000" in result.stdout
+
+        filtered = runner.invoke(app, ["proxies", "--type", "http"])
+        assert "没有代理" in filtered.stdout
+
+        as_json = runner.invoke(app, ["proxies", "--json"])
+        assert json.loads(as_json.stdout)["proxies"][0]["name"] == "alice.web"
+
+
+class TestInstancesCommand:
+    def test_lists_nothing_gracefully(self, cli_env) -> None:
+        result = runner.invoke(app, ["instances"])
+        assert result.exit_code == 0, result.output
+        assert "未找到任何实例" in result.output
+
+    def test_lists_all_instances(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["--instance", "web", "init", "--no-input"])
+        result = runner.invoke(app, ["instances"])
+        assert result.exit_code == 0, result.output
+        assert "default" in result.stdout
+        assert "web" in result.stdout
+        assert "STOPPED" in result.stdout
+
+    def test_json_shape(self, cli_env) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["instances", "--json"])
+        payload = json.loads(result.stdout)
+        assert payload["instances"][0]["instance"] == "default"
+        assert payload["instances"][0]["state"] == "STOPPED"
+
+
+class TestConfigListCommand:
+    def test_lists_keys_and_masks_secrets(self, cli_env) -> None:
+        import re
+
+        runner.invoke(app, ["init", "--no-input"])
+        raw = (cli_env / "instances" / "default" / "frps.toml").read_text("utf-8")
+        token = re.search(r'token = "([^"]+)"', raw).group(1)
+
+        result = runner.invoke(app, ["config", "list"])
+        assert result.exit_code == 0, result.output
+        assert "bindPort = 7000" in result.stdout
+        assert "auth.token = " in result.stdout
+        assert token not in result.stdout, "config list 泄露了 token"
+
+    def test_prefix_filter(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "list", "--prefix", "webServer"])
+        assert result.exit_code == 0, result.output
+        assert "webServer.port" in result.stdout
+        assert "bindPort" not in result.stdout
+
+    def test_tree_view_groups_tables(self, cli_env) -> None:
+        """`--tree` 按表分组缩进展示（表头只显示末段名）。"""
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "list", "--tree"])
+        assert result.exit_code == 0, result.output
+        assert "[auth]" in result.stdout
+        assert "  token = " in result.stdout
+        assert "[webServer]" in result.stdout
+        assert "  port = " in result.stdout
+        # 顶层键不缩进
+        assert "\nbindPort = " in "\n" + result.stdout
+
+    def test_tree_view_with_prefix(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "list", "--prefix", "transport", "--tree"])
+        assert result.exit_code == 0, result.output
+        assert "[transport.tls]" in result.stdout
+        assert "  force = true" in result.stdout
+
+    def test_unknown_prefix_is_a_config_error(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "list", "--prefix", "noSuchTable"])
+        assert result.exit_code == 3, result.output
+
+    def test_json_shape(self, cli_env) -> None:
+        import json
+
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["config", "list", "--json"])
+        payload = json.loads(result.stdout)
+        keys = {item["key"] for item in payload["keys"]}
+        assert "bindPort" in keys
+        token_item = next(item for item in payload["keys"] if item["key"] == "auth.token")
+        assert "***" in str(token_item["value"])
+
+
+class TestServiceLogs:
+    """`service logs`（journald 集成）：argv 构造与缺命令时的一致性报错。"""
+
+    def test_builds_journalctl_argv(self, cli_env, monkeypatch) -> None:
+        import subprocess as sp
+
+        runner.invoke(app, ["init", "--no-input"])
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "shutil.which", lambda name: "/usr/bin/journalctl" if name == "journalctl" else None
+        )
+        monkeypatch.setattr(sp, "call", lambda argv: calls.append(list(argv)) or 0)
+
+        result = runner.invoke(app, ["service", "logs", "-n", "50", "-f"])
+        assert result.exit_code == 0, result.output
+        assert calls == [
+            ["journalctl", "-u", "frps@default.service", "-n", "50", "--no-pager", "-f"]
+        ]
+
+    def test_missing_journalctl_is_usage_error(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        result = runner.invoke(app, ["service", "logs"])
+        assert result.exit_code == 2, result.output
+        assert "journalctl" in result.output
+
+
+class TestHealthWaitHint:
+    def test_start_prints_wait_hint_to_stderr(self, cli_env) -> None:
+        """等待健康检查时给一行 stderr 提示（长等待不再静默）。
+
+        必须走 stderr：`--json` 的 stdout 是机器可读契约。
+        """
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["start", "--health-timeout", "1"])
+        try:
+            assert result.exit_code == 0, result.output
+            assert "等待健康检查" in result.stderr
+            assert "等待健康检查" not in result.stdout
+        finally:
+            runner.invoke(app, ["stop"])
+
+    def test_wait_progress_lines_are_emitted_during_failure(self, cli_env, monkeypatch) -> None:
+        """gate 未通过时等待期有**逐轮进度**（非终端按行输出）。
+
+        回归：进度此前只有一行静态提示，等待过程没有任何实时反馈。
+        注意 `--health-timeout` 必须大于首轮探测耗时（L2 的 `/healthz` 超时
+        1.5s），否则循环不进入、也就没有后续轮次可报告。
+        """
+        import socket
+
+        from .conftest import free_ports
+
+        monkeypatch.setattr("frpsctl.cli.ui._progress_last", 0.0)  # 消除跨测试限流
+        install_fake_binary(cli_env)
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        dash_port = blocker.getsockname()[1]
+        bind_port = free_ports(1)[0]
+        try:
+            runner.invoke(
+                app,
+                [
+                    "init",
+                    "--no-input",
+                    "--bind-port",
+                    str(bind_port),
+                    "--dashboard-port",
+                    str(dash_port),
+                ],
+            )
+            result = runner.invoke(app, ["start", "--health-timeout", "3"])
+        finally:
+            blocker.close()
+        try:
+            assert result.exit_code == 12, result.output
+            progress_lines = [
+                line
+                for line in result.stderr.splitlines()
+                if line.startswith("等待健康检查 ") and "：L1" in line
+            ]
+            assert progress_lines, result.stderr
+        finally:
+            runner.invoke(app, ["stop"])
+
+    def test_json_mode_stdout_stays_clean(self, cli_env) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["start", "--health-timeout", "1", "--json"])
+        try:
+            assert result.exit_code == 0, result.output
+            json.loads(result.stdout)  # 混入提示就会在这里炸
+        finally:
+            runner.invoke(app, ["stop"])
 
 
 class TestInstallMirrorOption:

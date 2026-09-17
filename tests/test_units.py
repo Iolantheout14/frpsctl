@@ -18,6 +18,8 @@ from frpsctl.core import platform as plat
 from frpsctl.core.lock import instance_lock, is_locked
 from frpsctl.errors import ConfigError, LockBusy, TemplateSyntaxRejected
 
+from .conftest import make_fake_frps
+
 
 # ---------------------------------------------------------------------------
 # core/platform.py —— 进程原语
@@ -739,6 +741,87 @@ class TestInstallChecksumOrder:
         assert result.binary.exists()
 
 
+class _FakeResponse:
+    """最小 http 响应替身（只支持 with + read）。"""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+class TestFetchFallback:
+    """`_fetch` 的双通道：curl 失败必须回退 urllib（此前兜底代码不可达）。
+
+    回归：`if shutil.which("curl"): ... raise OSError(...)` 让 curl 存在但失败
+    （代理配置损坏、TLS 太老）时所有下载直接结束，而 urllib 那条路径永远不会
+    被执行——镜像回退再多也没用。
+    """
+
+    def test_falls_back_to_urllib_when_curl_fails(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.setattr(rel.shutil, "which", lambda _name: "/usr/bin/curl")
+        monkeypatch.setattr(
+            rel.subprocess,
+            "run",
+            lambda *a, **_k: subprocess.CompletedProcess(
+                a[0] if a else "curl", 22, stdout="", stderr="boom"
+            ),
+        )
+        monkeypatch.setattr(
+            rel.urllib.request,
+            "urlopen",
+            lambda *_args, **_kwargs: _FakeResponse(b"from-urllib"),
+        )
+        assert rel._fetch("https://example.invalid/x") == b"from-urllib"
+
+    def test_reports_both_channels_when_both_fail(self, monkeypatch) -> None:
+        from frpsctl.core import release as rel
+
+        monkeypatch.setattr(rel.shutil, "which", lambda _name: "/usr/bin/curl")
+        monkeypatch.setattr(
+            rel.subprocess,
+            "run",
+            lambda *a, **_k: subprocess.CompletedProcess(
+                a[0] if a else "curl", 22, stdout="", stderr="boom"
+            ),
+        )
+
+        def boom(url, timeout=None):
+            raise OSError("dns failure")
+
+        monkeypatch.setattr(rel.urllib.request, "urlopen", boom)
+        with pytest.raises(OSError) as excinfo:
+            rel._fetch("https://example.invalid/x")
+        assert "curl" in str(excinfo.value)
+        assert "urllib" in str(excinfo.value)
+
+    def test_curl_progress_output_is_not_captured(self, monkeypatch) -> None:
+        """curl 的 stderr 不得捕获：进度条与错误信息是唯一的可见通道。"""
+        from frpsctl.core import release as rel
+
+        calls: list[dict] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(kwargs)
+            out = Path(argv[argv.index("-o") + 1])
+            out.write_bytes(b"payload")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(rel.shutil, "which", lambda _name: "/usr/bin/curl")
+        monkeypatch.setattr(rel.subprocess, "run", fake_run)
+        assert rel._fetch("https://example.invalid/x") == b"payload"
+        assert calls and "capture_output" not in calls[0], calls
+
+
 class TestResolveMirrors:
     """镜像解析优先级：CLI 参数 > FRPSCTL_MIRROR > 内置。
 
@@ -1031,6 +1114,21 @@ class TestParseListen:
         info = parse_listen(config)
         assert info is not None
         assert (info.addr, info.port) == ("0.0.0.0", 7000)
+
+    def test_bind_port_zero_falls_back_to_default(self, tmp_path) -> None:
+        """`bindPort = 0` 回落到默认 7000——**实测确认**（真 frps 0.71.0 的
+        启动日志为 `frps tcp listen on 127.0.0.1:7000`）。
+
+        回归：此前把 `<= 0` 当作"无监听"返回 None，而 frp 其实照常监听——
+        用户会在 status 里看到一个真实存在却未展示的端口。
+        """
+        from frpsctl.core.healthcheck import parse_listen
+
+        config = tmp_path / "frps.toml"
+        config.write_text('bindAddr = "127.0.0.1"\nbindPort = 0\n', "utf-8")
+        info = parse_listen(config)
+        assert info is not None
+        assert (info.addr, info.port) == ("127.0.0.1", 7000)
 
     def test_missing_file_returns_none(self, tmp_path) -> None:
         from frpsctl.core.healthcheck import parse_listen
@@ -1439,6 +1537,27 @@ class TestSystemdDelegation:
         assert ["systemctl", "disable", "--now", "frps@test.service"] in recorded
         assert ["systemctl", "daemon-reload"] in recorded
 
+    def test_relative_inputs_are_resolved_in_unit(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts, monkeypatch
+    ) -> None:
+        """相对路径的 binary / log_dir 必须渲染为绝对路径（systemd 不接受相对路径）。"""
+        monkeypatch.chdir(tmp_path)
+        binary = Path("bin/frps-0.71.0")
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+
+        systemd.install_template(binary=binary, log_dir=Path("logs"))
+        text = systemd.template_path.read_text("utf-8")
+
+        resolved_bin = (tmp_path / "bin" / "frps-0.71.0").resolve()
+        assert f"ExecStart={resolved_bin} -c" in text
+        assert "ExecStart=bin/" not in text, "渲染了相对路径"
+        for line in text.splitlines():
+            if line.startswith("ReadWritePaths="):
+                for token in line.split("=", 1)[1].split():
+                    assert Path(token.replace("%i", "t")).is_absolute(), line
+
     def test_mutation_requires_root(self, systemd, recorded, monkeypatch) -> None:
         """非 root 时三个变更动作都必须拒绝，且**不得**调用 systemctl。"""
         from frpsctl.errors import PermissionRequired
@@ -1494,6 +1613,317 @@ class TestSystemdDelegation:
         # `unit_dir` 在 dataclass 实例上，改类属性对已构造的实例无效。
         monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
         assert Systemd(systemd.inst, unit_dir=tmp_path / "missing").available is False
+
+
+class TestPluginService:
+    """`plugin service install` 的 unit 渲染与部署体检（§11.2 的 systemd 落地）。
+
+    README 硬性要求"插件必须由 systemd 守护且 Restart=always"，但此前工具不提供
+    任何 unit 生成——用户只能手写。这里的断言就是那条文档承诺的可执行形式。
+    """
+
+    def test_render_plugin_unit(self) -> None:
+        from frpsctl.core.systemd import render_plugin_unit
+
+        text = render_plugin_unit(
+            exec_start="/usr/local/bin/frpsctl",
+            bind="127.0.0.1:8080",
+            handler_path="/handler",
+            policy=Path("/etc/frps/instances/web/plugin-policy.json"),
+            workdir=Path("/etc/frps/instances/web"),
+        )
+        assert (
+            "ExecStart=/usr/local/bin/frpsctl --instance %i plugin serve "
+            "--policy /etc/frps/instances/web/plugin-policy.json "
+            "--bind 127.0.0.1:8080 --path /handler" in text
+        )
+        # 插件是登录单点：任何退出都必须被立刻拉起
+        assert "Restart=always" in text
+        # 策略与审计都落在实例目录
+        assert "ReadWritePaths=/etc/frps/instances/web" in text
+        assert "ProtectHome=true" in text
+        assert "User=frps" in text and "Group=frps" in text
+
+    @pytest.fixture
+    def service(self, inst, tmp_path):
+        from frpsctl.core.systemd import PluginService
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        (inst.dir / "plugin-policy.json").write_text('{"users": {}}', "utf-8")
+        return PluginService(inst, unit_dir=tmp_path / "systemd-plugin")
+
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    @pytest.fixture
+    def as_root(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    @pytest.fixture
+    def fake_accounts(self, monkeypatch):
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._account_ids",
+            lambda *_: (os.getuid(), os.getgid()),
+        )
+
+    def _binary(self, tmp_path) -> Path:
+        binary = tmp_path / "frpsctl"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        return binary
+
+    def test_install_writes_unit_and_enables(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        policy = service.inst.dir / "plugin-policy.json"
+        path = service.install_template(exec_start=self._binary(tmp_path), policy=policy)
+
+        assert path == service.template_path
+        assert path.exists()
+        text = path.read_text("utf-8")
+        assert "ExecStart=" in text and "plugin serve" in text
+        assert ["systemctl", "daemon-reload"] in recorded
+        assert ["systemctl", "enable", "frpsctl-plugin@test.service"] in recorded
+
+    def test_install_rejects_non_loopback_bind(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError, match="非回环"):
+            service.install_template(
+                exec_start=self._binary(tmp_path),
+                policy=service.inst.dir / "plugin-policy.json",
+                bind="0.0.0.0:8080",
+            )
+        assert not service.template_path.exists()
+        assert recorded == [], "体检未过却调用了 systemctl"
+
+    def test_install_rejects_missing_policy(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError, match="策略文件不存在"):
+            service.install_template(
+                exec_start=self._binary(tmp_path),
+                policy=tmp_path / "nope.json",
+            )
+        assert recorded == []
+
+    def test_install_rejects_home_instance_dir(self, tmp_path, as_root, fake_accounts) -> None:
+        """家目录下的实例会被 ProtectHome=true 挡住：必须在安装前拒绝。"""
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.systemd import PluginService
+        from frpsctl.errors import UsageError
+
+        home_inst = Instance(
+            name="t",
+            instances_root=Path("/home/someone/.local/share/frpsctl/instances"),
+            data_home=tmp_path / "data",
+        )
+        service = PluginService(home_inst, unit_dir=tmp_path / "systemd-home")
+        policy = tmp_path / "policy.json"
+        policy.write_text('{"users": {}}', "utf-8")
+
+        with pytest.raises(UsageError, match="ProtectHome"):
+            service.install_template(exec_start=self._binary(tmp_path), policy=policy)
+        assert not service.template_path.exists()
+
+    def test_uninstall_disables_and_removes(self, service, recorded, as_root) -> None:
+        service.template_path.parent.mkdir(parents=True, exist_ok=True)
+        service.template_path.write_text("unit", "utf-8")
+        service.uninstall()
+        assert not service.template_path.exists()
+        assert ["systemctl", "disable", "--now", "frpsctl-plugin@test.service"] in recorded
+        assert ["systemctl", "daemon-reload"] in recorded
+
+    def test_relative_paths_are_resolved(
+        self, recorded, tmp_path, as_root, fake_accounts, monkeypatch
+    ) -> None:
+        """相对路径输入必须渲染为绝对路径（systemd 不接受相对路径）。
+
+        回归（第五轮 review 实测复现）：`--root ./instances` 时渲染出
+        `ExecStart=bin/frpsctl`、`WorkingDirectory=instances/t`——安装成功，
+        `systemctl start` 才报 "Executable path is not absolute"。
+        """
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.systemd import PluginService
+
+        monkeypatch.chdir(tmp_path)
+        inst = Instance(name="t", instances_root=Path("instances"), data_home=Path("data"))
+        inst.ensure_dirs()
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        policy = inst.dir / "plugin-policy.json"
+        policy.write_text('{"users": {}}', "utf-8")
+        binary = Path("bin/frpsctl")
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+
+        service = PluginService(inst, unit_dir=Path("units"))
+        path = service.install_template(exec_start=binary, policy=policy)
+
+        text = path.read_text("utf-8")
+        resolved_bin = (tmp_path / "bin" / "frpsctl").resolve()
+        resolved_work = (tmp_path / "instances" / "t").resolve()
+        assert f"ExecStart={resolved_bin}" in text
+        assert f"WorkingDirectory={resolved_work}" in text
+        assert f"--policy {resolved_work / 'plugin-policy.json'}" in text
+        assert "ExecStart=bin/" not in text, "渲染了相对路径"
+
+
+class TestDoctorBinaryDiagnosis:
+    """`doctor` 对"低于门槛"的二进制必须给出**正确**的诊断。
+
+    回归：`_read_version` 曾用带门槛的 `lc.binary_version()`——`< 0.70.0` 抛
+    `UnsupportedVersion` 被吞成 None，最终报"无法读取版本 / 可能不是官方
+    frps"。真因是"版本太低"，错误诊断会把用户引向完全错误的方向。
+    """
+
+    def test_unsupported_version_is_reported_as_such(self, inst) -> None:
+        from frpsctl.core.doctor import run_doctor
+
+        inst.config.write_text(
+            'bindPort = 17000\n[auth]\ntoken = "x"\n[webServer]\nport = 0\n', "utf-8"
+        )
+        inst.config.chmod(0o600)
+        make_fake_frps(inst.bin_dir, version="0.69.1")
+
+        findings = run_doctor(inst).findings
+        version_findings = [f for f in findings if f.check == "二进制版本"]
+        assert version_findings, [f.check for f in findings]
+        message = version_findings[0].message
+        assert "低于最低支持版本" in message, message
+        assert "无法读取版本" not in message
+
+
+class TestAdminPaging:
+    """`_paged` 必须按 `total` 翻页取全量。
+
+    实测（真 frp 0.71.0）：服务端把 `page_size` 上限 **cap 到 50**——请求 200
+    只返回 50 条（`pageSize=50`）。只取一页会静默少数据，因此这里锁定
+    "按 total 收敛、与请求页大小无关"的行为。
+    """
+
+    @staticmethod
+    def _client(*, total: int, cap: int = 50):
+        from frpsctl.core.admin import AdminClient
+
+        calls: list[int] = []
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, payload: dict) -> None:
+                self._payload = payload
+
+            def json(self) -> dict:
+                return self._payload
+
+        class _Client(AdminClient):
+            def _get(self, path, *, params=None):
+                page = int(params["page"])
+                calls.append(page)
+                start = (page - 1) * cap
+                end = min(start + cap, total)
+                items = [
+                    {
+                        "name": f"p{index}",
+                        "type": "tcp",
+                        "spec": {"type": "tcp", "tcp": {"remotePort": 6000 + index}},
+                        "status": {"phase": "online"},
+                    }
+                    for index in range(start, end)
+                ]
+                return _Resp({"data": {"total": total, "page": page, "pageSize": cap, "items": items}})
+
+        return _Client("http://127.0.0.1:1"), calls
+
+    def test_list_proxies_pages_until_total(self) -> None:
+        client, calls = self._client(total=107)
+        items = client.list_proxies()
+        assert len(items) == 107, f"少拉了 {107 - len(items)} 条"
+        assert calls == [1, 2, 3]
+        assert items[0].name == "p0"
+        assert items[-1].name == "p106"
+        assert items[0].remote_port == 6000
+
+    def test_list_clients_pages_until_total(self) -> None:
+        client, calls = self._client(total=120)
+        items = client.list_clients()
+        assert len(items) == 120
+        assert calls == [1, 2, 3]
+
+    def test_exact_total_does_not_fetch_extra_page(self) -> None:
+        client, calls = self._client(total=100)
+        assert len(client.list_clients()) == 100
+        assert calls == [1, 2]
+
+
+class TestUiOutputResilience:
+    """stderr 断开（`2>&1 | head` 等）时，所有 stderr 辅助输出必须静默。
+
+    回归（第六轮 review 实测复现）：`note` / `progress` / `warn` / `trace`
+    曾直接写 stderr——管道断开时抛 `BrokenPipeError`。挂在启动流程里的进度
+    回调抛异常会触发 `_reap_after_failure`：**刚派生的 frps 被误杀**；而
+    `warn` 在 `map_exceptions` 的错误报告路径上抛异常会变成 traceback。
+    """
+
+    class _Broken:
+        def write(self, _text: str) -> None:
+            raise BrokenPipeError("EPIPE")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("EPIPE")
+
+        def isatty(self) -> bool:
+            return False
+
+    def test_stderr_helpers_never_raise(self, monkeypatch) -> None:
+        import sys
+
+        from frpsctl.cli import ui
+
+        monkeypatch.setattr(sys, "stderr", self._Broken())
+        ui.note("x")
+        ui.progress("y")
+        ui.warn("z")
+        ui.end_progress()
+        monkeypatch.setattr(ui, "_VERBOSE", True)
+        ui.trace("t")
+
+    def test_progress_tty_branch_clears_line(self, monkeypatch) -> None:
+        """tty 模式下必须带清行尾码（`\\033[K`），否则短文本留残影。"""
+        import io
+        import sys
+
+        from frpsctl.cli import ui
+
+        captured = io.StringIO()
+
+        class _Tty:
+            def write(self, text: str) -> None:
+                captured.write(text)
+
+            def flush(self) -> None:
+                pass
+
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.setattr(sys, "stderr", _Tty())
+        ui.progress("等待健康检查 9s：L1 ok")
+        assert "\r" in captured.getvalue()
+        assert "\033[K" in captured.getvalue(), "tty 进度缺清行尾码（可能有残影）"
 
 
 class TestSystemdOwnerDetection:
@@ -1583,8 +2013,9 @@ class TestSystemdOwnerDetection:
     def test_same_config_active_matches_execstart_path(self, systemd, monkeypatch) -> None:
         """`same_config_active` 比的是 ExecStart 里的**配置路径**，不是 unit 名。
 
-        用户完全可能自建一个名字不同的 unit 指向我们的配置——那样也必须被认出来，
-        否则会出现 direct 与 systemd 双起（ADR-1 要防的事）。
+        用户完全可能自建一个名字与 frps 无关的 unit 指向我们的配置——那样也必须
+        被认出来，否则会出现 direct 与 systemd 双起（ADR-1 要防的事）。用例
+        特意把 unit 命名为 `my-tunnel.service`：此前按 `frps*` 过滤时它扫不到。
         """
         calls: list[list[str]] = []
 
@@ -1592,10 +2023,8 @@ class TestSystemdOwnerDetection:
             calls.append(list(argv))
             if "list-units" in argv:
                 return subprocess.CompletedProcess(
-                    argv, 0, stdout="frps-custom.service loaded active running\n", stderr=""
+                    argv, 0, stdout="my-tunnel.service loaded active running\n", stderr=""
                 )
-            if "is-active" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="active\n", stderr="")
             if "show" in argv:
                 return subprocess.CompletedProcess(
                     argv,
@@ -1628,15 +2057,20 @@ class TestSystemdOwnerDetection:
         assert systemd.same_config_active() is False
 
     def test_same_config_active_skips_inactive_units(self, systemd, monkeypatch) -> None:
+        """非 active 的 unit 交给 systemd 侧过滤（`--state=active`）。
+
+        修复后不再逐个 `is-active`：过滤在 `list-units` 参数里完成，空列表时
+        连 `show` 都不调用。
+        """
+        calls: list[list[str]] = []
+
         def fake_run(argv, **kwargs):
-            if "list-units" in argv:
-                return subprocess.CompletedProcess(
-                    argv, 0, stdout="frps-custom.service loaded inactive dead\n", stderr=""
-                )
-            if "is-active" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="inactive\n", stderr="")
+            calls.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
         assert systemd.same_config_active() is False
+        assert any("--state=active" in call for call in calls), calls
+        assert not any("is-active" in call for call in calls), "不需要逐个问 is-active"
+        assert not any("show" in call for call in calls), "空列表时不该调用 show"

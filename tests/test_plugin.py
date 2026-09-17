@@ -400,6 +400,146 @@ class TestAudit:
         log.close()
 
 
+class TestPolicyStrictTypes:
+    """策略 JSON 的类型错误必须显式拒绝，而不是宽松转换。
+
+    最危险的一条：JSON 里写 `"false"`（字符串）时，Python 的 `bool("false")`
+    是 **True**——`allow_unknown_user` 会被静默打开（fail-open：以为关了鉴权
+    后门，实际全开），`allow_random_port` 同理（白名单形同虚设）。
+    """
+
+    def test_string_false_is_not_false(self) -> None:
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="allow_unknown_user"):
+            PluginPolicy.parse({"allow_unknown_user": "false", "users": {"a": {}}})
+
+    def test_string_false_on_random_port_is_rejected(self) -> None:
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="allow_random_port"):
+            PluginPolicy.parse({"users": {"alice": {"allow_random_port": "false"}}})
+
+    def test_audit_must_be_an_object(self) -> None:
+        """`"audit": "false"` 此前会走到 `"false".get(...)` → 裸 AttributeError。"""
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="audit 必须是对象"):
+            PluginPolicy.parse({"audit": "false"})
+
+    def test_audit_numeric_fields_are_validated(self) -> None:
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="flush_every"):
+            PluginPolicy.parse({"audit": {"flush_every": "abc"}})
+        with pytest.raises(ConfigError, match="flush_interval"):
+            PluginPolicy.parse({"audit": {"flush_interval": "soon"}})
+
+    def test_bool_is_not_an_int(self) -> None:
+        """`bool` 是 `int` 的子类：`{"max_proxies": true}` 不得被当作 1。"""
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="max_proxies"):
+            PluginPolicy.parse({"users": {"alice": {"max_proxies": True}}})
+
+    def test_string_is_not_a_list(self) -> None:
+        """字符串会被逐字符迭代——那种"看似能跑"的行为必须变成明确报错。"""
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="allowed_ports"):
+            PluginPolicy.parse({"users": {"alice": {"allowed_ports": "6000"}}})
+
+    def test_valid_booleans_still_work(self) -> None:
+        policy = PluginPolicy.parse(
+            {
+                "allow_unknown_user": True,
+                "require_client_id": False,
+                "audit": {"enabled": False},
+                "users": {"alice": {"allow_random_port": True}},
+            }
+        )
+        assert policy.allow_unknown_user is True
+        assert policy.require_client_id is False
+        assert policy.audit.enabled is False
+        assert policy.users["alice"].allow_random_port is True
+
+    def test_negative_numbers_are_clamped_not_rejected(self) -> None:
+        """类型必须严格，但负数的**钳制**语义保持不变（flush_every 最小 1）。"""
+        policy = PluginPolicy.parse({"audit": {"flush_every": -5, "flush_interval": -1}})
+        assert policy.audit.flush_every == 1
+        assert policy.audit.flush_interval == 0.1
+
+
+class TestRejectRateLimiting:
+    """`reject_log_burst` / `reject_log_window` 必须真的生效（此前是零引用死配置）。
+
+    语义：拒绝风暴期间请求**仍然被拒绝**，只是审计停止逐条刷写；被抑制的条数
+    累计到下一条记录上（`suppressed` 字段），降采样必须可见。
+    """
+
+    def test_reject_storm_is_rate_limited_but_still_denied(self, tmp_path: Path) -> None:
+        policy = PluginPolicy.parse(
+            {
+                "users": {"alice": {"allowed_ports": ["6000"]}},
+                "audit": {"path": str(tmp_path / "storm.jsonl")},
+                "reject_log_burst": 2,
+                "reject_log_window": 100,
+            }
+        )
+        log = AuditLog(tmp_path / "storm.jsonl", flush_every=1, flush_interval=0.1)
+        engine = DecisionEngine(policy, log)
+
+        responses = [
+            engine.handle(
+                PluginRequest.from_payload(
+                    op="NewProxy",
+                    version="0.1.0",
+                    body={
+                        "content": {
+                            "user": {"user": "alice"},
+                            "proxy_name": "p",
+                            "proxy_type": "tcp",
+                            "remote_port": 9999,  # 越界 → 每次都拒绝
+                        }
+                    },
+                )
+            )
+            for _ in range(5)
+        ]
+        log.close()
+
+        assert all(item.reject is True for item in responses), "限速不得改变拒绝语义"
+        lines = [
+            line for line in (tmp_path / "storm.jsonl").read_text("utf-8").splitlines() if line.strip()
+        ]
+        assert len(lines) == 2, f"拒绝风暴只应写 burst(2) 条，实际 {len(lines)}"
+
+    def test_suppressed_count_is_reported_after_window(self) -> None:
+        """窗口过后，被抑制的条数必须如实汇报在 `suppressed` 字段上。"""
+        from frpsctl.plugin.engine import RejectLimiter
+
+        now = {"t": 1000.0}
+        limiter = RejectLimiter(burst=1, window=10.0, clock=lambda: now["t"])
+
+        keep1, extra1 = limiter.check("alice")
+        assert (keep1, extra1) == (True, 0)
+        keep2, _ = limiter.check("alice")
+        keep3, _ = limiter.check("alice")
+        assert keep2 is False and keep3 is False
+
+        now["t"] += 11.0  # 窗口滑过
+        keep4, extra4 = limiter.check("alice")
+        assert keep4 is True
+        assert extra4 == 2, "窗口期间被抑制的 2 条没有汇报"
+
+    def test_limiter_is_per_user(self) -> None:
+        from frpsctl.plugin.engine import RejectLimiter
+
+        limiter = RejectLimiter(burst=1, window=100.0, clock=lambda: 1000.0)
+        assert limiter.check("alice")[0] is True
+        assert limiter.check("bob")[0] is True, "alice 的拒绝风暴不该影响 bob"
+
+
 # ---------------------------------------------------------------------------
 # 真机契约：真 frpc → 真 frps → 我们的插件
 # ---------------------------------------------------------------------------

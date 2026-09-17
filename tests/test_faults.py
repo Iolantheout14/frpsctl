@@ -23,7 +23,7 @@ from frpsctl.core import config as cfg
 from frpsctl.core import release as rel
 from frpsctl.core.instance import Instance
 from frpsctl.core.lifecycle import State
-from frpsctl.core.transaction import apply_change
+from frpsctl.core.transaction import apply_set
 from frpsctl.errors import (
     BinaryError,
     ChecksumUnavailable,
@@ -112,19 +112,11 @@ class TestFilesystemFaults:
         report = lc.start(health_timeout=5)
         try:
             original = inst.config.read_text("utf-8")
-            plan = cfg.plan_set(inst.config, "bindPort", "18000")
             injector.on("os.replace", ENOSPC, at=1)
 
             with pytest.raises((FrpsctlError, OSError)):
-                apply_change(
-                    inst,
-                    dotted="bindPort",
-                    new_text=plan.text,
-                    change_diff=plan.diff,
-                    before=plan.before,
-                    after=plan.after,
-                    lifecycle=lc,
-                    health_timeout=3,
+                apply_set(
+                    inst, dotted="bindPort", raw="18000", lifecycle=lc, health_timeout=3
                 )
 
             assert inst.config.read_text("utf-8") == original, "配置被改坏了"
@@ -151,17 +143,9 @@ class TestFilesystemFaults:
         """快照目录建不出来（磁盘满/只读）时必须报错，而不是静默跳过备份。"""
         inst, _, lc = ready
         injector.on("os.mkdir", EACCES, matching="0001-")
-        plan = cfg.plan_set(inst.config, "bindPort", "18001")
         with pytest.raises((FrpsctlError, OSError)):
-            apply_change(
-                inst,
-                dotted="bindPort",
-                new_text=plan.text,
-                change_diff=plan.diff,
-                before=plan.before,
-                after=plan.after,
-                lifecycle=lc,
-                restart=False,
+            apply_set(
+                inst, dotted="bindPort", raw="18001", lifecycle=lc, restart=False
             )
         _assert_invariants(inst)
 
@@ -403,15 +387,11 @@ class TestSecretInvariants:
         try:
             failing = make_fake_frps(inst.bin_dir, mode="exit")
             failing_lc = make_lifecycle(inst, failing)
-            plan = cfg.plan_set(inst.config, "bindPort", "18002")
             with pytest.raises(ChangeRolledBack) as excinfo:
-                apply_change(
+                apply_set(
                     inst,
                     dotted="bindPort",
-                    new_text=plan.text,
-                    change_diff=plan.diff,
-                    before=plan.before,
-                    after=plan.after,
+                    raw="18002",
                     lifecycle=failing_lc,
                     health_timeout=3,
                     restore_lifecycle=failing_lc,

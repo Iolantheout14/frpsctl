@@ -22,7 +22,7 @@ import pytest
 
 from frpsctl.core import config as cfg
 from frpsctl.core.lifecycle import Lifecycle, Owner, State
-from frpsctl.core.transaction import apply_change, rollback_to
+from frpsctl.core.transaction import apply_set, rollback_to
 from frpsctl.errors import (
     ChangeRolledBack,
     ConfigError,
@@ -76,16 +76,8 @@ class TestLifecycleChain:
             assert status.health is not None and status.health.gate is True
 
             # config set（成功）
-            plan = cfg.plan_set(inst.config, "bindPort", "18000")
-            outcome = apply_change(
-                inst,
-                dotted="bindPort",
-                new_text=plan.text,
-                change_diff=plan.diff,
-                before=plan.before,
-                after=plan.after,
-                lifecycle=lc,
-                health_timeout=5,
+            outcome = apply_set(
+                inst, dotted="bindPort", raw="18000", lifecycle=lc, health_timeout=5
             )
             assert outcome.applied is True
             assert outcome.restarted is True
@@ -115,15 +107,11 @@ class TestLifecycleChain:
             failing = make_fake_frps(inst.bin_dir, mode="exit")
             failing_lc = make_lifecycle(inst, failing)
 
-            plan = cfg.plan_set(inst.config, "bindPort", "18001")
             with pytest.raises(ChangeRolledBack) as excinfo:
-                apply_change(
+                apply_set(
                     inst,
                     dotted="bindPort",
-                    new_text=plan.text,
-                    change_diff=plan.diff,
-                    before=plan.before,
-                    after=plan.after,
+                    raw="18001",
                     lifecycle=failing_lc,
                     health_timeout=3,
                     restore_lifecycle=failing_lc,
@@ -144,16 +132,8 @@ class TestLifecycleChain:
         fake = make_fake_frps(inst.bin_dir)
         lc = make_lifecycle(inst, fake)
 
-        plan = cfg.plan_set(inst.config, "bindPort", "18002")
-        outcome = apply_change(
-            inst,
-            dotted="bindPort",
-            new_text=plan.text,
-            change_diff=plan.diff,
-            before=plan.before,
-            after=plan.after,
-            lifecycle=lc,
-            restart=False,
+        outcome = apply_set(
+            inst, dotted="bindPort", raw="18002", lifecycle=lc, restart=False
         )
         assert outcome.applied is True
         assert outcome.restarted is False
@@ -397,16 +377,8 @@ class TestRollback:
         fake = make_fake_frps(inst.bin_dir)
         lc = make_lifecycle(inst, fake)
 
-        plan = cfg.plan_set(inst.config, "bindPort", "18003")
-        apply_change(
-            inst,
-            dotted="bindPort",
-            new_text=plan.text,
-            change_diff=plan.diff,
-            before=plan.before,
-            after=plan.after,
-            lifecycle=lc,
-            restart=False,
+        apply_set(
+            inst, dotted="bindPort", raw="18003", lifecycle=lc, restart=False
         )
         assert tomllib.loads(inst.config.read_text("utf-8"))["bindPort"] == 18003
 
@@ -454,6 +426,116 @@ class TestRollback:
         assert len(inst.history_entries()) == 10
 
 
+class TestConcurrentChanges:
+    """并发配置变更的锁边界（第四轮 review 的根因修复）。
+
+    回归：`plan_set`（读-改-写里的"读"）曾在实例锁**外**执行，两个并发
+    `config set` 都基于同一份旧文本生成完整新文本，后写入者覆盖前者，
+    且两条命令都报成功——确定性复现过（bindPort 的改动被静默抹掉）。
+    现在候选生成在锁内（`apply_set`），编辑器路径由 `apply_edit` 做 CAS。
+    """
+
+    def test_plan_happens_inside_the_instance_lock(self, inst, write_config, monkeypatch) -> None:
+        """不变量（确定性）：`cfg.plan_set` 必须在本进程持锁时被调用。
+
+        这条直接守根因，不依赖线程时序——锁内生成候选是并发正确性的充要条件。
+        """
+        from frpsctl.core import config as config_module
+        from frpsctl.core import lock as lock_mod
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        observed: list[bool] = []
+        real_plan = config_module.plan_set
+
+        def spy(path, dotted, raw):
+            observed.append(lock_mod.is_locked(inst.lock))
+            return real_plan(path, dotted, raw)
+
+        monkeypatch.setattr(config_module, "plan_set", spy)
+        apply_set(inst, dotted="bindPort", raw="18000", lifecycle=lc, restart=False)
+
+        assert observed == [True], "候选文本生成发生在实例锁之外（并发覆盖的根因）"
+
+    def test_concurrent_sets_keep_both_changes(self, inst, write_config) -> None:
+        """端到端：两个并发 `config set` 的变更都必须保留。"""
+        import threading
+
+        write_config(BASIC_CONFIG)
+        fake = make_fake_frps(inst.bin_dir)
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def worker(key: str, value: str) -> None:
+            lc = make_lifecycle(inst, fake)  # 每线程独立 Lifecycle（模拟两个进程）
+            barrier.wait(timeout=10)
+            try:
+                apply_set(inst, dotted=key, raw=value, lifecycle=lc, restart=False)
+            except BaseException as exc:  # noqa: BLE001 - 收集线程内异常供断言
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=("bindPort", "18000")),
+            threading.Thread(target=worker, args=("maxPortsPerClient", "30")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not errors, errors
+        data = tomllib.loads(inst.config.read_text("utf-8"))
+        assert data["bindPort"] == 18000, "并发 set 的改动被另一路覆盖"
+        assert data["maxPortsPerClient"] == 30
+
+    def test_edit_rejects_draft_when_file_changed_concurrently(self, inst, write_config) -> None:
+        """编辑器草稿在并发修改后必须被拒绝（CAS），而不是覆盖别人的改动。"""
+        from frpsctl.core.transaction import apply_edit
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        original = cfg.read_config_text(inst.config)
+
+        # 模拟"编辑期间"另一路 config set 改了配置
+        apply_set(inst, dotted="maxPortsPerClient", raw="30", lifecycle=lc, restart=False)
+
+        with pytest.raises(ConfigError, match="编辑期间"):
+            apply_edit(
+                inst,
+                draft=original + "# 草稿\n",
+                expected_current=original,
+                lifecycle=lc,
+                restart=False,
+            )
+        # 别人的改动必须完好，草稿不得落盘
+        assert "maxPortsPerClient = 30" in inst.config.read_text("utf-8")
+        assert "# 草稿" not in inst.config.read_text("utf-8")
+
+    def test_edit_noop_does_not_touch_anything(self, inst, write_config) -> None:
+        """草稿与基准一致（没有改动）→ 不写盘、不产生快照。"""
+        from frpsctl.core.transaction import apply_edit
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        original = cfg.read_config_text(inst.config)
+
+        outcome = apply_edit(
+            inst, draft=original, expected_current=original, lifecycle=lc, restart=False
+        )
+        assert outcome.noop is True
+        assert not inst.history_entries(), "无改动不应产生快照"
+
+    def test_set_noop_is_decided_inside_the_lock(self, inst, write_config) -> None:
+        """`config set` 写同值：返回 noop 且不产生快照/不改文件。"""
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        outcome = apply_set(inst, dotted="bindPort", raw="17000", lifecycle=lc, restart=False)
+        assert outcome.noop is True
+        assert not inst.history_entries()
+
+
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
@@ -482,6 +564,117 @@ def inst_alive(pid: int) -> bool:
             return False
         time.sleep(0.05)
     return True
+
+
+class TestSystemdStartHealthTimeout:
+    def test_health_timeout_is_forwarded_to_systemd_path(self, inst, write_config, monkeypatch) -> None:
+        """systemd 路径必须使用调用方给的 health_timeout。
+
+        回归：`_start_via_systemd` 硬编码 `_await_health(10.0)`，`--health-timeout`
+        对 systemd 托管的实例**静默无效**——用户以为调了等待时长，实际没有。
+        """
+        from frpsctl.core import systemd as sd_mod
+        from frpsctl.core.health import HealthLayer, HealthReport
+
+        write_config(BASIC_CONFIG)
+        fake = make_fake_frps(inst.bin_dir)
+        lc = make_lifecycle(inst, fake)
+
+        class _FakeSystemd:
+            def __init__(self, _instance, **_kw) -> None:
+                pass
+
+            def is_active(self) -> bool:
+                return True
+
+            def start(self) -> None:
+                pass
+
+            def main_pid(self) -> int:
+                return 4242
+
+        monkeypatch.setattr(sd_mod, "Systemd", _FakeSystemd)
+        received: list[float] = []
+
+        def fake_await(timeout: float, **_kwargs: object) -> HealthReport:
+            received.append(timeout)
+            return HealthReport(HealthLayer.OK, HealthLayer.OK, HealthLayer.SKIPPED)
+
+        monkeypatch.setattr(lc, "_await_health", fake_await)
+        report = lc.start(health_timeout=3.5)
+
+        assert received == [3.5], "health_timeout 没有传给 systemd 路径"
+        assert report.pid == 4242
+
+
+class TestHealthTick:
+    """健康等待期的进度回调（`on_tick`）——CLI 渲染逐轮进度的唯一通道。"""
+
+    def test_tick_fires_each_poll_until_gate(self, inst, write_config, monkeypatch) -> None:
+        from frpsctl.core.health import HealthLayer, HealthReport
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        sequence = iter(
+            [
+                HealthReport(HealthLayer.OK, HealthLayer.FAIL, HealthLayer.SKIPPED),
+                HealthReport(HealthLayer.OK, HealthLayer.FAIL, HealthLayer.SKIPPED),
+                HealthReport(HealthLayer.OK, HealthLayer.OK, HealthLayer.SKIPPED),
+            ]
+        )
+        monkeypatch.setattr(lc, "check_health", lambda **_kw: next(sequence))
+        monkeypatch.setattr("frpsctl.core.lifecycle.time.sleep", lambda _s: None)
+
+        ticks: list[str] = []
+        outcome = lc._await_health(
+            5.0, on_tick=lambda _elapsed, report: ticks.append(report.l2_control.value)
+        )
+        assert outcome.gate is True
+        assert ticks == ["fail", "fail"], ticks
+
+    def test_tick_not_fired_when_healthy_immediately(self, inst, write_config, monkeypatch) -> None:
+        from frpsctl.core.health import HealthLayer, HealthReport
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        monkeypatch.setattr(
+            lc,
+            "check_health",
+            lambda **_kw: HealthReport(HealthLayer.OK, HealthLayer.OK, HealthLayer.SKIPPED),
+        )
+
+        ticks: list[float] = []
+        lc._await_health(5.0, on_tick=lambda elapsed, _report: ticks.append(elapsed))
+        assert ticks == [], "首轮即过 gate 不该触发进度回调"
+
+
+    def test_tick_exception_does_not_break_the_wait(self, inst, write_config, monkeypatch) -> None:
+        """进度回调抛异常必须被隔离——展示层不能拖垮启动流程。
+
+        回归（第六轮 review 实测复现）：tick 抛 `BrokenPipeError`（stderr 管道
+        断开）时会冒泡进 `start()` 的 `except BaseException`，触发
+        `_reap_after_failure` 把刚派生的 frps 误杀。
+        """
+        from frpsctl.core.health import HealthLayer, HealthReport
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        sequence = iter(
+            [
+                HealthReport(HealthLayer.OK, HealthLayer.FAIL, HealthLayer.SKIPPED),
+                HealthReport(HealthLayer.OK, HealthLayer.OK, HealthLayer.SKIPPED),
+            ]
+        )
+        monkeypatch.setattr(lc, "check_health", lambda **_kw: next(sequence))
+        monkeypatch.setattr("frpsctl.core.lifecycle.time.sleep", lambda _s: None)
+
+        def broken_tick(_elapsed: float, _report: object) -> None:
+            raise BrokenPipeError("EPIPE")
+
+        outcome = lc._await_health(5.0, on_tick=broken_tick)
+        assert outcome.gate is True
 
 
 class TestV2ApiAssertion:
