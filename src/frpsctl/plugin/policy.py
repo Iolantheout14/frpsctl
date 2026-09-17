@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..core.auditlog import DEFAULT_AUDIT_FILE
 from ..core.healthcheck import is_loopback
 from ..errors import ConfigError, UsageError
 from .quota import QuotaResult
@@ -150,9 +151,13 @@ class AuditSettings:
     `path` 的默认值是 `./plugin-audit.jsonl` 而不是 None：审计**默认开启**却有
     一半概率没地方落盘，会让"我开了审计啊"变成一句空话——记录只进了内存，
     进程一退就没了。默认给个相对路径，让默认行为与默认意图一致。
+
+    相对路径的**解析基准是策略文件所在目录**（`core/auditlog.resolve_audit_path`）
+    ——此前写入侧跟随进程 CWD，手工前台运行与 systemd 托管会写到两个地方。
+    常量同样来自 `core/auditlog`：写入侧默认值与读取侧查找目标必须同一个源。
     """
 
-    path: Path | None = Path("plugin-audit.jsonl")
+    path: Path | None = Path(DEFAULT_AUDIT_FILE)
     enabled: bool = True
     #: 缓冲区达到多少条就刷盘。
     flush_every: int = 32

@@ -51,8 +51,16 @@ MAX_SESSIONS = 32
 
 
 def generate_password() -> str:
-    """生成 24 字符启动口令（与 `init` 生成的 dashboard 口令同量级）。"""
-    return secrets.token_urlsafe(18)
+    """生成管理台口令（24 字符）。
+
+    实现在 `core/systemd.generate_web_password`：`web serve` 的启动口令、
+    `web password set` 与 `web service install` 的口令文件必须由**同一个**
+    生成器产出——此前三处各写一份 `token_urlsafe(18)`，是典型的"规律相同、
+    实现三份"漂移风险。
+    """
+    from ..core.systemd import generate_web_password
+
+    return generate_web_password()
 
 
 @dataclass(frozen=True)

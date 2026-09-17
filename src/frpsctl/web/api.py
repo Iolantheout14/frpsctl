@@ -28,9 +28,18 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
+from urllib.parse import unquote
 
+from ..core import auditlog
 from ..core import config as cfg
-from ..core.admin import TRAFFIC_MAX_PROXIES, AdminClient
+from ..core import doctor as doc
+from ..core.admin import (
+    TRAFFIC_MAX_PROXIES,
+    AdminClient,
+    aggregate_days,
+    fetch_histories,
+    traffic_total,
+)
 from ..core.healthcheck import parse_dashboard
 from ..core.instance import Instance
 from ..core.lifecycle import HealthReport, Lifecycle, State
@@ -57,6 +66,16 @@ MAX_PENDING_PREVIEWS = 32
 #: 日志接口一次最多返回的行数（防止把大日志一次性拉爆浏览器）。
 MAX_LOG_LINES = 2000
 
+#: 趋势汇总的服务端缓存时间（秒）。浏览器每 5 秒轮询，而趋势是逐日粒度——
+#: 30 秒内重复查询 dashboard 只是把 50 个 HTTP 往返重复一遍。
+TRAFFIC_CACHE_TTL = 30.0
+
+#: 审计视图返回的记录条数（尾部）。
+AUDIT_TAIL_LINES = 50
+
+#: 代理名的长度上限（防御性；代理名来自 URL 路径片段）。
+MAX_PROXY_NAME = 256
+
 
 @dataclass
 class _Preview:
@@ -76,6 +95,9 @@ class WebContext:
     clock: Callable[[], float] = time.monotonic
     previews: dict[str, _Preview] = field(default_factory=dict)
     preview_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: 趋势汇总缓存（`(写入时刻, payload)`）。clock 可注入，测试用假时钟推进即可。
+    traffic_cache: tuple[float, dict] | None = None
+    traffic_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def prune_previews(self) -> None:
         """清理过期预览；超过上限时丢弃最旧的（防内存堆积）。"""
@@ -169,6 +191,12 @@ def _route(
             return 200, proxies_payload(ctx)
         if path == "/api/traffic":
             return 200, traffic_payload(ctx)
+        if path.startswith("/api/traffic/"):
+            return 200, traffic_one_payload(ctx, unquote(path[len("/api/traffic/") :]))
+        if path == "/api/doctor":
+            return 200, doctor_payload(ctx)
+        if path == "/api/audit":
+            return 200, audit_payload(ctx)
         if path == "/api/config":
             return 200, config_payload(ctx)
         if path == "/api/config/history":
@@ -267,44 +295,142 @@ def status_payload(ctx: WebContext) -> dict:
 def clients_payload(ctx: WebContext) -> dict:
     admin = _admin(ctx)
     with admin:
-        items = admin.list_clients()
-    return {"clients": items}
+        page = admin.page_clients()
+    return {"clients": page.items, "total": page.total, "truncated": page.truncated}
 
 
 def proxies_payload(ctx: WebContext) -> dict:
     admin = _admin(ctx)
     with admin:
-        items = admin.list_proxies()
-    return {"proxies": [asdict(item) for item in items]}
+        page = admin.page_proxies()
+    return {
+        "proxies": [asdict(item) for item in page.items],
+        "total": page.total,
+        "truncated": page.truncated,
+    }
 
 
 def traffic_payload(ctx: WebContext) -> dict:
-    """逐代理的 7 天日粒度流量（趋势图数据源）。
+    """全部代理的**逐日汇总**（趋势图数据源）。
 
-    单个代理查询失败**不拖垮整张图**（记为无数据）——dashboard 半死不活时
-    让整个趋势接口 502 没有意义。
+    单代理的 7 天明细由 `GET /api/traffic/{name}` 按需提供（前端点开某行才请求）
+    ——此前一次响应携带最多 50 个代理 × 7 天明细，而前端只用它画一张汇总柱状图，
+    展开行时再从内存里挑。现在响应体与"代理数 × 天数"解耦。
 
-    `truncated` / `total` 如实汇报截断：CLI `traffic` 超限会告警"仅统计前
-    N 个"，Web 曾经静默截断——前端无从知道图是**全量**还是前 50 个代理的。
+    查询本身是**并发**的（`fetch_histories`）并带 30 秒服务端缓存：浏览器 5 秒
+    轮询一次，而趋势是逐日粒度——没有缓存时每轮都会把最多 50 个 dashboard 请求
+    重放一遍。
+
+    `truncated` / `total` 如实汇报截断（CLI `traffic` 超限会告警"仅统计前 N 个"，
+    Web 同样不能静默）。
     """
+    now = ctx.clock()
+    with ctx.traffic_lock:
+        cached = ctx.traffic_cache
+    if cached is not None and now - cached[0] <= TRAFFIC_CACHE_TTL:
+        return cached[1]
+
     admin = _admin(ctx)
     with admin:
-        all_proxies = admin.list_proxies()
-        truncated = len(all_proxies) > TRAFFIC_MAX_PROXIES
-        series = []
-        for item in all_proxies[:TRAFFIC_MAX_PROXIES]:
-            try:
-                history = admin.proxy_traffic(item.name)
-            except FrpsctlError:
-                history = []
-            series.append({"name": item.name, "history": history})
-    return {
+        page = admin.page_proxies()
+        truncated = page.total > TRAFFIC_MAX_PROXIES
+        names = [item.name for item in page.items[:TRAFFIC_MAX_PROXIES]]
+        series = fetch_histories(admin, names)
+    payload = {
         "granularity": "day",
-        "proxies": series,
+        "days": aggregate_days(series),
+        "proxies": len(names),
+        "total": page.total,
         "truncated": truncated,
-        "total": len(all_proxies),
         "limit": TRAFFIC_MAX_PROXIES,
     }
+    with ctx.traffic_lock:
+        ctx.traffic_cache = (now, payload)
+    return payload
+
+
+def traffic_one_payload(ctx: WebContext, name: str) -> dict:
+    """单个代理的 7 天流量明细（趋势图"点开某行"的数据源）。
+
+    离线/不存在的代理返回空 history（真机语义是 404 = 无数据）——这是常态
+    （已下线客户端、待清理的离线记录），不该升级成错误。
+    """
+    name = name.strip()
+    if not name:
+        raise UsageError("代理名不能为空")
+    if len(name) > MAX_PROXY_NAME:
+        raise UsageError(f"代理名过长（>{MAX_PROXY_NAME} 字符）")
+    admin = _admin(ctx)
+    with admin:
+        history = admin.proxy_traffic(name)
+    return {
+        "name": name,
+        "granularity": "day",
+        "history": history,
+        "total": traffic_total(history),
+    }
+
+
+def doctor_payload(ctx: WebContext) -> dict:
+    """只读体检（与 CLI `doctor` 同一实现）。
+
+    ⚠️ 体检以 **Web 服务进程的身份**运行：端口可绑定性、二进制可执行性这类
+    检查的结果可能与 root 下的 CLI 结果不同——前端会注明这一点。
+    """
+    report = doc.run_doctor(ctx.inst)
+    return {
+        "instance": report.instance,
+        "ok": report.ok,
+        "counts": report.counts,
+        "findings": [
+            {
+                "check": finding.check,
+                "severity": finding.severity.value,
+                "message": finding.message,
+                "hint": finding.hint,
+            }
+            for finding in report.sorted_findings()
+        ],
+    }
+
+
+def audit_payload(ctx: WebContext) -> dict:
+    """插件审计视图：配置位置 + 统计 + 尾部记录。
+
+    策略文件缺失/不合法时也返回 200（`available=false` + reason）——审计视图
+    的职责是"展示现状"，不是替 `plugin check` 做严格校验；一条 400 只会让页面
+    失去"为什么看不到审计"的解释。
+    """
+    view = auditlog.load_view(ctx.inst)
+    payload: dict[str, Any] = {
+        "policy_path": str(view.policy_path),
+        "available": view.available,
+        "enabled": view.enabled,
+        "path": str(view.path) if view.path is not None else None,
+        "reason": view.reason,
+        "stats": None,
+        "tail": [],
+        "bad_lines": 0,
+    }
+    if view.available and view.enabled and view.path is not None:
+        summary = auditlog.summarize(view.path)
+        tail = auditlog.read_tail(view.path, AUDIT_TAIL_LINES)
+        payload["stats"] = {
+            "total": summary.total,
+            "allow": summary.allow,
+            "deny": summary.deny,
+            "suppressed_total": summary.suppressed_total,
+            "first_at": summary.first_at,
+            "last_at": summary.last_at,
+            "by_user": summary.by_user,
+            "by_op": summary.by_op,
+            "elapsed_avg_ms": summary.elapsed_avg_ms,
+            "elapsed_max_ms": summary.elapsed_max_ms,
+            "elapsed_count": summary.elapsed_count,
+        }
+        payload["tail"] = tail.records
+        payload["bad_lines"] = tail.bad_lines
+    return payload
 
 
 def _plain(value: Any) -> Any:
@@ -409,11 +535,12 @@ def action_payload(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
         return {"pid": report.pid, "healthy": report.healthy, "health": _health(report.health)}
     if action == "prune":
         # frp 没有强制下线在线代理的 API（DELETE /api/proxies 实为清理离线
-        # 记录）——UI 的"清理离线记录"按钮走这里。
+        # 记录）——UI 的"清理离线记录"按钮走这里。返回清理条数（清理前后
+        # 各数一次离线记录），让界面能说"清掉了多少"而不是永远只报成功。
         admin = _admin(ctx)
         with admin:
-            admin.clear_offline_proxies()
-        return {"cleared": True}
+            outcome = admin.prune_offline_proxies()
+        return {"cleared": True, "count": outcome.cleared, "before": outcome.before}
     if action == "rollback":
         outcome = rollback_to(
             ctx.inst,

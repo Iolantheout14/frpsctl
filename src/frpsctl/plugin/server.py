@@ -28,9 +28,11 @@ import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from ..core.auditlog import resolve_audit_path
 from .audit import AuditLog
 from .engine import DecisionEngine
 from .policy import PluginPolicy
@@ -51,6 +53,11 @@ class ServerSettings:
     path: str = "/handler"
     #: 是否把每个请求打进 stderr。默认关闭以保持日志干净，审计另有 JSONL。
     access_log: bool = False
+    #: 策略文件路径。用于把 `audit.path` 的相对路径解析到**策略文件所在目录**
+    #: ——否则审计落点跟随进程 CWD，手工前台运行与 systemd 托管会写到两个
+    #: 地方（systemd unit 的 WorkingDirectory 是实例目录，CLI 直接跑是当前
+    #: 目录）。读取侧（`plugin audit` / Web）按同一规则查找。
+    policy_path: Path | None = None
 
     @property
     def host(self) -> str:
@@ -219,11 +226,15 @@ class PluginServer:
         self.policy = policy
         self.settings = settings or ServerSettings()
         self.policy.validate(bind=self.settings.bind)
+        audit_path = policy.audit.path
+        if audit_path is not None and self.settings.policy_path is not None:
+            # 相对路径相对策略文件解析（读取侧同一规则，见 ServerSettings.policy_path）
+            audit_path = resolve_audit_path(self.settings.policy_path, audit_path)
         self.audit = (
             audit
             if audit is not None
             else AuditLog(
-                policy.audit.path,
+                audit_path,
                 enabled=policy.audit.enabled,
                 flush_every=policy.audit.flush_every,
                 flush_interval=policy.audit.flush_interval,
