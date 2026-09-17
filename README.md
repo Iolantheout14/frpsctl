@@ -18,6 +18,7 @@
 - [五分钟上手](#五分钟上手)
 - [日常使用](#日常使用)
   - [看状态](#看状态)
+  - [看客户端与代理](#看客户端与代理)
   - [改配置](#改配置)
   - [看日志](#看日志)
   - [停下来](#停下来)
@@ -154,7 +155,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.2.0
+ ✓ 命令可用：frpsctl 0.2.1
 
 frpsctl 安装完成
 ```
@@ -369,6 +370,25 @@ $ frpsctl status --json
 | `systemd` | 由 systemd 托管，`start`/`stop`/`restart` 委托 systemctl |
 | `none` | 没有进程在跑，也没有 unit |
 
+### 看客户端与代理
+
+`status` 给的是总数；"谁在线、哪个代理在跑、各跑了多少流量"用这两条
+（走 v2 Admin API，自动翻页取全量，`--json` 可管道给 `jq`）：
+
+```console
+$ frpsctl clients
+name                         user       hostname             online  ip               version
+alice.f2a3e2edeef4a920       alice      DESKTOP-S8A3AVK      True    127.0.0.1        0.71.0
+
+$ frpsctl proxies
+name                         user       type    port   phase    conns  traffic(in/out)
+alice.alice-ssh              alice      tcp     6000   online   0      0 B / 0 B
+
+$ frpsctl proxies --type http      # 只看某类型
+```
+
+`kick <proxy-name>` 下线指定代理（名字就是 `proxies` 列出的 name）。
+
 ### 改配置
 
 frps 没有热重载，所以"改配置"和"重启"是同一件事。`config set` 把它实现为一次
@@ -405,6 +425,9 @@ $ frpsctl config set maxPortsPerClient 30
 
 ```bash
 frpsctl config set bindPort 8000 --no-restart   # 只写不重启（输出会提示"尚未生效"）
+frpsctl config list                             # 列出全部键（值自动打码）
+frpsctl config list --prefix webServer          # 只看某张表
+frpsctl config list --tree                      # 按表分组缩进展示
 frpsctl config get bindPort                     # 读单键
 frpsctl config get auth                         # 读整张表（机密自动打码）
 frpsctl config get auth.token --reveal          # 需要看原值时显式索取
@@ -438,10 +461,14 @@ $ frpsctl config set webServer.addr '"0.0.0.0"'   # 这一步会让它变成完�
 frpsctl log                 # 最近 100 行
 frpsctl log -n 500          # 最近 500 行
 frpsctl log -f              # 持续跟踪（tail -f）
+frpsctl service logs -f     # systemd 模式：unit 级日志（journalctl -u）
 ```
 
 日志路径取自配置里的 `log.to`（相对路径按实例目录解析）。frpsctl **不写**这个
 文件——它由 frp 自己写并按天轮转。多一个写入者会和轮转互相破坏。
+
+`service logs` 看的是 **journald** 里的 unit 级日志（启动失败、OOM、权限拒绝
+这类"frp 还没写进自己的日志文件"的问题），两者互补。
 
 ### 停下来
 
@@ -520,6 +547,17 @@ FRPSCTL_INSTANCE=web frpsctl status    # 或长期用环境变量
 ```
 
 优先级：`--instance` > `FRPSCTL_INSTANCE` > `default`。
+
+一眼看全部实例（一行一个：owner / 状态 / pid / 版本 / 健康）：
+
+```console
+$ frpsctl instances
+default          direct   RUNNING (pid 10582, up 2m10s)  frps 0.71.0  L1 process ok  L2 control ok  L3 plugin skipped
+web              systemd  SYSTEMD_ACTIVE (pid 20041)
+```
+
+默认不做网络探测（快速）；加 `--health` 会对运行中的实例跑三层健康检查。
+`instances --json` 输出与 `status --json` 同构的数组。
 
 服务端场景可把实例根目录放到 `/etc`：
 
@@ -620,6 +658,25 @@ type = "tcp"
 localPort = 8080
 remotePort = 6005                        # 必须在自己被允许的范围内
 ```
+
+### 用 systemd 守护（推荐）
+
+`plugin serve` 是前台进程，而插件是**全部客户端登录的单点**且 fail-closed——
+生产环境必须让它随系统自启、退出即拉起。工具直接生成 unit：
+
+```bash
+sudo frpsctl plugin service install     # 体检 → 渲染 frpsctl-plugin@.service → enable
+sudo frpsctl plugin service status
+sudo frpsctl plugin service uninstall   # 停用并移除
+```
+
+生成的 unit 要点：`Restart=always`、`ProtectSystem=strict`、`ReadWritePaths=<实例目录>`
+（策略与审计都在那里）、`ExecStart=... --instance %i plugin serve --policy ...`。
+
+安装前的体检与 frps 的 `service install` 同样严格，且多一条硬约束——绑定地址
+必须是回环。另外 `frpsctl` 本身必须对服务用户可达且**不在家目录**：
+`ProtectHome=true` 会挡住 `~/.local/bin`，pipx 用户请用
+`sudo pipx install --global frpsctl`（或 `sudo pip install frpsctl`）。
 
 ### 审计
 
@@ -1038,9 +1095,9 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 296 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（271 条）
-.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 82%）
+.venv/bin/pytest                       # 全部 357 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（332 条）
+.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 83%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
 

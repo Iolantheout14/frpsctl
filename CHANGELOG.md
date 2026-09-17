@@ -3,6 +3,65 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-09-17
+
+第四轮全量迭代：并发根治、策略 fail-open 修复与便捷性命令。
+
+### 新增
+
+- `frpsctl instances [--health]`：多实例一行式概览（owner / 状态 / pid / 版本 / 健康）。
+- `frpsctl clients` / `frpsctl proxies [--type]`：v2 Admin API 的客户端与代理列表
+  （自动翻页取全量，`--json` 可管道）。
+- `frpsctl config list [--prefix] [--tree]`：列出全部配置键（值自动打码；
+  `--tree` 按表分组缩进展示）。
+- `frpsctl plugin service install|uninstall|status`：插件服务的 systemd unit
+  （`Restart=always`，安装前四项体检：账户 / frpsctl 可达且不在家目录 / 策略文件 / 回环）。
+- `frpsctl service logs [-f] [-n]`：journald 集成（unit 级日志）。
+- `start`/`restart` 等待健康检查时输出**逐轮进度**（终端原地刷新，非终端按行
+  限流；`--json` 不输出进度）；`install` 在终端上恢复 curl 下载进度条
+  （管道中自动静默）。
+
+### 修复
+
+- **并发（P0）**：`config set` 的候选生成（plan）移入实例锁内——两个并发变更不再
+  互相静默覆盖（实测复现：后写入者覆盖前者，两边都报成功）；`config edit` 引入
+  锁内 CAS（编辑期间文件被并发修改 → 拒绝草稿并提示重新编辑）；
+  `config rollback` / `config diff` 的读取同样入锁。
+- **安全**：策略 JSON 的宽松转换曾是 fail-open——`"allow_unknown_user": "false"`
+  （字符串）被 `bool()` 判成 **True**，等于打开鉴权后门；`allow_random_port` 同理。
+  现改为严格类型（类型错误报 3 并指出字段名），并修掉 `"audit": "false"` 的裸
+  `AttributeError`。
+- `--health-timeout` 对 systemd 实例生效（此前硬编码 10s，参数被静默忽略）。
+- `same_config_active` 扫描全部 active service：自建 unit 指向同一配置不再漏检
+  （direct 与 systemd 双起防护补洞）。
+- `status` 单次探测所有权（systemd 下从 4 个子进程降为 2 个，消除两次探测间的 TOCTOU）。
+- 下载在 curl 失败时回退 urllib（此前兜底代码不可达）；curl 进度不再被捕获。
+- `config edit` / `verify` / `config diff` 在配置缺失时给出配置错误(3)，而不是
+  未分类错误(1)；`EDITOR="vim -u NONE"` 这类带参数写法可用（引号不配对归用法错误 2）。
+- `reject_log_burst` / `reject_log_window` 真正生效：拒绝风暴期间审计限速，
+  被抑制的条数在 `suppressed` 字段如实汇报（此前是零引用的死配置）。
+- `write_state` 走统一原子写（fsync + 随机临时名 + 保留属主）。
+- `parse_listen`：`bindPort = 0` 实测回落默认 7000，不再当作"无监听"。
+- `do_GET /healthz` 的 BrokenPipe 不再把回溯打进插件 stderr。
+- "是否需要 `--allow-unsafe`" 收敛为单点判定（此前四份实现）。
+- 死代码清理（`restart` 的无效 try、`policy.validate` 的空分支）。
+- `doctor` 重复探测去重（`frps -v` 与 `resolve_owner` 各一次）。
+- 回归 review 追加修复：`doctor` 对低于门槛的二进制给出**正确诊断**
+  （"低于最低支持版本"而非"无法读取版本 / 可能不是官方 frps"）；systemd unit
+  渲染统一绝对化——`--root ./instances` / `--binary ./bin/frps` 这类相对输入
+  不再写出 `ExecStart=bin/frps` 的坏 unit。
+
+- 回归 review 追加修复：展示层异常不再拖垮启动（`on_tick` 进度回调的异常被
+  隔离——`start 2>&1 | head` 场景曾把刚派生的 frps 误杀）；`note` / `progress` /
+  `warn` / `trace` 在 stderr 管道断开时静默（不再二次崩溃）；tty 进度补清行尾码
+  （消除残影）。
+
+### 工程
+
+- 新增 61 条回归用例（总计 357），覆盖率 83%。
+- `init --bind-port` 加范围约束（`0` 归用法错误 2）；`config set --json` 的 noop
+  路径输出 JSON（此前打印人读文本）。
+
 ## [0.2.0] - 2026-09-16
 
 第三轮全量迭代：安全缺口、部署守护、稳定性与发布链路。

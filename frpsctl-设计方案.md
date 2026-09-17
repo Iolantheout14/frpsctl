@@ -2145,6 +2145,273 @@ $ frpsctl install --only-download                      # 显式不动链
 
 ---
 
+## 17.9 第四轮全量迭代（v0.2.1：并发根治、策略 fail-open 与便捷性）
+
+第四轮目标是"便捷性、易用性、稳定性、可靠性"四轴全覆盖。方法与前几轮一致：
+**先把全部源码、测试与文档读完（18,028 行，无截断），再逐条实测**。统计：修复
+**16 条**问题（含 2 条安全/正确性缺陷、1 条 P0 并发缺陷），新增 **47 个用例**
+（296 → 343），覆盖率 82% → **83%**，并新增 6 个命令。
+
+### 17.9.1 P0：并发配置变更静默丢失（前三轮的结构性盲区）
+
+`config set` 是"读-改-写"，但**"读"（`plan_set`）在实例锁外**：两个并发变更都
+基于同一份旧文本生成完整新文本，后写入者覆盖前者，**两条命令都报成功**。实测
+复现（确定性，不依赖线程时序）：
+
+```console
+$ 两个 plan_set 均基于 bindPort=7000 的初始配置，先后 apply：
+    A: config set bindPort 8000        → 成功
+    B: config set maxPortsPerClient 30 → 成功
+$ 最终配置：bindPort = 7000             ← A 的变更被静默覆盖
+```
+
+前三轮没发现它的原因很具体：**单线程逻辑完全正确**，代码读起来无懈可击；
+只有"两个并发调用 + 特定时序"才触发。这是串行审查的结构性盲区。
+
+修复是**锁边界的重新划分**（不是补丁）：`transaction.py` 只暴露三个入口，
+每个都在**同一把锁内**完成"读取 → 生成候选 → 落盘"：
+
+| 入口 | 场景 | 候选生成 |
+|------|------|---------|
+| `apply_set` | `config set` | 锁内 `plan_set`（noop 判定同样在锁内） |
+| `apply_edit` | `config edit` | 锁内 **CAS**：编辑器交互在锁外，写回前确认文件未被并发修改 |
+| `rollback_to` | `config rollback` | 锁内选快照并读取 |
+
+原 `apply_change`（接受已在锁外生成的 `new_text`）收敛为内部函数 `_apply_locked`
+——把"锁的边界"从调用方纪律变成 API 结构：CLI 不可能再写错。
+
+新增回归用例三条，其中最关键的一条是**确定性不变量**（不依赖时序）：
+`cfg.plan_set` 被调用时 `is_locked()` 必须为真。
+
+### 17.9.2 安全：策略 JSON 的宽松转换是 fail-open
+
+`bool(raw.get("allow_unknown_user", False))` —— JSON 里写 `"false"`（带引号的
+字符串）时 Python 的 `bool("false")` 是 **True**。实测确认：
+
+```console
+$ 策略里 allow_unknown_user: "false"
+→ allow_unknown_user = True     ← 用户以为关了鉴权后门，实际完全打开
+→ allow_random_port  = True     ← 端口白名单同理形同虚设
+```
+
+修复：`policy.py` 引入 `_strict_bool` / `_strict_int` / `_strict_float` /
+`_strict_list` 四个严格转换（`bool` 不是 `int`、字符串不是数组、类型错误报
+退出码 3 并指出字段名），并修掉 `"audit": "false"` 走到 `"false".get(...)` 的
+裸 `AttributeError`。负数的**钳制**语义（`flush_every` 最小 1）保持不变。
+
+同时兑现一个**零引用的死配置**：`reject_log_burst` / `reject_log_window` 在
+§11.3 承诺了"拒绝风暴限速"但实现里没有任何地方读过它。现在 `DecisionEngine`
+按用户限速：拒绝风暴期间**请求仍被拒绝**（安全语义不变），审计停止逐条刷写，
+被抑制的条数累计到下一条记录的 `suppressed` 字段上——降采样必须可见。
+
+### 17.9.3 其余修复（14 条）
+
+| # | 问题 | 修复 |
+|---|------|------|
+| 1 | `--health-timeout` 对 systemd 实例**静默无效**（`_start_via_systemd` 硬编码 10s） | 参数透传 + 回归用例 |
+| 2 | `same_config_active` 只扫 `frps*`：自建 unit（`my-tunnel.service`）指向同一配置时漏检，双起防护有洞 | 改为全量 active service + 逐个 ExecStart 比对 |
+| 3 | `status` 调 `resolve_owner()` 两次（systemd 下 4 个子进程 + TOCTOU） | 新增 `state_with_owner()` 单次探测；doctor 复用同一快照 |
+| 4 | curl 存在但失败时**不回退 urllib**（兜底代码不可达） | `_fetch` 双通道：curl 失败保留错误并尝试 urllib |
+| 5 | `config edit` 配置不存在 → 裸 `FileNotFoundError`（未分类 1） | 新增 `read_config_text()` 统一收口为配置错误(3)（verify/diff/start 同步） |
+| 6 | `EDITOR="vim -u NONE"`（带参数）→ `FileNotFoundError` | `shlex.split`；引号不配对归用法错误(2) |
+| 7 | 策略数值字段类型写错 → 裸 `ValueError` | 严格转换，指出字段名与实参 |
+| 8 | `do_GET /healthz` 无 BrokenPipe 保护 → 探活断开的回溯污染插件 stderr | `_send_body` 统一捕获 |
+| 9 | `write_state` 手写 tmp+replace（无 fsync/固定 tmp 名/夺回属主） | 统一到 `atomic_write` |
+| 10 | "是否需要 `--allow-unsafe`"有 **4 份**实现 | 单点 `config.needs_unsafe_flag(text)`，四处调用统一 |
+| 11 | `_place_binary` 临时名不带线程 id | 与 `switch_symlink` 对齐 |
+| 12 | `restart` 的 `try/except AlreadyRunning: raise` 死代码 | 删除 |
+| 13 | `doctor` 重复探 `frps -v`（2 次）与重复 `resolve_owner`（3 次） | run_doctor 单次探测后传参 |
+| 14 | `parse_listen` 把 `bindPort <= 0` 当成"无监听" | **实测修正**：frp 回落默认 7000（启动日志 `listen on 127.0.0.1:7000`） |
+
+### 17.9.4 便捷性与易用性：6 个新命令
+
+| 命令 | 价值 | 实现基础 |
+|------|------|---------|
+| `frpsctl instances [--health]` | 多实例一行式概览（此前要手动 ls + 逐个 status） | 遍历 + `status()`，`--health` 才对运行中的实例做网络探测 |
+| `frpsctl clients` | 在线客户端列表（`AdminClient.clients()` 早已实现却无 CLI 出口） | v2 `/api/v2/clients`，自动翻页取全量 |
+| `frpsctl proxies [--type]` | 代理列表（name/user/port/phase/流量） | 新增 `V2Proxy`：嵌套 `spec/status` 形状在真机核对 |
+| `frpsctl config list [--prefix] [--tree]` | 键名发现（此前只能翻文档或逐个 get 试） | `flatten_tree` + 同一套打码 |
+| `frpsctl plugin service install` | 插件 systemd unit（README 要求 `Restart=always` 却让用户手写） | `frpsctl-plugin@.service` 模板 + 四项目体检 |
+| `frpsctl service logs [-f]` | journald 集成（unit 级日志只有 journalctl 能看到） | `Systemd.journal_argv()` 纯函数 + CLI 终端接管 |
+
+配套体验：`start`/`restart` 的等待期输出**逐轮进度**（终端原地刷新、非终端按行
+限流；`--json` 不输出）；`install` 的 curl 不再捕获 stderr——终端上恢复下载
+进度条（管道中自动静默）；`config set` 的 noop 在 `--json` 下也输出 JSON
+（此前打印人读文本）。
+
+### 17.9.5 端到端验收（真 frps 0.71.0 + 真 frpc）
+
+```console
+$ frpsctl init → start → instances → clients → proxies → config list → config set → stop
+（全部通过；真实 frpc 连接后 clients/proxies 正确渲染出 runID/user/port/phase）
+```
+
+- 全量 **343 用例通过、0 skipped**（含 C1–C8 契约层与真 frpc 端到端）；
+- ruff 全绿；覆盖率 **83%**；非契约层 318 条。
+
+### 17.9.6 未做与边界（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| 策略 JSON 的 schema 校验（如 JSON Schema） | 不做：严格转换已覆盖"类型写错"这一真实高发面，上 schema 会引入新依赖与维护成本 |
+| `clients`/`proxies` 的实时刷新（`--watch`） | 不做：`status --watch` 已覆盖"持续观察"的主场景；列表类命令的刷新留给 shell 循环 |
+| `reject_log_burst` 的跨进程持久化 | 不做：限速是"保护审计文件不被刷爆"的进程内手段，重启后重置是合理的 |
+
+---
+
+## 17.10 第四轮回归 review（v0.2.1 发布前）
+
+方法：**逐条审查本轮全部 diff + 对抗性实测**（多进程并发、真实编辑器 CAS、
+真机分页与 unsafe 标志）。发现 **3 个真实缺陷**（全部是第四轮重构自己引入或
+放大的），并在"方案完整性核对"中补齐 **2 处实施降级**（见 §17.10.5）——
+新增 **11 条回归用例**（343 → 354），覆盖率维持 83%。
+
+### 17.10.1 doctor 的版本诊断漂移（重构引入）
+
+`_read_version` 改用带门槛的 `lc.binary_version()` 之后，`< 0.70.0` 抛出的
+`UnsupportedVersion` 被吞成 None，最终报"无法读取版本 / 可能不是官方 frps"
+——而真因是"版本太低"。实测（0.69.1 假件）复现。
+
+修复：裸读版本（`read_binary_version`），门槛判断留在 `_check_binary` 的
+展示逻辑；`_check_config` 对不达标版本跳过（不用低版本二进制做"权威校验"
+得到误导性结论）。
+
+### 17.10.2 unit 渲染的相对路径（既有缺陷，被 plugin service 放大）
+
+两个安装器会把用户给的相对路径（`--root ./instances` / `--binary ./bin/frps`）
+**原样写进 unit**：`ExecStart=bin/frps`、`WorkingDirectory=instances/t`、
+`ReadWritePaths=instances/t`。systemd 要求绝对路径——安装成功，
+`systemctl start` 才报 "Executable path is not absolute"。
+
+实测复现（第五轮 review 的前置实验）后修复：渲染前统一 `.resolve()`
+（`Systemd.install_template` 与 `PluginService.install_template`）。
+
+### 17.10.3 对抗性实测清单（全部通过）
+
+| 场景 | 方法 | 结果 |
+|------|------|------|
+| P0 并发（**多进程**，非线程） | 8 轮双进程并发 `config set` 不同键 | 两个键的改动全部保留（修复前必然丢失） |
+| 编辑器 CAS | 慢编辑器（2s）+ 编辑期间并发 `config set` | set 成功保留；edit 退出码 3 拒绝草稿，文件无草稿痕迹 |
+| exec tokenSource | 真 frps verify | trace 显示 `--allow-unsafe TokenSourceExec`，退出 0（单点判定无退化） |
+| 分页上限 | 真 frp `page_size=200` | 服务端 **cap 到 50**；`_paged` 按 `total` 收敛（mock 测试锁定翻页行为） |
+| `instances --health` | 真 frps 运行中 | 三层健康正确渲染 |
+| 残留模式扫描 | grep（宽松转换 / 死代码 / 未 resolve 路径） | 无残留 |
+
+### 17.10.4 未修（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| `_paged` 的 `max_pages=100`（2 万条上限） | 保留：服务端异常时的死循环防御；正常规模（代理数千）不会触及 |
+| `clients` 的 `bool(item.get("online"))` | 保留：展示层字段来自 frp 的 JSON 布尔，非安全语义 |
+
+### 17.10.5 方案完整性核对：补齐两处实施降级
+
+对照第四轮方案逐项核对，发现两处**实施时被简化**、与方案原文有差距（不是
+缺陷，但方案承诺未 100% 兑现），本轮补齐：
+
+| 方案条目 | 实施时的降级 | 补齐方式 |
+|---------|-------------|---------|
+| P2-5 健康等待**进度** | 只有一行静态提示，没有逐轮进度 | `Lifecycle._await_health` 增加 `on_tick` 回调链（`start`/`restart`/systemd 路径透传）；`ui.progress` 终端原地刷新、非终端按秒限流按行；`--json` 不输出进度 |
+| P2-4 `config list --tree` | 实现成了 `--prefix`（方案列的是 `--tree`） | 补 `--tree`（表头完整点分路径 + 叶子缩进，可与 `--prefix` 组合） |
+
+核对结论：P0 全部、P1 全部 14 条 + 待核对项（`bindPort = 0` 实测修正）、
+P2 全部 7 项、P3 全部 4 条——**至此 100% 落地**。
+
+---
+
+## 17.11 第五轮回归 review（v0.2.1 发布前，补齐项专项）
+
+方法：对上一轮补齐的新代码（`on_tick` 回调链、`ui.progress`、`config list
+--tree`）做**对抗性复现**（stderr 断开、回调抛异常、tty 残影），并复查全量
+diff。发现 **3 个真实缺陷**——全部集中在"**展示层与业务层的边界**"——新增
+**3 条回归用例**（354 → 357），覆盖率维持 83%。
+
+### 17.11.1 展示层异常会拖垮启动（最严重）
+
+`_await_health` 的进度回调没有异常隔离：tick 抛 `BrokenPipeError`（`start
+2>&1 | head` 让 stderr 管道断开）时会冒泡进 `start()` 的 `except BaseException`，
+触发 `_reap_after_failure`——**刚派生的 frps 被误杀**，而用户只看到 `head`
+截断的一行输出。core 层与真实 CLI 端到端均复现。
+
+修复：`_await_health` 用 `contextlib.suppress(Exception)` 包住 on_tick 调用
+——进度回调是展示层，任何异常都不能影响启动。修复后同一场景实测：进程正常
+托管（`state=RUNNING`）、退出码 12（健康未过的正确语义）。
+
+### 17.11.2 stderr 辅助输出在管道断开时二次崩溃
+
+`ui.note` / `ui.progress` / `ui.warn` / `ui.trace` 直接写 stderr：管道断开
+时抛 `BrokenPipeError`。其中 `warn` 还挂在 `map_exceptions` 的**错误报告路径**
+上——二次异常会变成 traceback。
+
+修复：四个函数内部 `suppress(OSError)`——stderr 是辅助通道，写失败静默放弃。
+
+### 17.11.3 tty 进度的残影
+
+`ui.progress` 的终端分支只写 `\r` 不清行尾——文本从 "等待健康检查 10s" 变
+"9s" 时留下残影。修复：补 `\033[K`（与 `status --watch` 的"仅 tty 写 ANSI"
+原则一致）。
+
+### 17.11.4 对抗性实测（复现 → 修复 → 验证）
+
+| 场景 | 修复前 | 修复后 |
+|------|--------|--------|
+| tick 抛 BrokenPipe（core 层复现） | 异常冒泡 → `_reap_after_failure` | 被隔离，等待正常完成 |
+| `start 2>&1 \| head -1`（真机 e2e，L2 fail） | 进程被误杀 | 进程 RUNNING、退出码 12 |
+| stderr 断开时 note / progress / warn / trace | 全部抛 `BrokenPipeError` | 全部静默 |
+| tty 进度文本变短 | 残影 | `\033[K` 清行尾 |
+
+**共同模式**：这三个缺陷都不在业务逻辑里，而在"**展示层被授予了影响业务
+流程的能力**"——进度、告警、诊断的失败都不能是启动失败。这与 §15.5.2 的
+"降级必须可见"是一体两面：业务降级要可见，展示失败要无害。
+
+---
+
+## 17.12 发布前最终验收（v0.2.1）
+
+最后一轮 review 的目标从"找缺陷"转为"证明可发布"：**复刻 CI 全套 + 验证
+发布产物本身**（用户实际会安装的东西）。结论：**可发布**。
+
+### 17.12.1 发布产物验证
+
+| 项 | 方法 | 结果 |
+|----|------|------|
+| wheel 内容 | 解包核对模块清单 | 28 个 `.py` + `py.typed`，无缺失 |
+| wheel 安装 | 干净 venv（Python 3.14）安装 | `frpsctl 0.2.1`；7 个新命令的 help 全部可用（无打包遗漏导致的 import 错误） |
+| sdist 安装 | 干净 venv 安装源码包 | 同上 |
+| 安装后冒烟 | `init` / `config list --tree` / `instances` | 通过 |
+| 版本一致性 | 模拟 release workflow 的 tag 校验 | `v0.2.1` == `__version__`，一致 |
+| wheel 自检 | 模拟 workflow 的 required 集合断言 | 通过（35 个条目） |
+
+### 17.12.2 CI 全套本地复刻（与 ci.yml 逐步一致）
+
+| 步骤 | 结果 |
+|------|------|
+| ruff | 全绿 |
+| 非契约 + 覆盖率门禁（80%） | 332 passed，覆盖率 83.29% |
+| 契约层（真 frps 0.71.0） | 21 passed |
+| 故障注入层 | 23 passed |
+| 插件契约层（真 frpc） | 4 passed |
+| 端到端冒烟（12 步，含全部新命令） | 通过 |
+| 无二进制降级路径 | 18 skipped + 3 passed（静态断言），无失败 |
+| 0.70.0 下界契约矩阵 | 21 passed |
+
+### 17.12.3 文档-代码交叉核对（自动脚本）
+
+| 核对项 | 方法 | 结果 |
+|--------|------|------|
+| 命令 | 提取 README 全部 `frpsctl <cmd>` 引用 vs CLI 实际命令树（33 条路径） | 双向一致（无幽灵命令、无未文档化命令） |
+| 环境变量 | 代码中 `FRPSCTL_*` 引用 vs README 环境变量表 | 双向一致 |
+| 退出码 | README 退出码表 vs `errors.ExitCode` | 双向一致 |
+
+### 17.12.4 工作区卫生
+
+- 25 个修改文件全部在预期内；无 untracked 漏网（`.gitignore` 覆盖 `.coverage`、
+  `dist/`、`.venv/` 等构建产物）；
+- 版本引用零残留（`0.3.0` 字样已全部改为 `0.2.1`；历史段落里的 `v0.2.0`
+  是真实发布记录，保留）。
+
+---
+
 ## 附录 A：frps 配置键速查表
 
 > 全部取自 `v0.71.0` 源码；「默认值」栏是 `Complete()` 之后的**生效值**。合法取值来自校验器。
@@ -2162,7 +2429,7 @@ $ frpsctl install --only-download                      # 显式不动链
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|-------|------|
 | `bindAddr` | string | `0.0.0.0` | 控制连接监听地址 |
-| `bindPort` | int | `7000` | 控制端口 |
+| `bindPort` | int | `7000` | 控制端口（**实测**：写 `0` 会回落默认 7000 并照常监听，不是"禁用"） |
 | `kcpBindPort` | int | `0`（禁用） | KCP 端口 |
 | `quicBindPort` | int | `0`（禁用） | QUIC 端口 |
 | `proxyBindAddr` | string | 同 `bindAddr` | 代理实际监听地址 |
