@@ -4,11 +4,36 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>frpsctl 管理台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%234f8cff'/%3E%3Cpath%20d='M10%2022V10h9v3.2h-5.4v1.6h4.6v3.1h-4.6V22z'%20fill='white'/%3E%3C/svg%3E">
+<script>
+  /* 主题必须在首帧前落定（放 head）：否则暗色用户会看到一次亮色闪烁。 */
+  try {
+    var saved = localStorage.getItem("frpsctl_web_theme");
+    var light = saved ? saved === "light"
+      : window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+    if (light) document.documentElement.classList.add("light");
+  } catch (e) { /* 隐私模式：跟随默认（暗色） */ }
+</script>
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --panel2: #1d222c; --border: #262b36;
     --text: #e6e9ef; --muted: #8b93a7; --accent: #4f8cff; --accent2: #7aa2ff;
     --ok: #34d399; --warn: #fbbf24; --err: #f87171; --radius: 12px;
+    --pre-bg: #0b0d11; --header-bg: rgba(15,17,21,.92); --shadow: rgba(0,0,0,.45);
+    --danger-bg: #3a1d1d; --danger-border: #5b2a2a; --danger-text: #ffb4b4; --danger-hover: #4a2222;
+    --tag-online-border: #1f4638;
+    --diff-add-bg: rgba(52,211,153,.12); --diff-del-bg: rgba(248,113,113,.12);
+    --banner-warn-bg: rgba(251,191,36,.10); --banner-err-bg: rgba(248,113,113,.12);
+  }
+  :root.light {
+    --bg: #f4f6fa; --panel: #ffffff; --panel2: #eef1f6; --border: #d8dee9;
+    --text: #1c2330; --muted: #5b6577; --accent: #2563eb; --accent2: #1d4ed8;
+    --ok: #059669; --warn: #b45309; --err: #dc2626;
+    --pre-bg: #f7f9fc; --header-bg: rgba(244,246,250,.92); --shadow: rgba(30,41,59,.18);
+    --danger-bg: #fee2e2; --danger-border: #fca5a5; --danger-text: #b91c1c; --danger-hover: #fecaca;
+    --tag-online-border: #a7f3d0;
+    --diff-add-bg: rgba(5,150,105,.10); --diff-del-bg: rgba(220,38,38,.10);
+    --banner-warn-bg: rgba(180,83,9,.10); --banner-err-bg: rgba(220,38,38,.10);
   }
   * { box-sizing: border-box; }
   body {
@@ -21,10 +46,11 @@
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit;
   }
-  button:hover { border-color: var(--accent); color: #fff; }
+  button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.danger { background: #3a1d1d; border-color: #5b2a2a; color: #ffb4b4; }
-  button.danger:hover { background: #4a2222; color: #fff; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.danger { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger-text); }
+  button.danger:hover { background: var(--danger-hover); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   input {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
@@ -33,20 +59,22 @@
   input:focus { outline: none; border-color: var(--accent); }
   code, pre { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
   pre {
-    background: #0b0d11; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--pre-bg); border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 12px; overflow: auto; max-height: 420px; font-size: 12.5px;
     margin: 0; white-space: pre-wrap; word-break: break-all;
   }
   header {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 12px 20px; border-bottom: 1px solid var(--border);
-    background: rgba(15,17,21,.92); position: sticky; top: 0; backdrop-filter: blur(8px); z-index: 5;
+    background: var(--header-bg); position: sticky; top: 0; backdrop-filter: blur(8px); z-index: 5;
   }
   header .brand { font-weight: 650; letter-spacing: .3px; }
   header .spacer { flex: 1; }
+  header .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   nav { display: flex; gap: 4px; }
   nav button { border: none; background: transparent; color: var(--muted); }
   nav button.active { color: var(--text); background: var(--panel2); }
+  #menu-toggle { display: none; }
   .badge {
     display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
     border-radius: 999px; font-size: 12.5px; border: 1px solid var(--border); color: var(--muted);
@@ -54,30 +82,49 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
   .dot.ok { background: var(--ok); } .dot.fail { background: var(--err); }
   .dot.warn { background: var(--warn); }
+  .dot.busy { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   main { padding: 20px; max-width: 1280px; margin: 0 auto; display: grid; gap: 16px; }
+  .banner {
+    border-radius: var(--radius); padding: 10px 14px; font-size: 13.5px;
+    border: 1px solid var(--border); white-space: pre-wrap;
+  }
+  .banner.warn { background: var(--banner-warn-bg); border-color: var(--warn); }
+  .banner.err { background: var(--banner-err-bg); border-color: var(--err); }
   .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
   .card h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; letter-spacing: .4px; }
   .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13.5px; }
   .kv div:nth-child(odd) { color: var(--muted); }
   .stat { display: flex; flex-direction: column; gap: 2px; }
-  .stat .num { font-size: 26px; font-weight: 650; }
+  .stat .num { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
   .stat .label { color: var(--muted); font-size: 12.5px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 14px; }
+  .tablewrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   tr:hover td { background: var(--panel2); }
+  tr.clickable { cursor: pointer; }
+  tr.detail td { background: var(--panel2); }
+  tr.detail pre { max-height: 260px; }
   .muted { color: var(--muted); }
   .tag { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
-  .tag.online { color: var(--ok); border-color: #1f4638; }
+  .tag.online { color: var(--ok); border-color: var(--tag-online-border); }
   #toast {
     position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column;
-    gap: 8px; z-index: 30; max-width: 420px;
+    gap: 8px; z-index: 30; max-width: 460px;
   }
   #toast .item {
     background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
-    border-radius: 8px; padding: 10px 14px; box-shadow: 0 8px 30px rgba(0,0,0,.45); white-space: pre-wrap;
+    border-radius: 8px; padding: 10px 12px; box-shadow: 0 8px 30px var(--shadow);
+    display: flex; gap: 8px; align-items: flex-start;
+  }
+  #toast .item .msg { flex: 1; white-space: pre-wrap; word-break: break-word; }
+  #toast .item .close {
+    border: none; background: transparent; color: var(--muted);
+    padding: 0 2px; font-size: 16px; line-height: 1; cursor: pointer;
   }
   #toast .item.err { border-left-color: var(--err); }
   #toast .item.ok { border-left-color: var(--ok); }
@@ -87,15 +134,36 @@
   #login p { color: var(--muted); margin: 0 0 16px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .chart-wrap { overflow-x: auto; }
-  .field { display: grid; grid-template-columns: minmax(180px, 300px) 1fr; gap: 8px 14px; align-items: center; padding: 5px 0; }
+  .chart-note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .field { display: grid; grid-template-columns: minmax(180px, 300px) 1fr auto; gap: 8px 14px; align-items: center; padding: 5px 0; }
   .field label { color: var(--muted); font-size: 13px; word-break: break-all; }
   .field.dirty label { color: var(--warn); }
   .field.dirty input { border-color: var(--warn); }
+  .field.deleted label { text-decoration: line-through; }
+  .field.deleted input { opacity: .45; }
   .group-title { margin: 18px 0 6px; color: var(--accent2); font-size: 13px; font-weight: 650; }
   .diffbox { max-height: 320px; }
+  .diffline { display: block; }
+  .diffline.add { background: var(--diff-add-bg); color: var(--ok); }
+  .diffline.del { background: var(--diff-del-bg); color: var(--err); }
+  .diffline.hunk { color: var(--accent2); }
+  /* 图表颜色走 CSS（SVG 的 fill/stroke 由样式表控制）：主题切换即时生效，
+     JS 不必知道任何颜色。 */
+  .bar-in { fill: var(--accent); }
+  .bar-out { fill: var(--ok); }
+  .line-in { stroke: var(--accent); }
+  .line-out { stroke: var(--ok); }
+  .axis { fill: var(--muted); }
   .logline { display: block; font-size: 12.5px; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } .field { grid-template-columns: 1fr; } }
+  .addrow { display: grid; grid-template-columns: minmax(180px, 300px) 1fr auto; gap: 8px; margin-top: 10px; }
+  #cfg-count.clickable { cursor: pointer; text-decoration: underline dotted; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } .field { grid-template-columns: 1fr; } .addrow { grid-template-columns: 1fr; } }
+  @media (max-width: 760px) {
+    #menu-toggle { display: inline-block; }
+    header .actions { display: none; width: 100%; }
+    header .actions.open { display: flex; }
+  }
 </style>
 </head>
 <body>
@@ -108,6 +176,7 @@
       <button class="primary" id="login-btn" style="flex:1">登录</button>
     </div>
     <p class="muted" id="login-error" style="margin-top:10px"></p>
+    <p class="muted" style="font-size:12px;margin-bottom:0">连续登录失败会被暂时限制（限速与口令错误的提示相同）。</p>
   </div>
 </div>
 
@@ -121,15 +190,21 @@
       <button id="nav-config">配置</button>
     </nav>
     <span class="spacer"></span>
-    <label class="muted" style="font-size:12.5px;display:flex;gap:6px;align-items:center">
-      <input type="checkbox" id="autopoll" checked style="width:auto"> 自动刷新
-    </label>
-    <button id="act-start">启动</button>
-    <button id="act-restart">重启</button>
-    <button class="danger" id="act-stop">停止</button>
-    <button id="logout" title="退出登录">登出</button>
+    <button id="menu-toggle" title="展开菜单">菜单</button>
+    <div class="actions">
+      <button id="refresh-btn" title="立即刷新">刷新</button>
+      <label class="muted" style="font-size:12.5px;display:flex;gap:6px;align-items:center">
+        <input type="checkbox" id="autopoll" checked style="width:auto"> 自动刷新
+      </label>
+      <button id="theme-toggle" title="切换明暗主题">亮色</button>
+      <button id="act-start">启动</button>
+      <button id="act-restart">重启</button>
+      <button class="danger" id="act-stop">停止</button>
+      <button id="logout" title="退出登录">登出</button>
+    </div>
   </header>
   <main>
+    <div id="banner" class="hidden"></div>
     <div id="view-dash" class="grid">
       <section class="card">
         <h2>实例状态</h2>
@@ -146,24 +221,28 @@
       <section class="card">
         <h2>近 7 天流量（按天）</h2>
         <div class="chart-wrap" id="chart-7d"></div>
+        <p class="chart-note" id="chart-7d-hint"></p>
       </section>
       <section class="card">
         <h2>本次会话实时流量（Δ/区间）</h2>
         <div class="chart-wrap" id="chart-live"></div>
-        <p class="muted" style="font-size:12px;margin:8px 0 0">页面打开期间每 5 秒采样一次（累计值差分），存本地浏览器。</p>
+        <p class="chart-note" id="live-hint">页面打开期间每 5 秒采样一次（累计值差分），存本地浏览器。</p>
       </section>
       <section class="card" style="grid-column: 1 / -1">
         <h2>客户端</h2>
-        <div id="clients-table" class="muted">加载中…</div>
+        <div class="tablewrap"><div id="clients-table" class="muted">加载中…</div></div>
       </section>
       <section class="card" style="grid-column: 1 / -1">
-        <h2>代理 <span class="spacer"></span>
-          <button id="prune-btn" style="float:right">清理离线记录</button>
+        <h2>代理 <span class="muted" style="font-size:12px;font-weight:400">（点击某行查看该代理的 7 天曲线）</span></h2>
+        <div class="row" style="justify-content:flex-end;margin-bottom:8px">
+          <button id="prune-btn">清理离线记录</button>
+        </div>
+        <div class="tablewrap"><div id="proxies-table" class="muted">加载中…</div></div>
+      </section>
+      <section class="card" style="grid-column: 1 / -1">
+        <h2>日志 <span class="muted" id="log-path" style="font-weight:400;font-size:12px"></span>
+          <span class="muted" id="log-follow" style="font-weight:400;font-size:12px;float:right">跟随中</span>
         </h2>
-        <div id="proxies-table" class="muted">加载中…</div>
-      </section>
-      <section class="card" style="grid-column: 1 / -1">
-        <h2>日志 <span class="muted" id="log-path" style="font-weight:400"></span></h2>
         <pre id="logs">加载中…</pre>
       </section>
     </div>
@@ -173,12 +252,17 @@
         <h2>配置编辑</h2>
         <p class="muted" style="margin-top:0">
           修改任意字段后点"预览变更"查看 diff，确认后应用到实例（会重启服务）。
-          敏感值（token / 口令）不回显：留空表示不改，填入新值才会覆盖。
+          敏感值（token / 口令）不回显：留空表示不改，填入新值才会覆盖；行尾"删除"会让该键回落默认值。
         </p>
         <div id="config-form"></div>
+        <div class="addrow">
+          <input id="add-key" placeholder="新增键名（点分，如 kcpBindPort）" autocomplete="off">
+          <input id="add-value" placeholder='值（如 7001 或 "text"）' autocomplete="off">
+          <button id="add-btn">添加</button>
+        </div>
         <div class="row" style="margin-top:16px">
           <button class="primary" id="cfg-preview">预览变更</button>
-          <button id="cfg-reset">丢弃修改</button>
+          <button id="cfg-reset">重新加载（丢弃修改）</button>
           <span class="muted" id="cfg-count" style="font-size:12.5px"></span>
         </div>
       </section>
@@ -192,7 +276,8 @@
       </section>
       <section class="card">
         <h2>历史与回滚</h2>
-        <div id="history-table" class="muted">加载中…</div>
+        <p class="muted" style="margin-top:0;font-size:12.5px">回滚前建议先"查看差异"——回滚会重启服务。</p>
+        <div class="tablewrap"><div id="history-table" class="muted">加载中…</div></div>
       </section>
     </div>
   </main>
@@ -203,17 +288,20 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 let CSRF = null;           // 只存内存（不落 localStorage）
-let SAMPLES_KEY = "frpsctl_web_samples_v1";
+const SAMPLES_KEY = "frpsctl_web_samples_v1";
+const THEME_KEY = "frpsctl_web_theme";
 let timer = null;
 let lastStatus = null;
+let busy = false;          // 有变更类操作在进行（此间不轮询、按钮禁用）
+let refreshing = false;    // 防止慢请求叠加（5s 轮询 + 手动刷新）
 
 /* ---------- 基础 ---------- */
 function toast(msg, kind = "") {
-  const box = document.createElement("div");
-  box.className = "item " + kind;
-  box.textContent = msg;
+  const box = el("div", { class: "item " + kind });
+  const close = el("button", { class: "close", text: "×", title: "关闭", onclick: () => box.remove() });
+  box.append(el("div", { class: "msg", text: msg }), close);
   $("toast").appendChild(box);
-  setTimeout(() => box.remove(), 6000);
+  if (kind !== "err") setTimeout(() => box.remove(), 4000);
 }
 function el(tag, attrs = {}, children = []) {
   const node = document.createElement(tag);
@@ -235,10 +323,29 @@ async function api(path, { method = "GET", body = null } = {}) {
   const resp = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : null });
   let data = {};
   try { data = await resp.json(); } catch (e) { /* 空响应体 */ }
-  if (resp.status === 401 && !path.endsWith("/login")) { showLogin(); throw new Error("登录已过期"); }
+  if (resp.status === 401 && !path.endsWith("/login")) { showLogin(); throw new Error("登录已过期，请重新登录"); }
   if (!resp.ok) throw new Error(data.error ? (data.error + (data.hint ? "\n" + data.hint : "")) : `HTTP ${resp.status}`);
   return data;
 }
+
+/* ---------- 主题 ---------- */
+function isLight() { return document.documentElement.classList.contains("light"); }
+function applyTheme(light, persist = true) {
+  document.documentElement.classList.toggle("light", light);
+  $("theme-toggle").textContent = light ? "暗色" : "亮色";
+  if (persist) {
+    try { localStorage.setItem(THEME_KEY, light ? "light" : "dark"); } catch (e) { /* 隐私模式 */ }
+  }
+}
+$("theme-toggle").textContent = isLight() ? "暗色" : "亮色";
+$("theme-toggle").addEventListener("click", () => applyTheme(!isLight()));
+// 用户从未手动选择过时，跟随系统主题的实时变化（选择过则以选择为准）
+try {
+  const scheme = window.matchMedia("(prefers-color-scheme: light)");
+  scheme.addEventListener("change", (e) => {
+    try { if (!localStorage.getItem(THEME_KEY)) applyTheme(e.matches, false); } catch (err) { /* 忽略 */ }
+  });
+} catch (e) { /* 老浏览器不支持 addEventListener：仅初始跟随 */ }
 
 /* ---------- 登录 ---------- */
 function showLogin() {
@@ -271,39 +378,57 @@ $("logout").addEventListener("click", async () => {
   showLogin();
 });
 
-/* ---------- 导航 ---------- */
+/* ---------- 导航与菜单 ---------- */
 function switchView(which) {
   const dash = which === "dash";
   $("view-dash").classList.toggle("hidden", !dash);
   $("view-config").classList.toggle("hidden", dash);
   $("nav-dash").classList.toggle("active", dash);
   $("nav-config").classList.toggle("active", !dash);
-  if (!dash) loadConfig();
+  // 已加载过就不重载：切走再切回不能丢掉未保存的修改（要丢弃请用"重新加载"）
+  if (!dash && !configLoaded) loadConfig();
 }
 $("nav-dash").addEventListener("click", () => switchView("dash"));
 $("nav-config").addEventListener("click", () => switchView("config"));
+$("menu-toggle").addEventListener("click", () => $("menu-toggle").nextElementSibling.classList.toggle("open"));
 
-/* ---------- 操作 ---------- */
+/* ---------- 操作（含 busy 态） ---------- */
+function setBusy(on, label = "") {
+  busy = on;
+  for (const id of ["act-start", "act-restart", "act-stop", "cfg-preview", "cfg-apply", "cfg-reset", "refresh-btn", "logout"]) {
+    const node = $(id);
+    if (node) node.disabled = on;
+  }
+  if (on) {
+    const dot = $("state-badge").querySelector(".dot");
+    dot.className = "dot busy";
+    $("state-text").textContent = label || "操作中…";
+  }
+}
 async function doAction(name, body = {}) {
   const label = { start: "启动", stop: "停止", restart: "重启" }[name] || name;
   if (name !== "start" && !confirm(`确认${label}实例？`)) return;
+  setBusy(true, `${label}中…`);
   try {
     const data = await api(`/api/actions/${name}`, { method: "POST", body });
     toast(`${label}完成` + (data.pid ? `（pid ${data.pid}）` : "") + (data.healthy === false ? "，但健康检查未通过" : ""), data.healthy === false ? "err" : "ok");
   } catch (err) {
     toast(`${label}失败：\n` + err.message, "err");
+  } finally {
+    setBusy(false);
   }
   refresh();
 }
 $("act-start").addEventListener("click", () => doAction("start"));
 $("act-stop").addEventListener("click", () => doAction("stop"));
 $("act-restart").addEventListener("click", () => doAction("restart"));
+$("refresh-btn").addEventListener("click", () => refresh());
 $("autopoll").addEventListener("change", (e) => {
   if (timer) { clearInterval(timer); timer = null; }
   if (e.target.checked) { timer = setInterval(tick, 5000); refresh(); }
 });
 async function tick() {
-  if (document.hidden || !$("autopoll").checked) return;
+  if (document.hidden || !$("autopoll").checked || busy) return;
   if (!$("view-dash").classList.contains("hidden")) refresh();
 }
 
@@ -333,8 +458,22 @@ function humanDuration(s) {
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
   if (d) return `${d}d${h}h`; if (h) return `${h}h${m}m`; if (m) return `${m}m${s % 60}s`; return `${s}s`;
 }
+function setBanners(items) {
+  const box = $("banner");
+  box.replaceChildren(...items.map((b) => el("div", { class: "banner " + b.kind, text: b.text })));
+  box.classList.toggle("hidden", items.length === 0);
+}
 
 async function refresh() {
+  if (refreshing) return;            // 慢请求叠加会让状态交错显示
+  refreshing = true;
+  try {
+    await doRefresh();
+  } finally {
+    refreshing = false;
+  }
+}
+async function doRefresh() {
   let status;
   try { status = await api("/api/status"); } catch (err) { toast("状态刷新失败：" + err.message, "err"); return; }
   lastStatus = status;
@@ -343,14 +482,26 @@ async function refresh() {
   dot.className = "dot " + badgeClass(status.state);
   $("state-text").textContent = status.state;
 
+  const banners = [];
+  if (status.state_corrupted) {
+    banners.push({
+      kind: "err",
+      text: "⚠ 状态文件已损坏：无法判断进程归属，因此 stop / start / 配置变更都会被拒绝。\n"
+        + "请确认没有 frps 在跑，然后删除实例目录下的 state.json。",
+    });
+  }
+  if (status.version_hint) banners.push({ kind: "warn", text: "⚠ " + status.version_hint });
+  const h = status.health;
+  if (h && h.plugin_warning) banners.push({ kind: "warn", text: "⚠ " + h.plugin_warning });
+  setBanners(banners);
+
   $("kv-status").replaceChildren(...kvRow([
     ["状态", status.state + (status.pid ? `（pid ${status.pid}）` : "")],
     ["运行时长", humanDuration(status.uptime_seconds)],
     ["版本", (status.binary_version || "-") + (status.disk_version && status.disk_version !== status.binary_version ? ` → 磁盘 ${status.disk_version}（重启生效）` : "")],
     ["监听", status.listen ? `${status.listen.addr}:${status.listen.port}` : "-"],
-    ["systemd", status.systemd_unit || "-"],
+    ["systemd", status.systemd_unit ? `${status.systemd_unit}（MainPID ${status.systemd_main_pid ?? "-"}）` : "-"],
   ]));
-  const h = status.health;
   $("kv-health").replaceChildren(...kvRow([
     ["L1 进程", h ? h.l1_process : "-"],
     ["L2 控制面", h ? h.l2_control : "-"],
@@ -379,11 +530,15 @@ async function refresh() {
   }
 }
 
+/* ---------- 列表（客户端 / 代理） ---------- */
+let proxiesCache = [];
+const expandedProxies = new Set();
 async function refreshLists() {
   try {
     const [clients, proxies] = await Promise.all([api("/api/clients"), api("/api/proxies")]);
     renderClients(clients.clients || []);
-    renderProxies(proxies.proxies || []);
+    proxiesCache = proxies.proxies || [];
+    renderProxies(proxiesCache);
   } catch (err) {
     $("clients-table").textContent = "（dashboard 不可用：" + err.message + "）";
     $("proxies-table").textContent = "（dashboard 不可用：" + err.message + "）";
@@ -392,7 +547,7 @@ async function refreshLists() {
 function tableOf(headers, rows) {
   if (!rows.length) return el("div", { class: "muted", text: "（空）" });
   const table = el("table", {}, [
-    el("thead", {}, [el("tr", {}, headers.map((h) => el("th", { text: h })))]),
+    el("thead", {}, [el("tr", {}, headers.map((h) => el("th", { text: h, class: h === "端口" || h === "连接" || h === "今日(入/出)" ? "num" : "" })))]),
     el("tbody", {}, rows),
   ]);
   return table;
@@ -408,28 +563,50 @@ function renderClients(items) {
   ]));
   $("clients-table").replaceChildren(tableOf(["name", "user", "hostname", "ip", "状态", "版本"], rows));
 }
+function proxySeries(name) {
+  return trafficSeries.find((s) => s.name === name) || { name, history: [] };
+}
 function renderProxies(items) {
-  const rows = items.map((p) => el("tr", {}, [
-    el("td", { text: p.name || "-" }),
-    el("td", { text: p.user || "-" }),
-    el("td", { text: p.type || "-" }),
-    el("td", { text: p.remote_port ? String(p.remote_port) : "-" }),
-    el("td", { text: p.phase || "-" }),
-    el("td", { text: String(p.cur_conns ?? 0) }),
-    el("td", { text: `${humanBytes(p.today_traffic_in)} / ${humanBytes(p.today_traffic_out)}` }),
-  ]));
+  const rows = [];
+  for (const p of items) {
+    rows.push(el("tr", { class: "clickable", onclick: () => toggleProxy(p.name) }, [
+      el("td", { text: p.name || "-" }),
+      el("td", { text: p.user || "-" }),
+      el("td", { text: p.type || "-" }),
+      el("td", { class: "num", text: p.remote_port ? String(p.remote_port) : "-" }),
+      el("td", {}, [el("span", { class: p.phase === "online" ? "tag online" : "tag", text: p.phase || "-" })]),
+      el("td", { class: "num", text: String(p.cur_conns ?? 0) }),
+      el("td", { class: "num", text: `${humanBytes(p.today_traffic_in)} / ${humanBytes(p.today_traffic_out)}` }),
+    ]));
+    if (expandedProxies.has(p.name)) {
+      rows.push(el("tr", { class: "detail" }, [
+        el("td", { colspan: "7" }, [bars7d([proxySeries(p.name)])]),
+      ]));
+    }
+  }
   $("proxies-table").replaceChildren(tableOf(["name", "user", "类型", "端口", "状态", "连接", "今日(入/出)"], rows));
+}
+function toggleProxy(name) {
+  if (expandedProxies.has(name)) expandedProxies.delete(name);
+  else expandedProxies.add(name);
+  renderProxies(proxiesCache);
 }
 async function pruneOffline() {
   if (!confirm("清理 dashboard 统计里的离线代理记录？\n（frp 不支持强制下线在线代理，这里只清理历史记录）")) return;
+  // 清理接口不返回条数（frp 的 DELETE 只回 code/msg），用列表里已看到的离线数
+  // 作为"这次清掉了多少"的近似——比一句干巴巴的"已清理"更有信息。
+  const offlineBefore = proxiesCache.filter((p) => p.phase === "offline").length;
+  setBusy(true, "清理中…");
   try {
     await api("/api/actions/prune", { method: "POST", body: {} });
-    toast("已清理离线代理记录", "ok");
+    toast(offlineBefore ? `已清理离线代理记录（清理前可见 ${offlineBefore} 条离线）` : "已清理离线代理记录", "ok");
   } catch (err) { toast("清理失败：\n" + err.message, "err"); }
+  finally { setBusy(false); }
+  refreshLists();
 }
 $("prune-btn").addEventListener("click", pruneOffline);
 
-/* ---------- 图表（SVG 自绘） ---------- */
+/* ---------- 图表（SVG 自绘；颜色走 CSS 变量，主题切换即时生效） ---------- */
 function svgEl(tag, attrs, children = []) {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
@@ -447,19 +624,30 @@ function bars7d(series) {
   const points = [...days.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   if (!points.length) return el("div", { class: "muted", text: "（无数据）" });
   const max = Math.max(1, ...points.map(([, v]) => Math.max(v.in, v.out)));
-  const W = 560, H = 160, pad = 24, bw = (W - pad * 2) / points.length / 2 - 4;
+  const W = 560, H = 160, pad = 24;
+  // 数据源固定近 7 天；clamp 是防御性的——若未来点数变多导致 bw 为负，
+  // 柱子会静默不渲染（SVG 对负宽度的处理是"什么都不画"）。
+  const bw = Math.max(1.5, (W - pad * 2) / points.length / 2 - 4);
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: H });
+  let totalIn = 0, totalOut = 0;
   points.forEach(([date, v], i) => {
+    totalIn += v.in; totalOut += v.out;
     const x0 = pad + i * ((W - pad * 2) / points.length);
     const hIn = (v.in / max) * (H - pad * 2);
     const hOut = (v.out / max) * (H - pad * 2);
-    svg.appendChild(svgEl("rect", { x: x0, y: H - pad - hIn, width: bw, height: hIn, fill: "#4f8cff", rx: 2 }));
-    svg.appendChild(svgEl("rect", { x: x0 + bw + 3, y: H - pad - hOut, width: bw, height: hOut, fill: "#34d399", rx: 2 }));
-    const label = svgEl("text", { x: x0, y: H - 8, fill: "#8b93a7", "font-size": 10 });
+    const rIn = svgEl("rect", { x: x0, y: H - pad - hIn, width: bw, height: hIn, rx: 2, class: "bar-in" });
+    rIn.appendChild(svgEl("title", {})).textContent = `${date} 入站 ${humanBytes(v.in)}`;
+    const rOut = svgEl("rect", { x: x0 + bw + 3, y: H - pad - hOut, width: bw, height: hOut, rx: 2, class: "bar-out" });
+    rOut.appendChild(svgEl("title", {})).textContent = `${date} 出站 ${humanBytes(v.out)}`;
+    svg.appendChild(rIn);
+    svg.appendChild(rOut);
+    const label = svgEl("text", { x: x0, y: H - 8, class: "axis", "font-size": 10 });
     label.textContent = date.slice(5);
     svg.appendChild(label);
   });
-  svg.appendChild(svgEl("text", { x: pad, y: 12, fill: "#8b93a7", "font-size": 11 })).textContent = "蓝=入站 绿=出站";
+  const legend = svgEl("text", { x: pad, y: 12, class: "axis", "font-size": 11 });
+  legend.textContent = `蓝=入站 绿=出站　合计 入 ${humanBytes(totalIn)} / 出 ${humanBytes(totalOut)}`;
+  svg.appendChild(legend);
   return svg;
 }
 function readSamples() {
@@ -479,68 +667,101 @@ function recordSample(trafficIn, trafficOut) {
   }
   return samples;
 }
-function sparkline(samples) {
-  if (samples.length < 2) return el("div", { class: "muted", text: "（采样不足，稍候）" });
+function speedSeries(samples) {
   const speeds = [];
   for (let i = 1; i < samples.length; i++) {
     const dt = (samples[i].t - samples[i - 1].t) / 1000;
     if (dt <= 0) continue;
     speeds.push({ t: samples[i].t, in: Math.max(0, (samples[i].vin - samples[i - 1].vin) / dt), out: Math.max(0, (samples[i].vout - samples[i - 1].vout) / dt) });
   }
+  return speeds;
+}
+function sparkline(samples) {
+  const speeds = speedSeries(samples);
+  if (speeds.length < 2) return el("div", { class: "muted", text: "（采样不足，稍候）" });
   const max = Math.max(1, ...speeds.map((s) => Math.max(s.in, s.out)));
   const W = 560, H = 140, pad = 20;
-  const mk = (key, color) => speeds.map((s, i) => {
+  const mk = (key) => speeds.map((s, i) => {
     const x = pad + (i / Math.max(1, speeds.length - 1)) * (W - pad * 2);
     const y = H - pad - (s[key] / max) * (H - pad * 2);
     return `${i === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", height: H });
-  svg.appendChild(svgEl("path", { d: mk("in", "#4f8cff") || "M0,0", fill: "none", stroke: "#4f8cff", "stroke-width": 1.6 }));
-  svg.appendChild(svgEl("path", { d: mk("out", "#34d399") || "M0,0", fill: "none", stroke: "#34d399", "stroke-width": 1.6 }));
-  const peak = svgEl("text", { x: pad, y: 12, fill: "#8b93a7", "font-size": 11 });
-  peak.textContent = `峰值 ${humanBytes(max)}/s`;
-  svg.appendChild(peak);
+  svg.appendChild(svgEl("path", { d: mk("in") || "M0,0", fill: "none", class: "line-in", "stroke-width": 1.6 }));
+  svg.appendChild(svgEl("path", { d: mk("out") || "M0,0", fill: "none", class: "line-out", "stroke-width": 1.6 }));
+  const last = speeds[speeds.length - 1];
+  const label = svgEl("text", { x: pad, y: 12, class: "axis", "font-size": 11 });
+  label.textContent = `当前 入 ${humanBytes(last.in)}/s 出 ${humanBytes(last.out)}/s　峰值 ${humanBytes(max)}/s`;
+  svg.appendChild(label);
   return svg;
 }
 
+let trafficSeries = [];
 async function refreshTraffic() {
   try {
     const data = await api("/api/traffic");
-    $("chart-7d").replaceChildren(bars7d(data.proxies || []));
+    trafficSeries = data.proxies || [];
+    $("chart-7d").replaceChildren(bars7d(trafficSeries));
+    $("chart-7d-hint").textContent = data.truncated
+      ? `已截断：仅统计前 ${data.limit} 个代理（共 ${data.total} 个）`
+      : "";
   } catch (err) { /* dashboard 不可用时保留旧图 */ }
   const dash = (lastStatus && lastStatus.dashboard) || {};
   const samples = recordSample(dash.traffic_in, dash.traffic_out);
   $("chart-live").replaceChildren(sparkline(samples));
+  if (samples.length === 1) $("live-hint").textContent = "已采样 1 次，等待下一次刷新后绘出速率曲线。";
 }
 
-/* ---------- 日志 ---------- */
-let logScroll = true;
+/* ---------- 日志（跟随/暂停） ---------- */
+let logStick = true;
+$("logs").addEventListener("scroll", () => {
+  const pre = $("logs");
+  logStick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+  $("log-follow").textContent = logStick ? "跟随中" : "已暂停（滚到底部恢复）";
+});
 async function refreshLogs() {
   try {
     const data = await api("/api/logs?lines=200");
     $("log-path").textContent = "· " + (data.path || "");
     const pre = $("logs");
-    const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent = (data.lines || []).join("");
-    if (stick || logScroll) pre.scrollTop = pre.scrollHeight;
+    if (logStick) pre.scrollTop = pre.scrollHeight;
   } catch (err) { $("logs").textContent = "日志读取失败：" + err.message; }
 }
 
 /* ---------- 配置编辑 ---------- */
 let configEntries = [];
-let dirty = new Map();
+let dirty = new Map();       // key -> 新的原始字符串值（尚未预览）
+let deletes = new Set();     // 待删除的键（config unset 语义）
+let addedKeys = [];          // 新增的键（不在 configEntries 里）
+let configLoaded = false;
+
+function entryValue(entry) {
+  return entry.masked ? "" : (typeof entry.value === "object" ? JSON.stringify(entry.value) : String(entry.value ?? ""));
+}
 async function loadConfig() {
   dirty.clear();
+  deletes.clear();
+  addedKeys = [];
   updateDirtyCount();
   $("cfg-preview-card").classList.add("hidden");
   loadHistory();
   try {
     const data = await api("/api/config");
     configEntries = data.entries || [];
+    configLoaded = true;
     renderConfigForm();
   } catch (err) {
     $("config-form").replaceChildren(el("div", { class: "muted", text: "配置读取失败：" + err.message }));
   }
+}
+function makeField(entry, input) {
+  const delBtn = el("button", {
+    class: "danger", text: "删除", title: "删除该键（回落 frp 默认值）",
+    onclick: () => toggleDelete(entry.key),
+  });
+  const field = el("div", { class: "field", "data-key": entry.key }, [el("label", { text: entry.key }), input, delBtn]);
+  return field;
 }
 function renderConfigForm() {
   const box = $("config-form");
@@ -555,78 +776,191 @@ function renderConfigForm() {
     }
     const input = el("input", {
       "data-key": entry.key,
-      value: entry.masked ? "" : (typeof entry.value === "object" ? JSON.stringify(entry.value) : String(entry.value ?? "")),
-      placeholder: entry.masked ? "••••（已设置；留空不改）" : "",
+      value: entryValue(entry),
+      placeholder: entry.masked ? `${entry.value}（已设置；留空不改）` : "",
     });
     input.addEventListener("input", () => {
-      const field = input.closest(".field");
       const raw = input.value;
-      const original = entry.masked ? "" : (typeof entry.value === "object" ? JSON.stringify(entry.value) : String(entry.value ?? ""));
-      if (raw === original) dirty.delete(entry.key);
+      if (raw === entryValue(entry)) dirty.delete(entry.key);
       else dirty.set(entry.key, raw);
-      field.classList.toggle("dirty", dirty.has(entry.key));
+      input.closest(".field").classList.toggle("dirty", dirty.has(entry.key));
       updateDirtyCount();
     });
-    box.appendChild(el("div", { class: "field" }, [el("label", { text: entry.key }), input]));
+    const field = makeField(entry, input);
+    if (deletes.has(entry.key)) markDeleted(field, input, entry.key, true);
+    box.appendChild(field);
+  }
+  // 新增的键（不在配置里的）
+  if (addedKeys.length) {
+    box.appendChild(el("div", { class: "group-title", text: "新增" }));
+    for (const key of addedKeys) {
+      const input = el("input", { value: dirty.get(key) ?? "", "data-key": key });
+      input.addEventListener("input", () => { dirty.set(key, input.value); updateDirtyCount(); });
+      box.appendChild(el("div", { class: "field", "data-key": key }, [
+        el("label", { text: key }),
+        input,
+        el("button", { class: "danger", text: "移除", onclick: () => { addedKeys = addedKeys.filter((k) => k !== key); dirty.delete(key); renderConfigForm(); updateDirtyCount(); } }),
+      ]));
+    }
   }
 }
+function markDeleted(field, input, key, on) {
+  field.classList.toggle("deleted", on);
+  input.disabled = on;
+  const btn = field.querySelector("button");
+  if (btn) { btn.textContent = on ? "恢复" : "删除"; btn.classList.toggle("primary", on); }
+}
+function toggleDelete(key) {
+  const field = document.querySelector(`.field[data-key="${CSS.escape(key)}"]`);
+  const input = field ? field.querySelector("input") : null;
+  const entry = configEntries.find((e) => e.key === key);
+  if (deletes.has(key)) {
+    deletes.delete(key);
+    if (field && input && entry) {
+      // 恢复：把输入框还原成"当前值"（否则它停在删除前被清空的状态，
+      // 看起来像"这个键的值丢了"——而实际是未修改）
+      input.value = entryValue(entry);
+      markDeleted(field, input, key, false);
+    }
+  } else {
+    deletes.add(key);
+    dirty.delete(key);
+    if (field && input) { input.value = ""; markDeleted(field, input, key, true); }
+  }
+  updateDirtyCount();
+}
 function updateDirtyCount() {
-  $("cfg-count").textContent = dirty.size ? `${dirty.size} 项已修改` : "无修改";
+  const total = dirty.size + deletes.size;
+  $("cfg-count").textContent = total ? `${total} 项待应用（改 ${dirty.size} / 删 ${deletes.size}）` : "无修改";
+  $("cfg-count").classList.toggle("clickable", total > 0);
+}
+$("cfg-count").addEventListener("click", () => {
+  const target = document.querySelector(".field.dirty, .field.deleted");
+  if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+});
+function addKey() {
+  const key = $("add-key").value.trim();
+  const value = $("add-value").value;
+  if (!key) { toast("请填写键名", "err"); return; }
+  if (value === "") { toast('请填写值（清空字符串请写 ""）', "err"); return; }
+  if (configEntries.some((e) => e.key === key)) { toast(`${key} 已存在，请直接修改对应字段`, "err"); return; }
+  if (addedKeys.includes(key)) { toast(`${key} 已在新增列表里`, "err"); return; }
+  addedKeys.push(key);
+  dirty.set(key, value);
+  $("add-key").value = "";
+  $("add-value").value = "";
+  renderConfigForm();
+  updateDirtyCount();
+  $("config-form").lastElementChild?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+$("add-btn").addEventListener("click", addKey);
+$("add-key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add-value").focus(); });
+$("add-value").addEventListener("keydown", (e) => { if (e.key === "Enter") addKey(); });
+
+function renderDiff(pre, text) {
+  const frag = document.createDocumentFragment();
+  const body = text && text.length ? text : "(无文本差异)";
+  for (const line of body.replace(/\n$/, "").split("\n")) {
+    const cls = line.startsWith("+++") || line.startsWith("---") ? "hunk"
+      : line.startsWith("+") ? "add"
+      : line.startsWith("-") ? "del"
+      : line.startsWith("@@") ? "hunk" : "";
+    frag.appendChild(el("div", { class: "diffline " + cls, text: line }));
+  }
+  pre.replaceChildren(frag);
 }
 async function previewChanges() {
-  if (!dirty.size) { toast("没有修改", ""); return; }
-  const changes = [...dirty.entries()];
+  const changes = [...dirty.entries()].filter(([key]) => !deletes.has(key));
+  const unsets = [...deletes];
+  if (!changes.length && !unsets.length) { toast("没有修改"); return; }
+  setBusy(true, "预览中…");
   try {
-    const data = await api("/api/config/preview", { method: "POST", body: { changes } });
+    const data = await api("/api/config/preview", { method: "POST", body: { changes, unsets } });
     if (data.noop) { toast("这些值与当前配置相同，无需变更"); return; }
-    $("cfg-diff").textContent = data.diff || "(无文本差异)";
+    renderDiff($("cfg-diff"), data.diff);
     $("cfg-preview-card").classList.remove("hidden");
     $("cfg-preview-card").dataset.previewId = data.preview_id;
   } catch (err) { toast("预览失败：\n" + err.message, "err"); }
+  finally { setBusy(false); }
 }
 async function applyPreview() {
   const id = $("cfg-preview-card").dataset.previewId;
   if (!id) return;
   if (!confirm("确认应用并重启服务？")) return;
+  setBusy(true, "应用中…");
   try {
     const data = await api("/api/config/apply", { method: "POST", body: { preview_id: id } });
     toast(data.noop ? "无需变更" : "配置已应用并重启" + (data.plugin_warning ? "\n⚠ " + data.plugin_warning : ""), "ok");
     $("cfg-preview-card").classList.add("hidden");
+    configLoaded = true;
     loadConfig();
     refresh();
   } catch (err) { toast("应用失败：\n" + err.message, "err"); }
+  finally { setBusy(false); }
 }
 $("cfg-preview").addEventListener("click", previewChanges);
 $("cfg-apply").addEventListener("click", applyPreview);
 $("cfg-cancel").addEventListener("click", () => $("cfg-preview-card").classList.add("hidden"));
-$("cfg-reset").addEventListener("click", loadConfig);
+$("cfg-reset").addEventListener("click", () => {
+  const total = dirty.size + deletes.size;
+  if (total && !confirm(`丢弃 ${total} 项未保存的修改并重新加载？`)) return;
+  loadConfig();
+});
 
-/* ---------- 历史与回滚 ---------- */
+/* ---------- 历史与回滚（含差异预览） ---------- */
 async function loadHistory() {
   try {
     const data = await api("/api/config/history");
-    const rows = (data.entries || []).map((entry) => el("tr", {}, [
-      el("td", { text: entry.name }),
-      el("td", { text: entry.action || "-" }),
-      el("td", { text: entry.at || "-" }),
-      el("td", {}, [el("button", {
-        text: "回滚到此份",
-        onclick: () => rollbackTo(entry.steps, entry.name),
-      })]),
-    ]));
+    const rows = [];
+    for (const entry of data.entries || []) {
+      rows.push(el("tr", {}, [
+        el("td", { text: entry.name }),
+        el("td", { text: entry.action || "-" }),
+        el("td", { text: entry.at || "-" }),
+        el("td", { class: "num" }, [
+          el("button", { text: "查看差异", onclick: () => toggleHistoryDiff(entry) }),
+          " ",
+          el("button", { class: "danger", text: "回滚到此份", onclick: () => rollbackTo(entry.steps, entry.name) }),
+        ]),
+      ]));
+    }
     $("history-table").replaceChildren(tableOf(["快照", "操作", "时间", ""], rows));
   } catch (err) {
     $("history-table").textContent = "历史读取失败：" + err.message;
   }
 }
+async function toggleHistoryDiff(entry) {
+  const table = $("history-table").querySelector("table");
+  if (!table) return;
+  const existing = table.querySelector("tr.diffrow");
+  if (existing) {
+    const wasSame = existing.dataset.steps === String(entry.steps);
+    existing.remove();
+    if (wasSame) return;
+  }
+  const pre = el("pre", { class: "diffbox", text: "读取中…" });
+  const row = el("tr", { class: "detail diffrow", "data-steps": String(entry.steps) }, [
+    el("td", { colspan: "4" }, [pre]),
+  ]);
+  table.querySelector("tbody").appendChild(row);
+  try {
+    const data = await api(`/api/config/history/${entry.steps}/diff`);
+    renderDiff(pre, data.diff);
+  } catch (err) {
+    pre.textContent = "差异读取失败：" + err.message;
+  }
+}
 async function rollbackTo(steps, name) {
-  if (!confirm(`确认回滚到快照 ${name}（${steps} 步前）并重启服务？`)) return;
+  if (!confirm(`确认回滚到快照 ${name}（${steps} 步前）并重启服务？\n建议先用"查看差异"确认会改什么。`)) return;
+  setBusy(true, "回滚中…");
   try {
     await api("/api/actions/rollback", { method: "POST", body: { steps } });
     toast("已回滚并重启", "ok");
+    configLoaded = true;
     loadConfig();
     refresh();
   } catch (err) { toast("回滚失败：\n" + err.message, "err"); }
+  finally { setBusy(false); }
 }
 
 /* ---------- 启动 ---------- */
