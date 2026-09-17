@@ -20,11 +20,13 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
   - [一条硬边界](#一条硬边界)
 - [环境要求](#环境要求)
 - [安装](#安装)
-  - [方式一：pipx / pip（推荐）](#方式一pipx--pip推荐)
-  - [方式二：源码一键脚本](#方式二源码一键脚本)
-  - [方式三：源码手动安装](#方式三源码手动安装)
+  - [方式一：一键安装（uv，无需 Python）（推荐）](#方式一一键安装uv无需-python推荐)
+  - [方式二：pipx / pip（已有 Python ≥ 3.11）](#方式二pipx--pip已有-python--311)
+  - [方式三：源码安装](#方式三源码安装)
+  - [服务器没有 Python 怎么办](#服务器没有-python-怎么办)
   - [安装 frps 二进制](#安装-frps-二进制)
   - [验证安装](#验证安装)
+  - [卸载](#卸载)
 - [五分钟上手](#五分钟上手)
 - [CLI 使用教程](#cli-使用教程)
   - [全局选项与命令总览](#全局选项与命令总览)
@@ -85,17 +87,19 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 | 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` |
 | 卸载 | `uninstall`（`--all` / `--keep-data` / `--keep-bin` / `--force`） |
 | systemd 集成 | `service install` / `uninstall` / `status` / `logs` |
-| 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin service install|uninstall|status` |
-| Web 管理台 | `web serve`、`web service install|uninstall|status`、`web password show` |
+| 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin audit tail|stats`、`plugin config list|set`、`plugin service install|uninstall|start|stop|restart|status` |
+| Web 管理台 | `web serve`、`web service install|uninstall|start|stop|restart|status`、`web password show|set` |
 
 **Web 管理台**——浏览器中的同等能力（`web serve` 启动，默认只绑回环）：
 
 | 区域 | 能力 |
 |------|------|
-| 仪表盘 | 实例状态 / 三层健康 / 概览统计 / 近 7 天流量图（可下钻单代理）/ 会话内实时速率曲线 / 客户端与代理列表（可展开代理曲线）/ 日志（跟随/暂停） |
+| 仪表盘 | 实例状态 / 三层健康 / 概览统计 / 近 7 天流量图（按需下钻单代理）/ 会话内实时速率曲线 / 客户端与代理列表（可展开代理曲线）/ 日志（跟随与暂停、行数可选）/ **系统体检**（只读 doctor，按钮触发） |
 | 配置 | 逐字段表单（敏感值打码提示）→ 预览 diff（+绿/−红）→ 应用（一次事务、一次重启）→ 失败自动回滚；可删除键、可新增键 |
 | 历史 | 快照列表，**先看差异再回滚** |
-| 进程 | 启动 / 重启 / 停止 / 清理离线记录（操作期间按钮禁用、状态徽章显示"操作中…"） |
+| 审计 | 插件审计只读视图：统计（允许 / 拒绝 / 限速抑制 / 坏行）+ 按用户与按操作分布 + 最近记录；策略缺失或关闭时说明原因而不报错 |
+| 配置编辑增强 | 键名搜索过滤；数组/内联表值即时校验；有未保存修改时离页确认 |
+| 进程 | 启动 / 重启 / 停止 / 清理离线记录（返回清理条数；操作期间按钮禁用、状态徽章显示"操作中…"） |
 | 主题 | 明暗双主题：跟随系统（可实时变化）或手动切换 |
 
 ### 一条硬边界
@@ -1409,8 +1413,8 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 573 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（543 条）
+.venv/bin/pytest                       # 全部 644 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（614 条）
 .venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 85%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```

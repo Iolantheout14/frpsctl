@@ -3,6 +3,119 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.6] - 2026-09-17
+
+把 core 已经实现、但用户面看不到的能力**全部呈现**出来（审计 / 体检 / enabled /
+列表总数 / 清理条数），并把两条高频数据路径做快（日志反向读、流量汇总并发 +
+缓存）。不新增 core 语义，只新增"可见性"与"性能"。
+
+### 新增
+
+**CLI**
+
+- `plugin audit tail [-n] [-f] [--json]` / `plugin audit stats [--since] [--json]`：
+  审计的只读面（此前审计只写不读）。tail 复用日志的反向读取；`-f` 跟随新记录
+  且在轮转时自动重开；stats 流式统计总量 / 允许 / 拒绝 / 按用户 / 按操作 /
+  限速抑制累计，`--since` 支持 `24h` / `7d` / ISO 时间 / unix 时间戳。
+- `plugin config list|set`：策略级设置的结构化编辑（此前只能手写 JSON）——
+  `allow_unknown_user` / `require_client_id` / `reject_log_burst` /
+  `reject_log_window` / `admin_url|user|password` / `audit.enabled` /
+  `audit.path`（字面 `null` = 仅内存）。写入前用与 `plugin check` 相同的判据
+  复验 + 0600 原子写；未知字段直接拒绝；`admin_password` 在读取侧打码。
+- `web password set [--stdin] [--prompt]`：口令轮换。不给输入通道时生成随机
+  口令并只显示一次；systemd 托管时提示重启生效。
+- `web serve --access-log`：逐请求日志（WebSettings 早就有这个字段，CLI 从未
+  透传）。
+- 三个 `service status`（frps / 插件 / Web）同时报告 **enabled**（开机自启）
+  与 active——`is_enabled` 在 v0.2.5 就为卸载实现了，用户面一直看不到。
+- `clients` / `proxies` 显示**总数**；列表被翻页上限截断时向 stderr 告警、
+  `--json` 带 `truncated`（此前静默截断）。`proxies` 增加启用时长列
+  （`lastStartAt`）与 `--json` 的 `last_start_at` 字段。
+- `prune` 返回**清理条数**（清理前后各数一次离线记录；列表被截断时如实标注
+  只是下界）。
+- `doctor --json` 增加 `counts`（error/warn/info），人读末尾显示计数。
+- `--instance` 的 shell 补全（列出实例根下的实例名；只读、失败即空）。
+- `instances --health` 多实例**并发**探测（顺序保持稳定）。
+
+- `plugin service start|stop|restart` / `web service start|stop|restart`：三个服务类
+  的 start/stop/restart 早已实现，但此前只有 frps 的经由 `frpsctl start/stop/restart`
+  委托 systemd——插件与 Web 服务只能手工 `sudo systemctl`。`install` 的收尾提示
+  同步改为指向这些命令。
+- `plugin service install --access-log` / `web service install --access-log`：
+  访问日志开关此前只存在于前台 `serve` 命令，systemd 部署无法开启。
+- `plugin audit stats` 增加**裁决耗时**统计（平均/最大，来自 `elapsed_ms`）——
+  审计记录这个字段的目的（回答"插件拖慢了登录吗"）此前没有出口；Web 审计
+  视图同步展示。
+- 口令生成器收敛为**单点**（`core.systemd.generate_web_password`，web 侧
+  `generate_password` 改为委托）：此前 `web serve` / `web password set` /
+  `web service install` 各自写 `token_urlsafe(18)`，而函数的 docstring 声称
+  "单点实现"——注释与事实不符。
+- `proxies --json` 增加 `client_id` 字段。
+
+**Web 管理台**
+
+- **审计视图**（第三个导航）：策略位置、统计卡片（总量/允许/拒绝/限速抑制/
+  坏行）、按用户与按操作分布、最近 50 条记录（新 → 旧）。策略缺失/关闭/仅内存
+  时如实说明原因，而不是报错。
+- **系统体检卡片**（只读，与 CLI `doctor` 同一实现）：按钮触发（不自动轮询）、
+  severity 分组着色、计数摘要；注明"以 Web 服务进程权限执行"。
+- **流量接口重构**：`GET /api/traffic` 只回**逐日汇总**（服务端聚合 + 并发
+  查询 + 30 秒缓存）；单代理明细走新的 `GET /api/traffic/{name}`，前端展开某行
+  时才拉取（缓存 60 秒）。此前每次响应携带最多 50 个代理 × 7 天明细、每 5 秒
+  串行重查一遍 dashboard。
+- 日志卡片：行数可选（100/200/500/2000）；**暂停跟随期间不再拉取**（滚动到底
+  部恢复并立即补拉）。
+- 配置页：键名搜索过滤（重建表单时保留未预览的修改）；数组/内联表值的括号
+  引号配对即时校验（红框提示）；有未保存修改时关闭页面弹出浏览器确认。
+- 客户端/代理列表显示总数；"清理离线记录"用服务端返回的准确条数。
+
+### 修复
+
+**发布前回归 review（v0.2.6，实测复现 → 修复 → 回归固化）**
+
+- **`plugin audit tail -f` 与 `status --watch` 的流式输出不实时**：stdout 重定向
+  到文件/管道时是块缓冲，`ui.emit` 依赖进程退出冲刷——跟随/刷新要攒满 4KB（或
+  进程被杀）才吐数据，"实时"语义失效。跟随与逐轮刷新改为**显式 flush**
+  （`log -f` 的既有实现一直如此，两条新路径与之对齐），并按 BrokenPipeError
+  冒泡语义处理（`| head` 优雅退出）。
+- **前端 `looksBalanced` 漏判混合括号不匹配**：深度计数让 `{ a = 1 ]` 从 1 减
+  到 0 被误判为合法。改为**类型栈**校验，并纳入 `]`/`}` 开头的语法碎片。
+- `plugin service stop` 的 fail-closed 告警在 `--json` 下丢失——告警改为
+  无条件进 stderr（脚本收集 stderr 时也必须看到）。
+- 前端运行时守卫补齐：v0.2.4 的 DOM stub 试验当时是**手工验证、未固化**，
+  现在纯函数边界（`looksBalanced` / `humanBytes` / `humanDuration`）由 node
+  动态执行断言；`plugin audit tail -f` 与 `status --watch` 的实时性由真实
+  子进程 + 管道读取断言（不是杀进程后的退出冲刷）。
+
+- **`typer.Exit` 的退出码在直接调用路径下被吞成 0**：`map_exceptions` 的兜底
+  分支把 `Exit`（继承 `RuntimeError`、无 `format_message`）当作"未分类错误"，
+  `doctor` 有 ERROR 时"应当退出 1"在测试/库调用路径下失效（真实 CLI 路径因为
+  Click standalone 模式恰好正常）。现在统一转成 `SystemExit(code)`；测试基建
+  同时改为接收 `standalone_mode=False` 的返回值（Click 把 `Exit` 作为返回值
+  而非异常给出，忽略它就测不到真实退出码）。
+- **审计相对路径的解析基准不一致**：`audit.path` 相对路径此前跟随进程 CWD
+  ——`plugin serve` 手工前台运行写到当前目录、systemd 托管写到实例目录
+  （WorkingDirectory），同一份策略因启动方式不同而"审计消失"。现在写入与读取
+  （`plugin audit` / Web 审计视图）统一相对**策略文件所在目录**解析。
+- **日志 tail 全量扫描**：`tail_lines` 用 ring buffer 顺序读整个文件——100MB
+  日志每看一次读 100MB、Web 每 5 秒再读一遍。改为从文件尾按 64KiB 块反向回扫，
+  读取量与"需要几行"相关（含跨块边界、多字节字符、无尾换行等边界处理）。
+- **admin 全量翻页的静默截断**：`_paged` 丢弃服务端 `total`、翻页上限用尽时
+  无从察觉。现在返回 `PageResult(total/truncated)`，CLI 与 Web 如实汇报。
+- **`proxies --type` 拼错静默返回空表**：改为用法错误(2) 并列出合法类型集合
+  （与 ADR-7"不猜测"一致）。
+- pyproject 清理无效的 `PT011` ignore 项（`select` 未启用 PT 规则）。
+
+### 测试与文档
+
+- 新增 71 条测试（573 → 644；非契约 543 → 614），覆盖：日志反向读（含跨块
+  边界与 I/O 量上界）、分页 total/截断、清理计数、审计读取（路径解析/统计/
+  时间窗口/用户表上限/坏行）、策略级设置编辑、口令轮换、install 选项透传、
+  `/api/doctor`、`/api/audit`、`/api/traffic/{name}`、traffic 服务端缓存、
+  动作成功路径（restart/rollback）、日志参数边界、未规范化路径、`web serve`
+  全链路（起真进程 → 登录 → SIGTERM 退出）。
+- 设计方案：§18.2 API 表、§7.2 命令表同步；新增 §22 第九轮实现记录。
+
 ## [0.2.5] - 2026-09-17
 
 完整卸载 + 在线一键安装：把此前分散的五段式清理（包管理器 / 三个 systemd

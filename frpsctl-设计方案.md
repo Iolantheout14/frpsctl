@@ -107,7 +107,7 @@ frpsctl                          命令行程序（pip/pipx 安装）
 ### 2.2 非目标
 
 - **不实现任何转发逻辑**，不 fork、不 patch frps，二进制始终是官方原版。
-- **不做 Web UI**：frps 自带 dashboard 已经够好，本工具只做终端侧聚合。
+- **Web UI**：~~不做~~——该非目标在 v0.2.2 被推翻：官方 dashboard 只有观测、没有控制面，而"改配置 / 停服务 / 回滚"恰恰是运维最需要的（§18）。此处保留原判断以记录决策变更。
 - **不管 frpc**：只做服务端。`frpc reload` 这类能力不在范围内。
 - **只支持 Linux**：唯一目标平台是 Linux，进程身份、锁、原子写、信号语义全部建立在 Linux 原语之上（§3.4）。**不实现 macOS / Windows 兼容分支，也不做运行时降级**——非 Linux 平台在启动时直接拒绝，而不是"尽力而为"。
 - **v1 不实现多租户配额**：那属于插件层（§11），列为独立阶段。
@@ -149,7 +149,7 @@ dashboard 仅在 `webServer.port > 0` 时启动；`port = 0` 表示**完全不�
 | `GET /api/v2/clients`、`/api/v2/clients/{key}` | Basic | ✔ 客户端列表 / 详情 |
 | `GET /api/v2/proxies`、`/api/v2/proxies/{name}`、`/api/v2/proxies/{name}/traffic` | Basic | ✔ 代理列表 / 详情 / 流量序列（带分页） |
 | `GET /api/v2/users` | Basic | ✔ 按用户聚合 |
-| `POST /api/v2/system/prune` | Basic | ✔ 供未来 `stats prune` 使用 |
+| `POST /api/v2/system/prune` | Basic | ✘ 未使用——`prune` 走的是下面那条 v1 遗留端点（v2 没有等价的清离线接口） |
 | `DELETE /api/proxies` | Basic | ✔ `prune` 用——**实际语义是"清理离线代理记录"**（`?status=offline`，源码 `controller.go` 的 `ClearOfflineProxies()`；真机实测无参数返回 400）。frp **没有**强制下线在线代理的 API；旧 `kick` 命令基于误读，从未工作（§18.6） |
 | `GET /api/proxy/{type}` | Basic | ✔ 逐类型代理列表（`{"proxies":[...]}`，用于 §13.1 C1 的交叉验证） |
 | `GET /api/serverinfo`、`GET /api/clients` | Basic | ✘ **v1 遗留**，不实现（ADR-3） |
@@ -489,7 +489,7 @@ class Instance:
 ├── bin/
 │   ├── frps-0.71.0            # 已校验的二进制，按版本并存
 │   ├── frps-0.70.0            # 旧版本保留，便于回退
-│   └── frps -> frps-0.71.0    # 当前版本软链，唯一被 install --switch 改动的对象
+│   └── frps -> frps-0.71.0    # 当前版本软链，唯一被 install（默认换链行为）改动的对象
 └── instances/
     └── default/
         ├── frps.toml          # 0600
@@ -542,7 +542,7 @@ class Instance:
 | `frpsctl stop [--force] [--timeout S]` | 停止 | SIGTERM → 轮询确认退出 → 超时 SIGKILL；身份不符则拒绝 |
 | `frpsctl restart [--health-timeout S] [--timeout S]` | 重启 | stop → start → 健康检查。**没有 `--no-rollback`**：重启不读配置，也就没有"新旧版本"可比，自动回滚只属于配置变更路径 |
 | `frpsctl status [--watch] [--interval S]` | 状态聚合 | `owner / 状态 / pid / 版本 / 运行时长 / listen / dashboard / 健康 / 客户端 / 各类型代理 / 今日流量`；`--watch --json` 为 NDJSON |
-| `frpsctl log [-f] [-n N]` | 看日志 | 纯 Python tail `log.to`；缺失时回退到 startup 日志（轮转后自动重开） |
+| `frpsctl log [-f] [-n N]` | 看日志 | 纯 Python tail（**从文件尾反向读取**，大文件不再全量扫描）；缺失时回退到 startup 日志（轮转后自动重开） |
 | `frpsctl config get <key> [--reveal]` | 读单键 | 点分路径；敏感值默认打码（`--reveal` 显式取明文） |
 | `frpsctl config set <key> <value> [--no-restart] [--dry-run] [--stdin] [--prompt]` | 写单键 | 走 §9 事务闭环；`--dry-run` 只校验并展示 diff；`--stdin`/`--prompt` 让敏感值不进 argv；`--health-timeout S` |
 | `frpsctl config unset <key> [--no-restart] [--dry-run]` | 删键回落默认 | 与 set 同一闭环；键不存在报配置错误(3) |
@@ -550,22 +550,26 @@ class Instance:
 | `frpsctl config edit [--yes]` | `$EDITOR` 编辑 | 保存后走同一闭环（锁内 CAS：编辑期间被并发修改则拒绝草稿） |
 | `frpsctl config diff [--steps N]` | 当前 vs 第 N 新快照 | unified diff（打码） |
 | `frpsctl config rollback [N]` | 回滚到 N 份之前 | 同样走闭环；`N ≥ 1` |
-| `frpsctl service install\|uninstall\|status` | frps 的 systemd 集成 | 渲染 `frps@.service` + `daemon-reload` + `enable`（需 root；安装前四项部署体检） |
+| `frpsctl service install\|uninstall\|status` | frps 的 systemd 集成 | 渲染 `frps@.service` + `daemon-reload` + `enable`（需 root；安装前四项部署体检）；`status` 同时报告 active 与 **enabled**（开机自启） |
 | `frpsctl service logs [-f] [-n N]` | journald 集成 | unit 级日志（启动失败 / OOM / 权限拒绝），与 `log` 互补 |
-| `frpsctl doctor [--json]` | 体检 | §8.7 检查项（含 Web 口令文件权限），按 severity 输出；有 ERROR 时退出码 1 |
-| `frpsctl clients [--json]` | 在线客户端列表 | v2 `/api/v2/clients`，**自动翻页取全量** |
-| `frpsctl proxies [--type T] [--json]` | 代理列表 | v2 `/api/v2/proxies`（嵌套 `spec/status` 形状），自动翻页 |
-| `frpsctl traffic [name] [--json]` | 近 7 天流量历史 | 无参 = 全部代理逐日汇总；单代理失败记空不拖垮整体（离线 = 404 无数据） |
-| `frpsctl instances [--health] [--json]` | 多实例一行式概览 | 默认只读本地状态；`--health` 额外做三层探测 |
-| `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；**不存在**强制下线在线代理的 API（§18.6） |
+| `frpsctl doctor [--json]` | 体检 | §8.7 检查项（含 Web 口令文件权限），按 severity 输出；`--json` 带 `counts`；有 ERROR 时退出码 1 |
+| `frpsctl clients [--json]` | 在线客户端列表 | v2 `/api/v2/clients`，**自动翻页取全量**；人读尾行与 `--json` 均带总数，翻页上限截断时告警 |
+| `frpsctl proxies [--type T] [--json]` | 代理列表 | v2 `/api/v2/proxies`（嵌套 `spec/status` 形状），自动翻页；`--type` 非法值报用法错误(2)（不再静默空表）；人读含启用时长（`lastStartAt`） |
+| `frpsctl traffic [name] [--json]` | 近 7 天流量历史 | 无参 = 全部代理逐日汇总（**并发查询**）；单代理失败记空不拖垮整体（离线 = 404 无数据） |
+| `frpsctl instances [--health] [--json]` | 多实例一行式概览 | 默认只读本地状态；`--health` 额外做三层探测（多实例**并发**，输出顺序稳定） |
+| `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；清理前后各数一次离线记录，**如实返回清理条数**；**不存在**强制下线在线代理的 API（§18.6） |
 | `frpsctl plugin init [--force]` | 生成策略模板 | fail-closed 默认；0600 原子写 |
 | `frpsctl plugin check [--bind B]` | 离线校验策略 | 载入 + 回环校验 + 典型裁决试算 |
 | `frpsctl plugin serve [--bind B] [--path P]` | 插件服务（前台） | 只允许绑回环；SIGTERM 优雅退出并刷审计；生产用 `plugin service install` 守护 |
 | `frpsctl plugin user set\|remove\|list` | 策略用户的结构化编辑 | 只改显式给出的字段；写入前同 `plugin check` 判据复验；未知键保留 |
-| `frpsctl plugin service install\|uninstall\|status` | 插件的 systemd 集成 | `Restart=always`（登录单点）+ 四项体检 |
-| `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速 |
-| `frpsctl web service install\|uninstall\|status` | 管理台的 systemd 集成 | 0600 口令文件（明文不进 unit）+ 四项体检；`--trusted-proxy` 可写入 unit |
+| `frpsctl plugin audit tail [-n N] [-f] [--json]` | 审计尾部（只读） | 复用日志的反向读取；`-f` 跟随新记录（轮转自动重开）；`--json` 是一次性导出（与 `-f` 互斥） |
+| `frpsctl plugin audit stats [--since W] [--json]` | 审计统计（只读） | 流式扫描：总量/允许/拒绝/按用户/按操作/限速抑制；`--since` 支持 `24h` / `7d` / ISO / unix |
+| `frpsctl plugin config list\|set` | 策略级设置的结构化编辑 | `allow_unknown_user` / `require_client_id` / `reject_log_burst` / `reject_log_window` / `admin_*` / `audit.*`；写入前同 `plugin check` 判据复验；未知字段拒绝 |
+| `frpsctl plugin service install\|uninstall\|start\|stop\|restart\|status` | 插件的 systemd 集成 | `Restart=always`（登录单点）+ 四项体检；`status` 同时报告 **enabled**；`install --access-log` 把逐请求日志写进 journald |
+| `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy] [--access-log]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速；`--access-log` 打开逐请求日志（排查用） |
+| `frpsctl web service install\|uninstall\|start\|stop\|restart\|status` | 管理台的 systemd 集成 | 0600 口令文件（明文不进 unit）+ 四项体检；`--trusted-proxy` / `--access-log` 可写入 unit；`status` 同时报告 **enabled** |
 | `frpsctl web password show [--json]` | 读回管理台口令 | 显式索取明文；权限过宽时向 stderr 告警 |
+| `frpsctl web password set [--stdin] [--prompt]` | 设置（轮换）管理台口令 | 不给输入通道时生成随机口令并只显示一次；0600 原子写；systemd 托管需重启生效 |
 | `frpsctl uninstall [--all] [--keep-data] [--keep-bin] [--force] [--yes]` | 完整卸载 | 默认只卸当前实例并要求确认（`--json` 必须显式 `--yes`）；删共享二进制要求覆盖全部实例（或 `--keep-bin`）；运行中默认拒绝（`--force` 先停止）；unit 清理需 root，权限不足汇总为"未清理项" |
 
 ### 7.3 退出码
@@ -577,14 +581,14 @@ class Instance:
 | 0 | 成功 | |
 | 1 | 未分类错误 | 意外异常 |
 | 2 | 用法 / 参数错误 | Typer 参数校验失败 |
-| 3 | 配置非法 | pydantic 或 `frps verify` 拒绝 |
+| 3 | 配置非法 | pydantic 或 `frps verify` 拒绝；**state.json 损坏**也归此码（`status` 仍可用，`stop`/`start` 会拒绝） |
 | 4 | 二进制缺失 / 不可执行 / 版本不受支持 | 未 install，或版本 `< 0.70.0`（§3.6） |
 | 5 | 实例未运行 | `stop` 时无进程 |
 | 6 | 实例已在运行 | 重复 `start` |
 | 7 | dashboard 不可达 | 网络不通 / 未启用 / 鉴权失败 |
 | 8 | 权限不足 | 需要 root 的操作 |
 | 9 | 变更已自动回滚 | 配置写入后启动失败，已恢复上一版 |
-| 10 | 启动即失败 | 附 frp 原始错误输出 |
+| 10 | 启动即失败 / 停止失败 | 附 frp 原始错误输出；`StopFailed`（SIGKILL 后仍未退出）复用此码，仅文案区分 |
 | 11 | 进程所有权冲突 | 身份校验不通过 / systemd 与 direct 混用 |
 | 12 | 已启动但健康检查未通过 | L1 进程在、L2 控制面不可达（v0.2.0 新增；进程保留，`status`/`stop` 可用，见 §3.7） |
 
@@ -1088,7 +1092,7 @@ def install(version: str, dest: Path, mirrors: list[str], *, insecure: bool = Fa
     actual = hashlib.sha256(blob).hexdigest()
     if expected and actual != expected:
         raise ChecksumMismatch(asset, expected, actual)
-    # 解包 frps → chmod 0755 → 运行 -v 复验 → 落盘为 frps-<version> → （仅 --switch 时）换软链
+    # 解包 frps → chmod 0755 → 运行 -v 复验 → 落盘为 frps-<version> → 换软链（--only-download 时跳过）
 ```
 
 **信任模型**：镜像只影响可用性，不影响信任。信任锚是**官方校验和文件**——校验不通过绝不落盘（ADR-7）。
@@ -1105,7 +1109,7 @@ def install(version: str, dest: Path, mirrors: list[str], *, insecure: bool = Fa
 三条必须写进帮助文本与 `doctor` 的语义：
 
 1. **运行中的进程不受换链影响**。Linux 上进程的可执行映像在 `execve` 后已绑定到 inode，换软链（甚至删除旧文件）都不会改变正在运行的进程；它只影响**下一次** `start`。
-2. **因此升级不是"立即全局生效"，而是"下次启动生效"**。`install --switch` 后 `status` 必须能同时显示两个版本：`state.json.version`（正在跑的）与 `frps -v`（软链指向的）。两者不一致时明确输出 `binary : frps 0.70.0 (running) → 0.71.0 (on disk, restart to apply)`。
+2. **因此升级不是"立即全局生效"，而是"下次启动生效"**。`install`（默认换链）后 `status` 必须能同时显示两个版本：`state.json.version`（正在跑的）与 `frps -v`（软链指向的）。两者不一致时明确输出 `binary : frps 0.70.0 (running) → 0.71.0 (on disk, restart to apply)`。
 3. **`state.json.binary` 存真实路径而非软链路径**（`active_binary()` 做 `resolve()`）。否则软链一换，`is_ours()` 的命令行比对就会失配，把自家进程判成 `FOREIGN`（退出码 11）——**这是升级功能最容易埋进去的自伤 bug**。
 
 配套约定：
@@ -1470,7 +1474,7 @@ WantedBy=multi-user.target
 
 ## 13. 测试策略
 
-这类工具最容易出错的不是命令逻辑，而是**边界**：进程身份、并发、配置往返、失败回滚。因此测试分四层：
+这类工具最容易出错的不是命令逻辑，而是**边界**：进程身份、并发、配置往返、失败回滚。因此测试分**七层**（单元 / 集成 / CLI / 契约 / 故障注入 / 插件 / 前端与文档，完整定义见 README §开发；下表为其中六类，另加手工冒烟）：
 
 | 层 | 目标 | 手段 |
 |----|------|------|
@@ -1533,7 +1537,7 @@ M5 后的全量 review（§15.5）发现 4 处高危缺陷，**全部位于异�
 **信号没发出去却清掉了 state.json**（留下无人认领的进程），以及 `validate_text`
 的 `subprocess.TimeoutExpired` 无人接管（裸异常冒到 CLI）。
 
-CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13），容器内跑全部四层；**不设其他操作系统的 job**——平台范围由 §3.4 决定，CI 与之一致。
+CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13 / 3.14），容器内跑全部七层；**不设其他操作系统的 job**——平台范围由 §3.4 决定，CI 与之一致。
 
 **特别建议**：把附录 B 的核对命令打包成 `tests/test_facts.py`，C1–C7 全部落在这个文件里。这样"事实基线"就具备了自动保鲜能力。
 
@@ -1762,6 +1766,9 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 ## 17. 实现验证记录（M0–M5 已落地）
 
 > 本节记录 M5 之前的实现验证；M5 之后的全量回归 review 见 §15.5。
+>
+> ⚠️ 本章各小节里的用例数（226 / 277 / …）是**当时**的快照，用于记录每轮增量；
+> 当前总数以 CHANGELOG 最新条目为准（v0.2.6 起为 632 条）。
 
 本章记录实现过程中**文档被现实修正**的地方，以及只有真机测试才能照出来的问题。
 它的用途是：下次改这块代码的人，不必重新踩一遍。
@@ -2482,7 +2489,11 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 | POST | `/api/login` `/api/logout` | 口令登录（下发会话 Cookie + CSRF）/ 登出；**login 是唯一免认证入口** |
 | GET | `/api/session` | 会话状态：归还 CSRF（刷新页面后内存丢失 → 用它恢复，否则所有变更都 403） |
 | GET | `/api/status` | 进程状态 + 三层健康（含 L3 告警文本）+ dashboard 统计（统计不可得为 null） |
-| GET | `/api/clients` `/api/proxies` `/api/traffic` | v2 数据（自动翻页；traffic 为 7 天日粒度，超 50 个代理时带 `truncated` / `total`） |
+| GET | `/api/clients` `/api/proxies` | v2 数据（自动翻页；响应带 `total`，列表被翻页上限截断时 `truncated` 如实汇报） |
+| GET | `/api/traffic` | 全部代理的**逐日汇总**（服务端聚合 + 并发查询 + 30s 缓存；超 50 个代理时带 `truncated` / `total`） |
+| GET | `/api/traffic/{name}` | 单个代理的 7 天明细（前端展开某行时按需请求，不再随汇总全量下发） |
+| GET | `/api/doctor` | 只读体检（与 CLI `doctor` 同一实现；以 Web 服务进程权限运行，结果可能与 root 不同） |
+| GET | `/api/audit` | 插件审计视图：策略位置 + 统计 + 尾部记录；策略缺失/关闭时以 `available` / `enabled` / `reason` 如实说明 |
 | GET | `/api/config` | 配置树（**打码值 + masked 标记**，原文永不下发） |
 | GET | `/api/config/history` | 快照列表（只读 meta.json，**不读快照里的配置原文**） |
 | GET | `/api/config/history/{steps}/diff` | 某快照 vs 当前配置的**打码 diff**（回滚前的"看差异"；与 `config diff --steps` 同一实现） |
@@ -2881,6 +2892,85 @@ uv 指引；`--uninstall --prefix` / `--uninstall --system` 参数组合。安�
 6 条自动化测试（`bash -n`、两条真跑行为测试、承诺一致性、静态守卫）；
 **本轮合计 28 条**（545 → 573；非契约 543）；文档守卫的环境变量核对同步扩展
 覆盖 `install.sh`。
+
+---
+
+## 22. 第九轮迭代（v0.2.6：可见性与性能——CLI + Web）
+
+**目标**：把 core 已经实现、但 CLI/Web 没有出口的能力全部呈现（审计 / 体检 /
+enabled / 列表总数 / 清理条数），并把两条高频数据路径做快（日志反向读、流量
+汇总并发 + 缓存）。不新增 core 语义。
+
+**素材来源**：发布前的全量精读（CLI 2622 行、Web 2160 行、core 核心 2471 行
+逐行；core 其余与 plugin、全部测试 9926 行、全部文档 5647 行由并行通道完整
+读尽并交叉核对）。两条独立线索指向同一结论：**core 能力面领先于呈现面**，
+而 Web 的流量接口与日志读取存在随规模恶化的真实性能缺陷。
+
+### 22.1 新增：已实现能力的出口
+
+| 能力（此前无出口） | CLI | Web |
+|--------------------|-----|-----|
+| 审计读取（`plugin/audit.py` 只写） | `plugin audit tail|stats`（复用反向读；`-f` 轮转重开；`--since 24h/7d/ISO/unix`） | 审计视图（统计 + 分布 + 最近 50 条；缺失/关闭/仅内存如实说明） |
+| 策略级字段编辑 | `plugin config list|set`（严格复验 + 0600 原子写 + 未知字段拒绝） | —（策略编辑仍属 CLI 职责） |
+| `is_enabled`（v0.2.5 为卸载实现） | 三个 `service status` 同时报告 enabled | — |
+| `run_doctor` | `doctor --json` 增加 counts | 系统体检卡片（按钮触发） |
+| 翻页信封的 `total` | `clients/proxies` 显示总数与截断告警 | 列表总数 |
+| 清理条数 | `prune` 返回清理数（前后各数一次离线记录） | 同左（服务端计算） |
+| `WebSettings.access_log` | `web serve --access-log` | — |
+| 口令轮换 | `web password set [--stdin/--prompt]` | — |
+| 服务生命周期（插件/Web 的 start/stop/restart 原语） | `plugin service start\|stop\|restart`、`web service start\|stop\|restart` | — |
+| `access_log` 的 systemd 入口 | `plugin/web service install --access-log`（此前只有前台 `serve` 能开） | — |
+| 口令生成器单点（三份 `token_urlsafe(18)` 收敛） | `generate_password` 委托 `core.systemd.generate_web_password` | — |
+| 审计裁决耗时（`elapsed_ms`） | `plugin audit stats` 平均/最大耗时 | 审计视图同字段 |
+| `client_id` | `proxies --json` 字段 | — |
+| 实例名补全 | `--instance` shell 补全（只读、失败即空） | — |
+| `lastStartAt` | `proxies` 启用时长列 + JSON 字段 | — |
+
+### 22.2 性能：两条高频路径
+
+**日志 tail 从"全量扫描"改为"尾部反向读"**（`core/logs.tail_lines`）。旧实现
+用 `deque(maxlen)` 顺序读整个文件：100MB 日志每看一次读 100MB，而 Web 每 5 秒
+刷新一次。新实现从文件尾按 64KiB 块回扫，数到 `lines + 1` 个换行即停——多要
+一个换行使返回的字节串从**完整行的起点**开始（否则 `splitlines` 首元素是半行）。
+读取量与"需要几行"相关；跨块边界与多字节字符由"解码发生在完整累积字节串上 +
+起点之前的半行必然被丢弃"共同保证。CLI `log` 的初始 tail 与 `plugin audit
+tail` 复用同一实现。
+
+**流量汇总：汇总/明细分离 + 并发 + 服务端缓存**。旧 `/api/traffic` 每次响应
+携带最多 50 个代理 × 7 天明细（前端只用它画汇总图），且串行查询——dashboard
+稍慢就能把一次刷新拖到秒级。现在：
+
+- `GET /api/traffic` 只回逐日汇总（服务端用与 CLI `traffic` **同一份**
+  `aggregate_days` 聚合）；`GET /api/traffic/{name}` 提供单代理明细，前端展开
+  某行才拉取（60 秒缓存）；
+- 查询并发化（`fetch_histories`，8 线程；`httpx.Client` 线程安全）；
+- 服务端 30 秒缓存（浏览器 5 秒轮询 × 逐日粒度数据 = 大量无谓重查）。
+
+### 22.3 修复（全量精读发现）
+
+| # | 缺陷 | 影响 | 修复 |
+|---|------|------|------|
+| 1 | `typer.Exit` 的退出码在直接调用路径被吞成 0：`map_exceptions` 兜底分支把 `Exit`（继承 `RuntimeError`、无 `format_message`）当"未分类错误" | `doctor` 有 ERROR 时"应当退出 1"在测试/库调用路径失效（真实 CLI 路径因 Click standalone 恰好正常）——正是"测试测不到真实契约"的又一实例 | 带 `exit_code` 的异常统一转 `SystemExit(code)`；测试基建接收 `standalone_mode=False` 的**返回值**（Click 把 `Exit` 作为返回值给出，忽略它等于放弃断言退出码） |
+| 2 | 审计相对路径解析基准不一致（写入跟随 CWD / systemd WorkingDirectory） | 同一份策略手工运行与 systemd 托管写到两个地方，"审计消失" | 写入与读取统一相对**策略文件目录**（`core/auditlog.resolve_audit_path`）；默认文件名常量单源 |
+| 3 | `_paged` 丢弃信封 `total`、上限用尽静默截断 | "共 N 条"无从说起；超限无言 | `PageResult(items, total)` + `truncated`；CLI/Web 如实展示 |
+| 4 | `proxies --type` 拼错静默返回空表 | 用户以为"没有代理" | 用法错误(2) + 合法集合提示（ADR-7） |
+| 5 | pyproject 的 `PT011` ignore 无效（`select` 未含 PT） | 死配置 | 清理 |
+| 6 | `plugin audit tail -f` 与 `status --watch` 的 stdout 块缓冲 | 重定向/管道下流式输出攒满 4KB 才吐——"实时"失效 | 显式逐行/逐轮 flush（与 `log -f` 既有实现对齐）；BrokenPipeError 走 `map_exceptions` 优雅退出 |
+| 7 | 前端 `looksBalanced` 用深度计数，`{ a = 1 ]` 被误判合法 | 输入校验形同虚设（动态守卫抓到） | 类型栈校验 + 纳入 `]`/`}` 开头碎片 |
+| 8 | `plugin service stop` 的 fail-closed 告警在 `--json` 下丢失 | 脚本拿不到关键告警 | 告警无条件进 stderr |
+| 9 | v0.2.4 的前端 DOM stub 试验未固化（当时为手工验证） | 前端运行时行为零自动守卫 | 新增 `TestFrontendPureFunctionsRuntime`（node 执行抽取源码）+ 两条真子进程流式实时性断言 |
+
+### 22.4 测试与验收
+
+- **新增 71 条**（573 → 644；非契约 543 → 614）：日志反向读（跨块边界 / 多字节
+  / 无尾换行 / I/O 量上界断言）、分页 total 与截断、清理计数、审计读取全谱
+  （路径解析 / 统计 / 窗口 / 用户表上限 / 坏行）、策略级编辑（含 `audit.path
+  null` 与严格拒绝）、口令轮换、`install` 全选项透传、`/api/doctor`、`/api/audit`、
+  `/api/traffic/{name}`、traffic 服务端缓存（假时钟）、动作成功路径
+  （restart / rollback——此前只有拒绝路径）、日志参数边界、未规范化路径、
+  `web serve` 全链路（真进程 → 登录 → SIGTERM 退出码 0）。
+- 文档一致性守卫同步扩展：README 命令表、§7.2 命令表（含审计/策略编辑/口令
+  轮换）、§18.2 API 表（doctor / audit / traffic 明细）。
 
 ---
 
