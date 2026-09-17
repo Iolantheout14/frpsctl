@@ -83,6 +83,7 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 | 生命周期 | `start` / `stop` / `restart` / `status` / `log` |
 | 配置子命令 | `config get` / `set` / `unset` / `edit` / `list` / `diff` / `rollback`（`set` 支持 `--dry-run` / `--stdin` / `--prompt`） |
 | 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` |
+| 卸载 | `uninstall`（`--all` / `--keep-data` / `--keep-bin` / `--force`） |
 | systemd 集成 | `service install` / `uninstall` / `status` / `logs` |
 | 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin service install|uninstall|status` |
 | Web 管理台 | `web serve`、`web service install|uninstall|status`、`web password show` |
@@ -126,7 +127,22 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 
 ## 安装
 
-### 方式一：pipx / pip（推荐）
+### 方式一：一键安装（uv，无需 Python）（推荐）
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install frpsctl
+```
+
+一条命令搞定。`uv` 是单文件静态二进制，**自带 Python 版本管理**——服务器上
+没有 Python 时它会自动下载一个独立构建，因此**这是唯一不依赖系统 Python 的
+安装方式**。装完命令在 `~/.local/bin/frpsctl`。
+
+```bash
+uv tool upgrade frpsctl          # 升级
+uv tool uninstall frpsctl        # 卸载（不动实例数据）
+```
+
+### 方式二：pipx / pip（已有 Python ≥ 3.11）
 
 ```bash
 pipx install frpsctl        # 或：pip install frpsctl
@@ -139,12 +155,18 @@ pipx install frpsctl        # 或：pip install frpsctl
 frpsctl --install-completion
 ```
 
-### 方式二：源码一键脚本
+### 方式三：源码安装
+
+**一键脚本**（两种跑法，效果相同）：
 
 ```bash
+# A. 先 clone 再运行
 git clone https://github.com/ThzxxArt/frpsctl.git
 cd frpsctl
 ./install.sh
+
+# B. 在线直跑：脚本自动把源码下载到数据目录（无需 git）
+curl -fsSL https://raw.githubusercontent.com/ThzxxArt/frpsctl/main/install.sh | bash
 ```
 
 脚本做的事：建一个独立 venv → 装依赖 → 把 `frpsctl` 注册到 `~/.local/bin` → 自检。
@@ -154,9 +176,9 @@ cd frpsctl
 $ ./install.sh
 检查运行环境
  ✓ 操作系统：Linux
- ✓ Python：Python 3.13.5（/usr/bin/python3）
- ✓ 源码目录：/mnt/d/CodeWorkspace/frpsctl
+ ✓ Python：Python 3.13.13（/usr/bin/python3）
  ✓ venv 模块可用
+ ✓ 源码目录：/mnt/d/CodeWorkspace/frpsctl（脚本同目录）
 
 创建虚拟环境
  ✓ 已创建：/home/u/.local/share/frpsctl-src/venv
@@ -165,7 +187,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.2.4
+ ✓ 命令可用：frpsctl 0.2.5
 
 frpsctl 安装完成
 ```
@@ -175,8 +197,13 @@ frpsctl 安装完成
 | （无） | 装到 `~/.local`（命令 → `~/.local/bin/frpsctl`） |
 | `--system` | 装到 `/usr/local`（需要 `sudo`） |
 | `--prefix DIR` | 自定义前缀 |
-| `--uninstall` | 卸载（删 venv 与命令，**不动实例数据**） |
+| `--uninstall` | 卸载（删 venv 与命令，**不动实例数据**；不需要 Python） |
 | `--no-verify` | 跳过安装后自检 |
+
+| 环境变量 | 作用 |
+|---------|------|
+| `FRPSCTL_INSTALL_REF` | 固定源码版本（tag / 分支，默认 `main`），管道安装用 |
+| `FRPSCTL_INSTALL_URL` | 覆盖源码 tarball 地址（镜像 / 离线内网用） |
 
 **反复运行即为升级**（会重新装依赖并重写命令）。源码用 `-e` 方式安装，因此改完
 源码无需重装，命令立即生效。
@@ -184,7 +211,7 @@ frpsctl 安装完成
 > 脚本**不下载 frps 二进制**——那是 `frpsctl install` 的职责（需要网络与校验和，
 > 且要写入用户数据目录）。
 
-### 方式三：源码手动安装
+**手动安装**：
 
 ```bash
 git clone https://github.com/ThzxxArt/frpsctl.git && cd frpsctl
@@ -194,6 +221,31 @@ uv venv && uv pip install -e ".[dev]"
 # 或让 pip 直接装到用户环境
 pip install --user -e .
 ```
+
+### 服务器没有 Python 怎么办
+
+三条路，按省事程度排序：
+
+1. **用 uv**（推荐）——uv 自带 Python，系统什么都不用装：
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install frpsctl
+   ```
+
+2. **装一个 Python 再走本文任一方式**（需要 ≥ 3.11 **且 venv 组件完整**）：
+
+   ```bash
+   sudo apt install python3 python3-venv     # Debian / Ubuntu
+   sudo dnf install python3                  # Fedora / RHEL
+   sudo apk add python3                      # Alpine
+   ```
+
+   最小化安装的系统常出现"有 python3 但缺 venv/ensurepip"——`install.sh` 会在
+   第一步检测出来，并给出上面两条命令；检测到完全没有 Python 时，会把 uv
+   一键命令直接打印出来，而不是只报一句错。
+
+3. **独立二进制**：当前不提供（设计文档 ADR-4 评估过"只打 Python 侧、收益
+   有限"，内嵌 frps 明确拒绝）。
 
 ### 安装 frps 二进制
 
@@ -234,10 +286,39 @@ frpsctl install --with-frpc        # frps + frpc
 ### 验证安装
 
 ```bash
-frpsctl --version                  # frpsctl 0.2.4
+frpsctl --version                  # frpsctl 0.2.5
 frpsctl install                    # 下载 frps 二进制
 frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
+
+### 卸载
+
+```bash
+frpsctl uninstall              # 卸载当前实例（先列出清单，要求确认）
+frpsctl uninstall --all        # 卸载实例根下的全部实例
+frpsctl uninstall --keep-data  # 保留配置/快照/审计，只停 unit 与删共享二进制
+frpsctl uninstall --keep-bin   # 保留共享二进制（多实例机器上只卸一个实例）
+frpsctl uninstall --force      # 运行中的实例先停止再卸载（默认拒绝）
+```
+
+- 默认只卸**当前实例**（`--instance` 指定，默认 `default`）。共享二进制（`bin/`）
+  要求目标覆盖全部实例才能删——多实例机器上删掉它会让其他实例起不来，此时
+  要么 `--all`，要么 `--keep-bin`。
+- ⚠️ 删除**不可恢复**：实例目录含 `auth.token`、dashboard 口令、配置快照与插件
+  审计。因此默认先列出将删清单并要求确认；`--yes` 跳过确认；`--json` 下**必须**
+  显式 `--yes`（破坏性操作不做隐式确认）。
+- 运行中的实例默认**拒绝**卸载（退出码 11，数据分毫未动）；`--force` 会先停止
+  再卸载。systemd 托管的实例同样处理。
+- 权限不足或不该代删的东西**不会静默跳过**：unit 清理需要 root（汇总"未清理项"
+  并给出命令）；`/var/log/frps` 与 `frps` 服务账户只提示、不代删（可能另有用途）。
+- 多实例机器上只卸一个实例时，共享 unit 模板（`frps@.service` 等）会保留，
+  只停用当前实例的 unit——删模板会连累其他实例。
+- Python 包本身用包管理器移除：
+
+  ```bash
+  pipx uninstall frpsctl            # 或 pip uninstall frpsctl
+  ./install.sh --uninstall          # 源码一键脚本安装的（不动实例数据）
+  ```
 
 ---
 
@@ -1328,8 +1409,8 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 545 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（515 条）
+.venv/bin/pytest                       # 全部 573 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（543 条）
 .venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 85%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```

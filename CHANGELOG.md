@@ -3,6 +3,81 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.5] - 2026-09-17
+
+完整卸载 + 在线一键安装：把此前分散的五段式清理（包管理器 / 三个 systemd
+uninstall / 手工 `rm -rf` 数据目录）收敛为一条带护栏的命令；`install.sh`
+支持 `curl … | bash` 直跑，并给"没有 Python"的服务器一条现成出路（uv）。
+
+### 新增
+
+**完整卸载**
+
+- `frpsctl uninstall`：完整卸载当前实例的数据（配置 / state / 快照 / 插件
+  策略与审计 / 口令文件 / 日志）、对应 unit 与共享二进制。默认先列出将删清单
+  并要求确认；`--yes` 跳过；`--json` 下**必须**显式 `--yes`（破坏性操作不做
+  隐式确认）。
+- `--all`：卸载实例根下的全部实例；`--keep-data` / `--keep-bin` 各自保留数据
+  维度（多实例机器上卸一个实例时二进制必须保留）。
+- 安全护栏（延续 ADR-7 与"降级必须可见"）：
+  - 运行中的实例默认**拒绝**卸载（退出码 11，数据分毫未动）；`--force` 先停止
+    再卸载，systemd 托管同理；
+  - 身份不明（FOREIGN）与状态文件损坏一律拒绝；
+  - 多实例共用二进制却要删它 → 拒绝（`--all` 或 `--keep-bin` 才放行）；
+  - 预检在最前：任一实例不允许，一个都不动；执行顺序为"停服务 → 清 unit →
+    删数据 → 删共享二进制"，不会留下"服务在跑而数据已删"的状态；
+  - unit 清理需要 root，权限不足时汇总为"未清理项"并给出可复制命令；
+    `/var/log/frps` 与服务账户只提示、不代删。
+- 三个 systemd 服务类拆出 `disable()`：多实例机器上卸载单个实例只停用本实例
+  的 unit，**不删共享模板**（`frps@.service` 是全部实例共用的）。
+
+**在线一键安装**
+
+- `install.sh` 支持**管道直跑**：`curl -fsSL …/install.sh | bash`——没有脚本
+  同目录的源码时自动下载 tarball 到数据目录；`FRPSCTL_INSTALL_REF` 可固定
+  tag / 分支 / commit，`FRPSCTL_INSTALL_URL` 可换镜像或内网源。源码 URL 用
+  GitHub 通用形态 `archive/<ref>.tar.gz`（`refs/heads/` 固定前缀会让 tag 404，
+  实测发现）。
+- **没有 Python 的出路**：`install.sh` 检测不到 Python ≥ 3.11 时直接打印 uv
+  一键命令（uv 自带 Python，无需系统 Python）；"有 python3 但缺 venv/ensurepip"
+  会在第一步被检测并给出 apt / uv 两条指引。
+- README 安装章节重排为三条路线（uv 一键 → pipx/pip → 源码），新增
+  "服务器没有 Python 怎么办"一节。
+
+### 修复
+
+**卸载（发布前回归 review）**
+
+- 判定"是否需要停用 unit"曾看**共享模板文件是否存在**——模板是所有实例共用
+  的，它存在不代表本实例用过 systemd，多实例场景会产生"需要 root 才能停用
+  frps unit"的假警告（实测复现）。现改用 `is_active() / is_enabled()`（本实例
+  unit 的真实状态），并把"需要 root"的警告文案区分为"停用 unit"与"停用并
+  删除模板"两种动作。
+
+**安装器（实测暴露）**
+
+- **`--uninstall --prefix DIR` 会走安装路径**：MODE 与安装布局挤在同一变量，
+  `--prefix` 把 `--uninstall` 覆盖成 custom——"装到自定义前缀后想卸载"这个
+  帮助里演示的组合实际是坏的。现在 MODE / LAYOUT 分离。
+- **`--uninstall` 被 Python 与源码检查挡住**：卸载本不需要它们；检查已移入
+  安装路径（卸载分支之后）。
+- **半残 venv 被"复用"**：venv 创建中断会留下"有 python 没有 pip"的目录，
+  无条件复用让之后每次安装都在同一个坑里失败——现先验证 `import pip` 再复用，
+  创建失败时清理目录并给出指引。
+
+### 工程
+
+- 新增 28 条测试（545 → 573；非契约 543）——集成 15（作用域规则、全部安全
+  拒绝路径、`--force` 停止语义、预检与停止之间的竞态收紧、`--keep-*` 组合、
+  共享模板假警告回归、外部配置提示）/ CLI 5（确认门、`--json` 约束、运行中拒绝 = 退出码 11）/ 单元 2
+  （`disable()` 不碰模板、`is_enabled()` 三态）/ installer 6（`bash -n`、
+  `--uninstall` 不需要 Python（真跑）、无 Python 时打印 uv 指引（真跑）、
+  帮助 / README 承诺一致性、`--prefix` 不碰 MODE 的静态守卫）；
+- release.yml 的 wheel 自检集合加入 `core/uninstall.py`；README 新增"卸载"
+  教程与安装三路线；设计文档 §7.2 命令表、§12.1 交付形态、§21（第八轮）同步；
+- 文档守卫的环境变量核对扩展覆盖 `install.sh`（它读 `FRPSCTL_INSTALL_*`——
+  此前只扫 Python 会把这两个变量误判成"幽灵"）。
+
 ## [0.2.4] - 2026-09-17
 
 Web 管理台的体验迭代：把后端已有的能力全部交付到界面，并给单文件前端补上

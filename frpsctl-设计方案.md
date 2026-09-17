@@ -82,6 +82,8 @@ frpsctl                          命令行程序（pip/pipx 安装）
 └── Web 管理台                    web serve / web service install|uninstall|status
                                   web password show
 
+└── 工具管理                      install / uninstall（完整卸载，§21）
+
 可选：插件服务与 Web 管理台都是独立进程，由各自的 systemd unit 守护。
 ```
 
@@ -564,6 +566,7 @@ class Instance:
 | `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速 |
 | `frpsctl web service install\|uninstall\|status` | 管理台的 systemd 集成 | 0600 口令文件（明文不进 unit）+ 四项体检；`--trusted-proxy` 可写入 unit |
 | `frpsctl web password show [--json]` | 读回管理台口令 | 显式索取明文；权限过宽时向 stderr 告警 |
+| `frpsctl uninstall [--all] [--keep-data] [--keep-bin] [--force] [--yes]` | 完整卸载 | 默认只卸当前实例并要求确认（`--json` 必须显式 `--yes`）；删共享二进制要求覆盖全部实例（或 `--keep-bin`）；运行中默认拒绝（`--force` 先停止）；unit 清理需 root，权限不足汇总为"未清理项" |
 
 ### 7.3 退出码
 
@@ -1394,8 +1397,9 @@ async def handler(
 | 方案 | 结论 |
 |------|------|
 | PyInstaller 内嵌 frps | ❌ 不用：约 14 MB 二进制每次运行都要解包到临时目录；还需处理 Apache-2.0 的 LICENSE 随包分发，并被迫给每个 glibc/musl × x86_64/aarch64 组合单独出包 |
-| PyInstaller 只打 Python 侧 | ⚠️ 可选，收益有限（依赖全是纯 Python） |
+| PyInstaller 只打 Python 侧 | ⚠️ 可选，收益有限（依赖全是纯 Python）。"没有 Python 的服务器"由 uv 路线覆盖（uv 自带 Python），见 §22 |
 | **pip / pipx + 按需下载 frps** | ✅ **采用** |
+| **uv 一键 + install.sh 管道直跑** | ✅ v0.2.5 起支持（§21.4）：`curl … \| bash` 自动下载源码；无 Python 时打印 uv 指引 |
 
 ```toml
 # pyproject.toml（要点）
@@ -2762,6 +2766,121 @@ JS 经 `node --check` 语法验证通过。
 
 残余风险如实记账：DOM 级行为（点击后的界面变化）仍只能人工验证（§18.7 的
 不做项），而 id 缺失这类"用户可见的白屏风险"已被自动化覆盖。
+
+---
+
+## 21. 第八轮迭代（v0.2.5：完整卸载与在线一键安装）
+
+这一轮的起点是一个用户提问："有没有完整卸载的功能"。通读后确认：**没有**。
+卸载能力此前是分散的五段式——Python 包（pipx/pip/install.sh）、三个 systemd
+`uninstall`、以及一个**没有任何命令覆盖**的数据目录（`bin/` 里的二进制 +
+`instances/` 里的配置/state/快照/插件策略与审计/口令文件）。用户必须手工串联
+`rm -rf ~/.local/share/frpsctl`，而它会静默连 token 与口令一起删掉、不可逆、
+多实例场景没有任何护栏。
+
+### 21.1 设计：作用域模型 + 三条安全原则
+
+**作用域模型**：默认卸载**当前实例**；`--all` 覆盖实例根下的全部实例。
+两个"保留"维度各自独立：`--keep-data` 保留实例数据（配置/快照/审计），
+`--keep-bin` 保留共享二进制（多实例环境下还有别的实例要用）。
+
+三条安全原则都是项目既有纪律在新场景的应用：
+
+| 原则 | 落地 |
+|------|------|
+| **不确定就拒绝**（ADR-7） | 实例在运行 / 身份不明（FOREIGN）/ 状态文件损坏 / 多实例共用二进制却要求删它——一律拒绝并给出处置；运行中要 `--force` 显式授权 |
+| **顺序安全** | 先停服务 → 再清 unit → 再删数据 → 最后删共享二进制；任何一步失败都不会留下"服务还在跑但数据已被删"的失控状态；且所有实例的**预检在任何破坏动作之前**完成（一个不允许，一个都不动） |
+| **降级必须可见** | unit 清理需要 root，权限不足时收进 warnings 并给出可复制命令；`/var/log/frps` 与服务账户只提示不代删（可能另有用途） |
+
+三个实现要点：
+
+1. **共享 unit 模板的边界**：`frps@.service` / `frpsctl-plugin@.service` /
+   `frpsctl-web@.service` 是所有实例共享的模板。多实例机器上卸载单个实例只能
+   `disable --now`，**不能删模板**——为此给三个服务类拆出了 `disable()`
+   入口（既有 `uninstall()` 保持原语义：停用并删模板）。
+2. **`--json` 必须显式 `--yes`**：破坏性操作不做隐式确认，也不让确认提示污染
+   stdout 的机器可读契约。
+3. **锁与删除的相容性**：删实例目录时持有实例锁——并发 `config set` 不能与
+   删除交错；删除持有中的 `.lock` 文件本身安全（锁按 fd 持有，unlink 不影响
+   已有 flock）。
+
+### 21.2 命令与验收
+
+```bash
+frpsctl uninstall              # 卸载当前实例（列出清单 → 确认）
+frpsctl uninstall --all        # 卸载实例根下的全部实例
+frpsctl uninstall --keep-data  # 保留数据，只停 unit 与删二进制
+frpsctl uninstall --keep-bin   # 保留共享二进制
+frpsctl uninstall --force      # 运行中的实例先停止再卸载
+```
+
+卸载部分新增 22 条测试：集成层覆盖作用域规则与全部安全拒绝
+（运行中 / FOREIGN / 损坏 / 多实例 / 缺实例）、`--force` 的停止语义、
+预检与停止之间的竞态收紧、unit 权限
+不足的可见降级、共享模板假警告回归、`--keep-*` 组合与外部配置（`--config`）
+提示；CLI 层覆盖确认门（取消不动分毫）、`--json` 约束与"运行中拒绝 = 退出码
+11"的契约；单元层覆盖 `disable()` 只停用不删模板与 `is_enabled()` 三态。
+
+### 21.3 发布前回归 review
+
+方法同历次：全部 diff 逐行审查 + 对抗性实测（复现 → 修复 → 回归）+ 测试基建
+复查。发现并修复 **2 条真实缺陷** + 1 处文案歧义：
+
+| # | 问题 | 复现 | 修复 |
+|---|------|------|------|
+| 1 | `_clean_units` 的判定基于 `template_path.exists()`——而模板是**全部实例共享**的：实例从未用过 systemd 时也会尝试停用，产生"需要 root 才能停用 frps unit"的假警告（多实例场景实测复现） | 对抗性脚本（模板存在 + 本实例无 unit → 输出假警告） | 判定改为 `is_active() / is_enabled()`（本实例 unit 的真实状态，为三个服务类新增 `is_enabled()`）；`remove_templates` 与"本实例是否在用"两个维度分开判定 |
+| 2 | **预检与停止之间的竞态窗口**：`_ensure_stopped` 无条件停止运行态，理由是"预检已授权"——实例可能在窗口里被并发启动，无 `--force` 的卸载会越权停掉一个刚起来的服务 | 代码审查（时序推理） | `_ensure_stopped` 接收 `force` 并在停止前**复核**状态：非 `--force` 遇运行态即中止（退出码 11），两条竞态回归用例（RUNNING / SYSTEMD_ACTIVE）固化 |
+| 3 | "需要 root"的警告统一写"停用 unit"，而覆盖全部实例时的实际动作是"停用并删除模板"——两种动作的处置不同（一个要保模板、一个要删） | 代码审查 | 文案按 `remove_template` 分支区分 |
+
+修复过程本身也暴露一个测试设计教训（已固化）：给 `Systemd.is_active` 做注入会
+**顺带改变 `resolve_owner()` 的所有权判定**（实例被预检当成 systemd 托管而拒绝
+卸载）——测试要注入的是"清理阶段需要停用"，应注入 `is_enabled`（所有权判定
+不看它）。这条写进了测试的 docstring。
+
+对抗性实测清单（全部通过）：重复卸载（第二次报"实例不存在"退出码 3）；只读
+子目录（删除失败如实报错退出码 1、提示可重跑，修权限后重跑成功）；半删状态
+（手工删掉 frps.toml 后卸载仍成功）；多实例共享模板无假警告（转正为回归用例）；
+管道模式二次运行（重下载源码 + 复用 venv = 升级语义）；非法
+`FRPSCTL_INSTALL_URL`（退出码 1、三条处置指引、不产生半截安装目录）。
+
+---
+
+### 21.4 在线一键安装（第九轮内容并入本版本发布）
+
+起点是一个用户提问："README 能不能写一个一键在线安装命令？现在的安装脚本
+支不支持？如果服务器没有 Python 该怎么办？" 核查结论：`install.sh` **不支持**
+管道直跑（它用 `BASH_SOURCE` 定位源码，管道方式下既没有自身路径也没有源码），
+也**没有任何"没有 Python"的出路**（脚本自身要跑 python3 建 venv）。本轮把
+三件事一起解决。
+
+### 21.5 在线安装：新增能力
+
+| 能力 | 落点 |
+|------|------|
+| 管道直跑 | `curl … \| bash`：源码不在脚本旁边时下载 tarball 到 `<prefix>/share/frpsctl-src/src`；`FRPSCTL_INSTALL_REF` 固定 tag / 分支 / commit、`FRPSCTL_INSTALL_URL` 换镜像 |
+| 无 Python 出路 | 检测失败时打印 **uv 一键命令**（uv 是静态二进制、自带 Python）；"缺 venv/ensurepip"在第一步给出 apt / uv 两条指引 |
+| README 三路线 | uv 一键（推荐）→ pipx / pip → 源码（clone / 管道 / 手动），另立"服务器没有 Python 怎么办"一节 |
+
+### 21.6 在线安装：实测暴露并修复的三处缺陷
+
+| # | 问题 | 复现 | 修复 |
+|---|------|------|------|
+| 1 | `--uninstall --prefix DIR` 走安装路径 | `MODE` 与布局信息挤在同一变量，`--prefix` 把 `--uninstall` 覆盖成 custom——帮助文本里演示的组合实际是坏的 | MODE / LAYOUT 分离 |
+| 2 | `--uninstall` 被 Python 与源码检查挡住 | 卸载分支写在检查之后 | 检查移入安装路径（卸载分支之后）；卸载不再需要 Python |
+| 3 | 半残 venv 被"复用" | venv 创建中断留下"有 python 没有 pip"的目录，无条件复用让之后每次安装都在同一坑里失败 | 复用前验证 `import pip`；创建失败清理目录并给出指引 |
+
+另有一处 URL 形态问题在实测中发现：`archive/refs/heads/<ref>.tar.gz` 对 tag 返回
+404——改用 GitHub 通用形态 `archive/<ref>.tar.gz`（自动解析 tag / 分支 / commit）。
+
+### 21.7 在线安装：验收（发布前实测）
+
+全部真实执行：目录模式完整安装（含自检）；重复运行幂等（复用 venv）；
+**管道模式真实下载 GitHub 源码并安装**；`FRPSCTL_INSTALL_REF=v0.2.4` 固定 tag；
+`--uninstall` 在"系统 Python 缺 ensurepip"的环境成功；完全无 Python 时打印
+uv 指引；`--uninstall --prefix` / `--uninstall --system` 参数组合。安装部分新增
+6 条自动化测试（`bash -n`、两条真跑行为测试、承诺一致性、静态守卫）；
+**本轮合计 28 条**（545 → 573；非契约 543）；文档守卫的环境变量核对同步扩展
+覆盖 `install.sh`。
 
 ---
 
