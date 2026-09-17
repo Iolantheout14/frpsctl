@@ -304,6 +304,19 @@ class PluginService:
             return False
         return self._run("is-active", self.unit_name).stdout.strip() == "active"
 
+    def is_enabled(self) -> bool:
+        """unit 是否处于 enabled（开机自启）——卸载时它同样需要被停掉。
+
+        **与 `template_path.exists()` 的区别**：模板是全部实例共享的，模板存在
+        不代表**本实例**的 unit 存在；只有 `is-enabled` 才对"本实例的 unit"
+        有发言权——否则会对从未用过 systemd 的实例产生假警告（实测复现过）。
+        """
+        if not self.available:
+            return False
+        if self._run("cat", "--no-pager", self.unit_name).returncode != 0:
+            return False
+        return self._run("is-enabled", self.unit_name).stdout.strip() in ("enabled", "enabled-runtime")
+
     def main_pid(self) -> int | None:
         out = self._run("show", "-p", "MainPID", "--value", self.unit_name)
         text = out.stdout.strip()
@@ -415,6 +428,15 @@ class PluginService:
         self._run_checked("daemon-reload")
         self._run_checked("enable", self.unit_name)
         return self.template_path
+
+    def disable(self) -> None:
+        """停用**本实例**的 unit（`disable --now`），**不删共享模板**。需要 root。
+
+        unit 模板（`frpsctl-plugin@.service`）是所有实例共享的：多实例环境里
+        卸载单个实例时删模板会连累其他实例，因此拆出这个"只停用"的入口。
+        """
+        self._require_root("停用插件 unit")
+        self._run_checked("disable", "--now", self.unit_name)
 
     def uninstall(self) -> None:
         """停用并删除插件 unit 模板。**需要 root**。"""
@@ -591,6 +613,19 @@ class Systemd:
             return False
         return self._run("is-active", timeout=5).stdout.strip() == "active"
 
+    def is_enabled(self) -> bool:
+        """unit 是否处于 enabled（开机自启）——卸载时它同样需要被停掉。
+
+        **与 `template_path.exists()` 的区别**：模板是全部实例共享的，模板存在
+        不代表**本实例**的 unit 存在；只有 `is-enabled` 才对"本实例的 unit"
+        有发言权——否则会对从未用过 systemd 的实例产生假警告（实测复现过）。
+        """
+        if not self.available:
+            return False
+        if not self._unit_exists():
+            return False
+        return self._run("is-enabled", timeout=5).stdout.strip() in ("enabled", "enabled-runtime")
+
     def _unit_exists(self) -> bool:
         return self._run("cat", "--no-pager", self.unit_name, timeout=5).returncode == 0
 
@@ -751,6 +786,15 @@ class Systemd:
         self._run_checked("enable", self.unit_name)
         return self.template_path
 
+    def disable(self) -> None:
+        """停用**本实例**的 unit（`disable --now`），**不删共享模板**。需要 root。
+
+        unit 模板（`frps@.service`）是所有实例共享的：多实例环境里卸载单个实例
+        时删模板会连累其他实例，因此拆出这个"只停用"的入口。
+        """
+        self._require_root("停用 systemd unit")
+        self._run_checked("disable", "--now", self.unit_name)
+
     def uninstall(self) -> None:
         """停用并删除模板。**需要 root**。"""
         self._require_root("卸载 systemd unit")
@@ -813,6 +857,19 @@ class WebService:
         if self._run("cat", "--no-pager", self.unit_name).returncode != 0:
             return False
         return self._run("is-active", self.unit_name).stdout.strip() == "active"
+
+    def is_enabled(self) -> bool:
+        """unit 是否处于 enabled（开机自启）——卸载时它同样需要被停掉。
+
+        **与 `template_path.exists()` 的区别**：模板是全部实例共享的，模板存在
+        不代表**本实例**的 unit 存在；只有 `is-enabled` 才对"本实例的 unit"
+        有发言权——否则会对从未用过 systemd 的实例产生假警告（实测复现过）。
+        """
+        if not self.available:
+            return False
+        if self._run("cat", "--no-pager", self.unit_name).returncode != 0:
+            return False
+        return self._run("is-enabled", self.unit_name).stdout.strip() in ("enabled", "enabled-runtime")
 
     def main_pid(self) -> int | None:
         out = self._run("show", "-p", "MainPID", "--value", self.unit_name)
@@ -919,6 +976,15 @@ class WebService:
         self._run_checked("daemon-reload")
         self._run_checked("enable", self.unit_name)
         return self.template_path, password_plain
+
+    def disable(self) -> None:
+        """停用**本实例**的 unit（`disable --now`），**不删共享模板**。需要 root。
+
+        unit 模板（`frpsctl-web@.service`）是所有实例共享的：多实例环境里卸载
+        单个实例时删模板会连累其他实例，因此拆出这个"只停用"的入口。
+        """
+        self._require_root("停用 Web 管理台 unit")
+        self._run_checked("disable", "--now", self.unit_name)
 
     def uninstall(self) -> None:
         """停用并删除 unit 模板。**需要 root**。口令文件保留（数据不属于 unit）。"""
