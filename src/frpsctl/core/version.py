@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import UnsupportedVersion, VersionParseError
+from .diagnostics import trace
 
 __all__ = [
     "MINIMUM_VERSION",
@@ -70,8 +71,6 @@ def read_binary_version(binary: Path, *, timeout: float = 5.0) -> Version:
     但这里只用最朴素的 `-v` 形式。
     """
     try:
-        from ..cli.ui import trace
-
         trace(f"读取二进制版本：{binary} -v")
         proc = subprocess.run(
             [str(binary), "-v"],
@@ -84,8 +83,6 @@ def read_binary_version(binary: Path, *, timeout: float = 5.0) -> Version:
     except subprocess.TimeoutExpired:
         raise VersionParseError(f"{binary} -v 超时未返回") from None
     version = parse_version(proc.stdout or proc.stderr)
-    from ..cli.ui import trace
-
     trace(f"二进制版本：{version}（退出码 {proc.returncode}）")
     return version
 

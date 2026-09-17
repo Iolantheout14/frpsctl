@@ -24,6 +24,7 @@ from pathlib import Path
 
 from ..errors import (
     AlreadyRunning,
+    ConfigError,
     FrpsctlError,
     NotRunning,
     OwnershipConflict,
@@ -31,6 +32,7 @@ from ..errors import (
     StopFailed,
 )
 from . import platform as plat
+from .diagnostics import trace
 from .health import HealthLayer, HealthReport, probe_plugins
 from .healthcheck import ListenInfo, parse_dashboard, parse_listen, parse_plugin_targets
 from .instance import Instance
@@ -310,7 +312,7 @@ class Lifecycle:
 
         # L2：控制面（webServer.port = 0 → SKIPPED）
         dash = parse_dashboard(self.inst.config)
-        detail = ""
+        l2_detail = ""
         ms = 0.0
         if not dash.enabled:
             l2 = HealthLayer.SKIPPED
@@ -328,7 +330,7 @@ class Lifecycle:
             except Exception:  # noqa: BLE001 - 探针失败只能说明"不健康"，不是调用方的错
                 ok, ms = False, 0.0
             l2 = HealthLayer.OK if ok else HealthLayer.FAIL
-            detail = f"/healthz 200, {ms:.0f}ms" if ok else f"/healthz 无响应 ({dash.base_url})"
+            l2_detail = f"/healthz 200, {ms:.0f}ms" if ok else f"/healthz 无响应 ({dash.base_url})"
 
         # L3：插件面（无 httpPlugins → SKIPPED）。同样不能被异常打断：探针内部
         # 只捕 OSError，而 URL 解析等仍可能抛出别的东西。
@@ -337,8 +339,14 @@ class Lifecycle:
             l3, l3_detail = probe_plugins(targets)
         except Exception:  # noqa: BLE001 - 探针失败只意味着"不可达"
             l3, l3_detail = HealthLayer.FAIL, "插件探针异常"
+        # detail 汇总**所有失败层**：L3 曾直接覆盖 L2 的信息，两层同挂时
+        # 看不到控制面的失败详情（而那是恢复顺序上的第一层）。
         if l3 is HealthLayer.FAIL:
-            detail = l3_detail
+            parts = [l2_detail] if l2 is HealthLayer.FAIL and l2_detail else []
+            parts.append(l3_detail)
+            detail = "；".join(parts)
+        else:
+            detail = l2_detail
 
         return HealthReport(l1_process=l1, l2_control=l2, l3_plugin=l3, detail=detail, ms=ms)
 
@@ -481,8 +489,6 @@ class Lifecycle:
         # 交给 with 会在 Popen 之前就关掉，子进程拿到的是已关闭的 fd。
         handle = open(log_path, "ab", buffering=0)  # noqa: SIM115
         try:
-            from ..cli.ui import trace
-
             trace(f"派生进程：{binary} -c {self.inst.config}（stdout → {log_path}）")
             proc = subprocess.Popen(
                 [str(binary), "-c", str(self.inst.config)],
@@ -754,31 +760,33 @@ class Lifecycle:
         """聚合状态（§7.4）。不抛异常——`status` 必须永远能回答"现在什么情况"。"""
         corrupted = self.inst.state_corrupted()
         listen = parse_listen(self.inst.config)
-        if corrupted:
-            # status 必须**永远**能回答"现在什么情况"，不能因为状态文件损坏就
-            # 以异常收场。这里如实报告"不可判定"，把处置交给用户（stop/start
-            # 会拒绝，那是对的——它们要动进程）。
-            mode: str | None = None
-            if self.inst.config.exists():
-                with contextlib.suppress(OSError):
-                    mode = oct(self.inst.config.stat().st_mode & 0o777)[2:].zfill(4)
-            return StatusReport(
-                instance=self.inst.name,
-                owner=Owner.NONE,
-                state=State.STOPPED,
-                config=self.inst.config if self.inst.config.exists() else None,
-                config_mode=mode,
-                state_corrupted=True,
-                listen=listen,
-            )
-        owner, state, ref = self.state_with_owner()
+        owner = self.resolve_owner()
+
+        if owner is Owner.SYSTEMD:
+            # systemd 托管下 state.json **不参与任何判定**（ADR-1）：一份残留且
+            # 损坏的 state.json（direct → systemd 迁移的常见遗留）不该把报告
+            # 拖回"不可判定"——服务明明在跑。继续走正常路径。
+            state, ref = State.SYSTEMD_ACTIVE, None
+        else:
+            if corrupted:
+                return self._indeterminate_report(listen=listen)
+            try:
+                state, ref = self._state_from(owner)
+            except ConfigError:
+                # 竞态：损坏检查之后、读取之前文件被写坏。status 承诺永不异常，
+                # 如实报告"不可判定"而不是把异常放给调用方。
+                return self._indeterminate_report(listen=listen)
 
         version_hint: str | None = None
         binary_version: str | None = None
         disk_version: str | None = None
         uptime: float | None = None
 
-        data = self.inst.read_state() or {}
+        # SYSTEMD + 损坏残留 state.json 时 read_state 会抛——损坏也意味着
+        # state.json 不能作为任何信息的来源，直接跳过。
+        data: dict = {}
+        if not corrupted:
+            data = self.inst.read_state() or {}
         recorded = data.get("version")
         if isinstance(recorded, str) and recorded:
             binary_version = recorded
@@ -832,6 +840,28 @@ class Lifecycle:
             systemd_unit=unit_name,
             systemd_main_pid=unit_pid,
             state_corrupted=corrupted,
+            listen=listen,
+        )
+
+    def _indeterminate_report(self, *, listen: ListenInfo | None) -> StatusReport:
+        """state.json 损坏且无 systemd 时的"不可判定"报告。
+
+        `status` 的承诺是**永远能回答"现在什么情况"**，因此这里如实报告
+        "无法判断进程归属"，把处置交给用户（stop/start 会拒绝，那是对的——
+        它们要动进程）。owner 显示 NONE 而不是 DIRECT：损坏的 state.json
+        不再构成任何有效归属信息。
+        """
+        mode: str | None = None
+        if self.inst.config.exists():
+            with contextlib.suppress(OSError):
+                mode = oct(self.inst.config.stat().st_mode & 0o777)[2:].zfill(4)
+        return StatusReport(
+            instance=self.inst.name,
+            owner=Owner.NONE,
+            state=State.STOPPED,
+            config=self.inst.config if self.inst.config.exists() else None,
+            config_mode=mode,
+            state_corrupted=True,
             listen=listen,
         )
 

@@ -63,14 +63,20 @@ class HealthReport:
         return f"插件不可达：{self.detail or '见配置'} —— 客户端将无法登录（fail-closed），请先恢复插件服务"
 
     def render(self) -> str:
-        """一行式展示（§7.4）。"""
+        """一行式展示（§7.4）。
+
+        `detail` 在 **L2 或 L3 失败时**附加显示：L2 失败的原因是"dashboard 为什么
+        没起来"，那恰恰是先要修的信息（控制面恢复前连统计都拿不到）。
+        """
         parts = [
             f"L1 process {self.l1_process.value}",
             f"L2 control {self.l2_control.value}",
             f"L3 plugin {self.l3_plugin.value}",
         ]
         line = "  ".join(parts)
-        if self.detail and self.l3_plugin is HealthLayer.FAIL:
+        if self.detail and (
+            self.l2_control is HealthLayer.FAIL or self.l3_plugin is HealthLayer.FAIL
+        ):
             line += f" ({self.detail})"
         return line
 

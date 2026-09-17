@@ -27,39 +27,32 @@ __all__ = [
     "trace",
 ]
 
-_MASK = "***"
-
-#: 进程级开关，由 `--verbose` 设置。
-#:
-#: 为什么是模块级而不是穿参：`--verbose` 是**全局**选项，而它要影响的调用点分布在
-#: `core/release.py`（下载/复验子进程）与 `core/config.py`（`frps verify` 子进程）
-#: 里，这些函数都没有 CLI 上下文。把它做成全局调试开关比给整条调用链加参数更诚实
-#: ——它确实就是一个进程级的诊断开关。
-#: 在 `--verbose` 出现之前这个选项被解析后**从未被读过**（文档却承诺"详细输出"），
-#: 那比没有这个选项更糟。
-_VERBOSE = False
+#: `--verbose` 的实现位于 `core/diagnostics.py`（分层约束：core 不依赖 cli）。
+#: 本模块的三个函数是薄委托，保持既有调用点（`ui.trace` / `ui.set_verbose`）不变。
 
 
 def set_verbose(enabled: bool) -> None:
-    global _VERBOSE
-    _VERBOSE = bool(enabled)
+    """设置进程级详细模式（委托到 core，见 `core/diagnostics.py`）。"""
+    from ..core.diagnostics import set_verbose as _set
+
+    _set(enabled)
 
 
 def verbose_enabled() -> bool:
-    return _VERBOSE
+    from ..core.diagnostics import verbose_enabled as _enabled
+
+    return _enabled()
 
 
 def trace(text: str) -> None:
-    """详细模式下把诊断信息写到 **stderr**。
+    """详细模式下把诊断信息写到 **stderr**（委托到 core）。
 
     必须走 stderr：`--json` 的 stdout 是机器可读契约，一行诊断就能让 `jq` 解析失败。
-    非详细模式下完全静默。
-
-    stderr 断开（`2>&1 | head` 之类）时静默放弃：诊断输出不值得让主流程崩掉。
+    非详细模式下完全静默。stderr 断开时静默放弃。具体实现见 `core/diagnostics.py`。
     """
-    if _VERBOSE:
-        with contextlib.suppress(OSError):
-            sys.stderr.write(f"[trace] {text}\n")
+    from ..core.diagnostics import trace as _trace
+
+    _trace(text)
 
 
 def mask_secret(value: object, *, reveal: bool = False) -> str:

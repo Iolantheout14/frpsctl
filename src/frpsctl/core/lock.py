@@ -23,7 +23,7 @@ from pathlib import Path
 
 from ..errors import LockBusy
 
-__all__ = ["instance_lock", "is_locked", "held_locks"]
+__all__ = ["instance_lock", "is_locked"]
 
 
 @dataclass
@@ -49,12 +49,6 @@ def _key(path: Path) -> tuple[str, int]:
     except OSError:
         resolved = str(path.absolute())
     return (resolved, threading.get_ident())
-
-
-def held_locks() -> list[str]:
-    """当前持有的锁路径（doctor / 调试用）。"""
-    with _registry_lock:
-        return sorted({key[0] for key in _held})
 
 
 @contextlib.contextmanager

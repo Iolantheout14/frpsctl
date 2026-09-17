@@ -36,6 +36,7 @@ from ..errors import (
     ChecksumUnavailable,
     UsageError,
 )
+from .diagnostics import trace
 from .version import ensure_supported, parse_version
 
 __all__ = [
@@ -315,8 +316,6 @@ def install(
             downloaded=False,
             switched_frpc=switched_frpc,
         )
-
-    from ..cli.ui import trace
 
     trace(f"目标资产：{asset}（镜像数 {len(mirrors)}）")
 
