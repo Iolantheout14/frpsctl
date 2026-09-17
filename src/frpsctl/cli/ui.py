@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
+import time
 from typing import Any
 
 __all__ = [
@@ -17,6 +19,9 @@ __all__ = [
     "human_bytes",
     "human_duration",
     "warn",
+    "note",
+    "progress",
+    "end_progress",
     "set_verbose",
     "verbose_enabled",
     "trace",
@@ -49,9 +54,12 @@ def trace(text: str) -> None:
 
     必须走 stderr：`--json` 的 stdout 是机器可读契约，一行诊断就能让 `jq` 解析失败。
     非详细模式下完全静默。
+
+    stderr 断开（`2>&1 | head` 之类）时静默放弃：诊断输出不值得让主流程崩掉。
     """
     if _VERBOSE:
-        sys.stderr.write(f"[trace] {text}\n")
+        with contextlib.suppress(OSError):
+            sys.stderr.write(f"[trace] {text}\n")
 
 
 def mask_secret(value: object, *, reveal: bool = False) -> str:
@@ -72,8 +80,57 @@ def emit(text: str = "") -> None:
 
 
 def warn(text: str) -> None:
-    """告警输出（stderr）：不改变退出码，但必须让人看见。"""
-    sys.stderr.write(text + "\n")
+    """告警输出（stderr）：不改变退出码，但必须让人看见。
+
+    stderr 已断开时静默放弃：告警不值得让主流程崩掉，更不该在
+    `map_exceptions` 的错误报告路径上抛二次异常（那会变成 traceback）。
+    """
+    with contextlib.suppress(OSError):
+        sys.stderr.write(text + "\n")
+
+
+def note(text: str) -> None:
+    """进度/提示输出（stderr）。
+
+    与 `warn` 的区别是语义（提示 vs 告警），渠道相同：stderr——`--json` 的
+    stdout 是机器可读契约，任何进度信息都不能进去。
+    """
+    with contextlib.suppress(OSError):
+        sys.stderr.write(text + "\n")
+
+
+_progress_last = 0.0
+
+
+def progress(text: str) -> None:
+    """单行进度（stderr）：终端上原地刷新，非终端上按秒限流地按行输出。
+
+    "等待健康检查"这类过程需要连续反馈（最长 10 秒），但两类输出环境的要求
+    相反：终端想要**原地刷新**（\\r 不换行 + 清行尾防残影），重定向到文件/CI
+    日志则既不能写控制字符、也不能每 0.3 秒刷一行。这里按 `isatty` 分流。
+
+    本函数**绝不抛异常**：它挂在启动流程的健康等待里，一次写失败（管道断开）
+    不该让刚派生的 frps 被当成"启动失败"收掉。
+    """
+    global _progress_last
+    now = time.monotonic()
+    with contextlib.suppress(OSError):
+        if sys.stderr.isatty():
+            # \033[K 清行尾：新文本短于旧文本（"10s" → "9s"）时不留残影
+            sys.stderr.write(f"\r{text}\033[K")
+            sys.stderr.flush()
+            _progress_last = now
+        elif now - _progress_last >= 1.0:
+            sys.stderr.write(f"{text}\n")
+            _progress_last = now
+
+
+def end_progress() -> None:
+    """收尾单行进度：终端上清掉可能残留的半行（非终端无操作）。"""
+    with contextlib.suppress(OSError):
+        if sys.stderr.isatty():
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
 
 
 def emit_json(payload: Any, *, compact: bool = False) -> None:

@@ -25,19 +25,21 @@ from ..core import doctor as doc
 from ..core import healthcheck, release
 from ..core import platform as plat
 from ..core.admin import AdminClient, sum_proxy_types
-from ..core.instance import Instance
+from ..core.instance import Instance, list_instances
 from ..core.lifecycle import Lifecycle, StartReport, State
-from ..core.systemd import DEFAULT_SERVICE_USER, Systemd
-from ..core.transaction import apply_change, rollback_to
+from ..core.lock import instance_lock
+from ..core.systemd import DEFAULT_SERVICE_USER, PluginService, Systemd
+from ..core.transaction import apply_edit, apply_set, rollback_to
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
 from ..errors import (
     AdminUnreachable,
-    AlreadyRunning,
     ConfigError,
+    ConfigKeyMissing,
     FrpsctlError,
     UnhealthyAfterStart,
+    UsageError,
 )
 from . import ui
 from .context import AppContext, build_context, run_cli
@@ -125,9 +127,11 @@ app = typer.Typer(
 config_app = typer.Typer(no_args_is_help=True, help="配置读写与变更闭环。")
 service_app = typer.Typer(no_args_is_help=True, help="systemd 集成。")
 plugin_app = typer.Typer(no_args_is_help=True, help="服务端插件：多用户鉴权 + 端口白名单 + 审计。")
+plugin_service_app = typer.Typer(no_args_is_help=True, help="插件服务的 systemd 集成。")
 app.add_typer(config_app, name="config")
 app.add_typer(service_app, name="service")
 app.add_typer(plugin_app, name="plugin")
+plugin_app.add_typer(plugin_service_app, name="service")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +208,20 @@ def _admin(app_ctx: AppContext) -> AdminClient | None:
         return None
     password = app_ctx.admin_password or dash.password
     return AdminClient(dash.base_url, dash.user, password)
+
+
+def _require_admin(app_ctx: AppContext, *, feature: str) -> AdminClient:
+    """需要 dashboard 的命令的统一入口；未启用时退出码 7（§7.3）。
+
+    不用配置错误(3)：脚本据此区分"配置写错了"与"这个功能当前不可用"。
+    """
+    client = _admin(app_ctx)
+    if client is None:
+        raise AdminUnreachable(
+            f"dashboard 未启用（webServer.port = 0），无法{feature}",
+            hint="该命令依赖 Admin API；请在配置里设置 webServer.port",
+        )
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +305,10 @@ def init(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的配置（会先备份）"),
-    bind_port: int = typer.Option(7000, "--bind-port", help="控制端口 bindPort"),
-    dashboard_port: int = typer.Option(7500, "--dashboard-port", help="dashboard 端口（0 = 不启用）"),
+    bind_port: int = typer.Option(7000, "--bind-port", min=1, max=65535, help="控制端口 bindPort"),
+    dashboard_port: int = typer.Option(
+        7500, "--dashboard-port", min=0, max=65535, help="dashboard 端口（0 = 不启用）"
+    ),
     allow_ports: str = typer.Option(
         "", "--allow-ports", help="端口白名单，如 6000-6100 或 6000,6001（留空 = 不限，不推荐）"
     ),
@@ -481,30 +501,14 @@ def verify(
     version = lc.binary_version()
     binary = lc.binary()
 
-    text = target.read_text("utf-8")
-    uses_unsafe = _config_uses_unsafe(text)
+    text = cfg.read_config_text(target)
+    uses_unsafe = cfg.needs_unsafe_flag(text)
     cfg.validate_text(text, binary=binary, workdir=app_ctx.instance.dir, uses_unsafe=uses_unsafe)
     flags = " ".join(cfg.config_flags(uses_exec_token_source=uses_unsafe))
     if app_ctx.json:
         ui.emit_json({"file": str(target), "ok": True, "flags": flags})
     else:
         ui.emit(f"{target} 校验通过（frps {version}，标志：{flags}）")
-
-
-def _config_uses_unsafe(text: str) -> bool:
-    import tomllib
-
-    try:
-        data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
-        return False
-    auth = data.get("auth")
-    if not isinstance(auth, dict):
-        return False  # `auth = "oops"` 这类类型错误交给 pydantic 报（退出码 3）
-    source = auth.get("tokenSource")
-    if not isinstance(source, dict):
-        return False
-    return str(source.get("type", "")).lower() == "exec"
 
 
 # ---------------------------------------------------------------------------
@@ -533,13 +537,12 @@ def start(
     lc = _lifecycle(app_ctx)
 
     # 落盘前先跑权威校验（§9 第 5 步的理念：把 verify 请到最前面）
-    cfg.load_config(app_ctx.config_path)  # 不存在 → ConfigError(3) 而非 FileNotFoundError(1)
-    text = app_ctx.config_path.read_text("utf-8")
+    text = cfg.read_config_text(app_ctx.config_path)  # 不存在 → ConfigError(3) 而非 FileNotFoundError(1)
     cfg.validate_text(
         text,
         binary=lc.binary(),
         workdir=app_ctx.instance.dir,
-        uses_unsafe=_config_uses_unsafe(text),
+        uses_unsafe=cfg.needs_unsafe_flag(text),
     )
 
     if foreground:
@@ -548,7 +551,13 @@ def start(
             subprocess.call([str(lc.binary()), "-c", str(app_ctx.config_path)], cwd=app_ctx.instance.dir)
         )
 
-    report = lc.start(health_timeout=health_timeout)
+    tick = _health_tick(app_ctx)
+    if tick is not None:
+        ui.note(f"等待健康检查（最多 {health_timeout:g}s）…")
+    try:
+        report = lc.start(health_timeout=health_timeout, on_health_tick=tick)
+    finally:
+        ui.end_progress()
     if app_ctx.json:
         ui.emit_json(_start_payload(report))
     else:
@@ -586,10 +595,13 @@ def restart(
     """重启实例（stop → start）。配置变更请用 `config set`，它会自动回滚。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     lc = _lifecycle(app_ctx)
+    tick = _health_tick(app_ctx)
+    if tick is not None:
+        ui.note(f"等待健康检查（最多 {health_timeout:g}s）…")
     try:
-        report = lc.restart(timeout=timeout, health_timeout=health_timeout)
-    except AlreadyRunning:
-        raise
+        report = lc.restart(timeout=timeout, health_timeout=health_timeout, on_health_tick=tick)
+    finally:
+        ui.end_progress()
     if app_ctx.json:
         ui.emit_json(_start_payload(report))
     else:
@@ -611,6 +623,24 @@ def _start_payload(report) -> dict:
             "detail": report.health.detail,
         },
     }
+
+
+def _health_tick(app_ctx: AppContext):
+    """健康等待期的逐轮进度回调（`--json` 时返回 None）。
+
+    进度只进 stderr：stdout 是机器可读契约；`--json` 下连进度都关掉——脚本
+    可能把 stderr 一并收进日志，节奏性输出只会造成噪声。
+    """
+    if app_ctx.json:
+        return None
+
+    def tick(elapsed: float, report) -> None:
+        ui.progress(
+            f"等待健康检查 {elapsed:.0f}s："
+            f"L1 {report.l1_process.value}  L2 {report.l2_control.value}  L3 {report.l3_plugin.value}"
+        )
+
+    return tick
 
 
 def _emit_health_warnings(health) -> None:
@@ -677,6 +707,43 @@ def status(
         return
 
 
+def _status_payload(
+    report, *, client_count: int | None = None, proxy_counts: dict[str, int] | None = None
+) -> dict:
+    """`status` / `instances` 共用的 JSON 形状（含 `--watch` 的 NDJSON 行）。"""
+    counts = proxy_counts or {}
+    return {
+        "instance": report.instance,
+        "owner": report.owner.value,
+        "state": report.state.value,
+        "state_corrupted": report.state_corrupted,
+        "pid": report.pid,
+        "uptime_seconds": report.uptime_seconds,
+        "binary": str(report.binary) if report.binary else None,
+        "binary_version": report.binary_version,
+        "disk_version": report.disk_version,
+        "config": str(report.config) if report.config else None,
+        "config_mode": report.config_mode,
+        "listen": None
+        if report.listen is None
+        else {"addr": report.listen.addr, "port": report.listen.port},
+        "systemd_unit": report.systemd_unit,
+        "systemd_main_pid": report.systemd_main_pid,
+        "health": None
+        if report.health is None
+        else {
+            "l1_process": report.health.l1_process.value,
+            "l2_control": report.health.l2_control.value,
+            "l3_plugin": report.health.l3_plugin.value,
+            "detail": report.health.detail,
+        },
+        "clients": client_count,
+        "proxy_type_counts": counts,
+        "proxy_total": sum_proxy_types(counts) if counts else None,
+        "version_hint": report.version_hint,
+    }
+
+
 def _print_status(app_ctx: AppContext, *, compact: bool = False) -> None:
     lc = _lifecycle(app_ctx)
     report = lc.status()
@@ -700,36 +767,7 @@ def _print_status(app_ctx: AppContext, *, compact: bool = False) -> None:
 
     if app_ctx.json:
         ui.emit_json(
-            {
-                "instance": report.instance,
-                "owner": report.owner.value,
-                "state": report.state.value,
-                "state_corrupted": report.state_corrupted,
-                "pid": report.pid,
-                "uptime_seconds": report.uptime_seconds,
-                "binary": str(report.binary) if report.binary else None,
-                "binary_version": report.binary_version,
-                "disk_version": report.disk_version,
-                "config": str(report.config) if report.config else None,
-                "config_mode": report.config_mode,
-                "listen": None
-                if report.listen is None
-                else {"addr": report.listen.addr, "port": report.listen.port},
-                "systemd_unit": report.systemd_unit,
-                "systemd_main_pid": report.systemd_main_pid,
-                "health": None
-                if report.health is None
-                else {
-                    "l1_process": report.health.l1_process.value,
-                    "l2_control": report.health.l2_control.value,
-                    "l3_plugin": report.health.l3_plugin.value,
-                    "detail": report.health.detail,
-                },
-                "clients": client_count,
-                "proxy_type_counts": proxy_counts,
-                "proxy_total": sum_proxy_types(proxy_counts) if proxy_counts else None,
-                "version_hint": report.version_hint,
-            },
+            _status_payload(report, client_count=client_count, proxy_counts=proxy_counts),
             compact=compact,
         )
         return
@@ -910,6 +948,85 @@ def config_get(
         ui.emit(str(value))
 
 
+@config_app.command("list")
+def config_list(
+    ctx: typer.Context,
+    prefix: str = typer.Option("", "--prefix", help="只看某个前缀下的键（点分路径，如 webServer）"),
+    tree: bool = typer.Option(False, "--tree", help="按表分组缩进展示（默认平铺点分键）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出全部配置键（点分路径 + 打码后的值）。
+
+    键名的**发现**入口：不必翻文档或逐个 `config get` 试。敏感值同样打码
+    （`is_secret_key` 判定），要明文用 `config get <key> --reveal`。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    doc = cfg.load_config(app_ctx.config_path)
+    all_entries = cfg.flatten_tree(doc)
+    if prefix:
+        entries = [
+            (key, value)
+            for key, value in all_entries
+            if key == prefix or key.startswith(f"{prefix}.")
+        ]
+        if not entries:
+            raise ConfigKeyMissing(prefix)
+    else:
+        entries = all_entries
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "keys": [
+                    {
+                        "key": key,
+                        "value": ui.mask_secret(value) if cfg.is_secret_key(key) else _plain(value),
+                    }
+                    for key, value in entries
+                ]
+            }
+        )
+        return
+    if tree:
+        for line in _render_tree(entries):
+            ui.emit(line)
+        return
+    for key, value in entries:
+        ui.emit(f"{key} = {_render_leaf(key, value)}")
+
+
+def _render_leaf(key: str, value: object) -> str:
+    """单个键值的展示文本（敏感值打码）。"""
+    if cfg.is_secret_key(key):
+        return ui.mask_secret(value)
+    return json.dumps(_plain(value), ensure_ascii=False, default=str)
+
+
+def _render_tree(entries: list[tuple[str, object]]) -> list[str]:
+    """把点分键列表渲染成按表分组的缩进视图（`config list --tree`）。
+
+    表头用**完整点分路径**（`[transport.tls]`，与 TOML 的实际写法一致），
+    表下叶子统一缩进 2 空格（层级已由表头表达，叶子不必再按深度缩进）；
+    顶层键不缩进。
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for key, value in entries:
+        parts = key.split(".")
+        table = ".".join(parts[:-1])
+        if table and table not in seen:
+            seen.add(table)
+            lines.append(f"[{table}]")
+        indent = "  " if table else ""
+        lines.append(f"{indent}{parts[-1]} = {_render_leaf(key, value)}")
+    return lines
+
+
+def _plain(value: object) -> object:
+    """把 tomlkit 的包装类型转成可 JSON 化的原生值。"""
+    return value.unwrap() if hasattr(value, "unwrap") else value
+
+
 @config_app.command("set")
 def config_set(
     ctx: typer.Context,
@@ -925,23 +1042,32 @@ def config_set(
     app_ctx = _ctx(ctx).with_json(json_output)
     lc = _lifecycle(app_ctx)
 
-    # 2. 内存定点补丁（线上文件此刻未被触碰）
-    plan = cfg.plan_set(app_ctx.config_path, key, value)
-    if plan.is_noop:
-        ui.emit(f"{key} 已经是 {plan.after}，无需变更")
-        return
-
-    outcome = apply_change(
+    # 候选生成（plan）与落盘在**同一把实例锁内**完成（apply_set）：锁外生成
+    # 候选会被并发变更静默覆盖（第四轮 review 实测复现）。noop 同样锁内判定。
+    outcome = apply_set(
         app_ctx.instance,
         dotted=key,
-        new_text=plan.text,
-        change_diff=plan.diff,
-        before=plan.before,
-        after=plan.after,
+        raw=value,
         lifecycle=lc,
         restart=not no_restart,
         health_timeout=health_timeout,
     )
+
+    if outcome.noop:
+        if app_ctx.json:
+            ui.emit_json(
+                {
+                    "key": key,
+                    "before": ui.mask_secret(outcome.before) if cfg.is_secret_key(key) else outcome.before,
+                    "after": ui.mask_secret(outcome.after) if cfg.is_secret_key(key) else outcome.after,
+                    "applied": False,
+                    "restarted": False,
+                    "noop": True,
+                }
+            )
+        else:
+            ui.emit(f"{key} 已经是 {outcome.after}，无需变更")
+        return
 
     if app_ctx.json:
         ui.emit_json(
@@ -966,6 +1092,29 @@ def config_set(
         ui.warn(f"⚠ {outcome.plugin_warning}")
 
 
+def _resolve_editor() -> list[str]:
+    """把 `$EDITOR` 拆成 argv，支持 `EDITOR="vim -u NONE"` 这类带参数的写法。
+
+    此前直接把整个字符串当可执行文件路径：带参数时 `subprocess.call` 抛
+    `FileNotFoundError: 'vim -u NONE'` → "未分类错误(1)"，而这是完全正常的
+    配置方式。引号不配对（`EDITOR="'vim"`）时给出用法错误(2) 与可行动提示，
+    而不是让 shlex 的裸 `ValueError` 冒出去。
+    """
+    import shlex
+
+    raw = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    try:
+        argv = shlex.split(raw)
+    except ValueError as exc:
+        raise UsageError(
+            f"无法解析 EDITOR={raw!r}：{exc}",
+            hint="检查引号是否配对，或改用不带引号的写法（如 EDITOR=vim）",
+        ) from None
+    if not argv:
+        raise UsageError("EDITOR 为空", hint="设置 EDITOR=vim，或手工编辑配置文件")
+    return argv
+
+
 @config_app.command("edit")
 def config_edit(
     ctx: typer.Context,
@@ -986,11 +1135,10 @@ def config_edit(
 
     app_ctx = _ctx(ctx)
     lc = _lifecycle(app_ctx)
-    original = app_ctx.config_path.read_text("utf-8")
+    original = cfg.read_config_text(app_ctx.config_path)  # 缺文件 → ConfigError(3)
 
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    editor_argv = _resolve_editor()
     # 同 validate_text：先拿到路径再写，否则写失败会把含机密的草稿留在 /tmp
-    # 同上：先拿路径再写，保证写失败时 /tmp 不残留含机密的草稿
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
         "w", suffix=".toml", delete=False, encoding="utf-8"
     )
@@ -998,7 +1146,7 @@ def config_edit(
     try:
         with handle:
             handle.write(original)
-        code = subprocess.call([editor, str(draft_path)])
+        code = subprocess.call([*editor_argv, str(draft_path)])
         if code != 0:
             raise ConfigError(f"编辑器退出码 {code}，放弃变更")
         draft = draft_path.read_text("utf-8")
@@ -1016,18 +1164,19 @@ def config_edit(
         ui.emit("已放弃")
         return
 
-    outcome = apply_change(
+    # 编辑器交互在锁外（不能持锁等用户），写回由 apply_edit 在锁内做 CAS：
+    # 编辑期间若有人改过配置，草稿会被拒绝而不是覆盖别人的改动。
+    outcome = apply_edit(
         app_ctx.instance,
-        dotted="(edit)",
-        new_text=draft,
-        change_diff=diff,
-        before="(edited)",
-        after="(edited)",
+        draft=draft,
+        expected_current=original,
         lifecycle=lc,
         restart=True,
         health_timeout=health_timeout,
     )
-    if outcome.note:
+    if outcome.noop:
+        ui.emit("没有改动")
+    elif outcome.note:
         ui.emit(f"✓ {outcome.note}")
     else:
         ui.emit("✓ 已写入并重启，健康检查通过")
@@ -1041,16 +1190,22 @@ def config_diff(
 ) -> None:
     """当前配置 vs 历史快照（unified diff）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
-    entries = app_ctx.instance.history_entries()
-    if not entries:
-        raise ConfigError("没有配置快照", hint="快照在每次 config set / edit 时自动创建")
-    index = max(0, steps - 1)
-    if index >= len(entries):
-        raise ConfigError(f"只找到 {len(entries)} 份快照")
-    snapshot = entries[index] / "frps.toml"
-    if not snapshot.exists():
-        raise ConfigError(f"快照不完整：{snapshot}")
-    diff = cfg.diff_texts(snapshot.read_text("utf-8"), app_ctx.config_path.read_text("utf-8"), "frps.toml")
+    inst = app_ctx.instance
+    # 锁内读两份文本：锁外读时"选中的快照"与"当前文本"可能来自不同时刻，
+    # 展示的差异与真实状态不符（并发 config set 正在推进历史的窗口）。
+    with instance_lock(inst.lock):
+        entries = inst.history_entries()
+        if not entries:
+            raise ConfigError("没有配置快照", hint="快照在每次 config set / edit 时自动创建")
+        index = max(0, steps - 1)
+        if index >= len(entries):
+            raise ConfigError(f"只找到 {len(entries)} 份快照")
+        snapshot = entries[index] / "frps.toml"
+        if not snapshot.exists():
+            raise ConfigError(f"快照不完整：{snapshot}")
+        snapshot_text = snapshot.read_text("utf-8")
+        current_text = cfg.read_config_text(inst.config)
+    diff = cfg.diff_texts(snapshot_text, current_text, "frps.toml")
     if app_ctx.json:
         ui.emit_json({"snapshot": str(snapshot.parent), "diff": cfg.mask_diff(diff)})
     else:
@@ -1177,6 +1332,30 @@ def service_status(
             ui.emit(f"main pid : {pid}")
 
 
+@service_app.command("logs")
+def service_logs(
+    ctx: typer.Context,
+    lines: int = typer.Option(100, "--lines", "-n", min=1, help="显示行数"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪"),
+) -> None:
+    """查看 systemd 托管的实例日志（`journalctl -u frps@<name>`）。
+
+    frp 自己的日志文件用 `frpsctl log`；unit 级日志（启动失败、OOM、权限拒绝）
+    只在 journald 里，只有 journalctl 能看到。
+    """
+    app_ctx = _ctx(ctx)
+    import shutil as _shutil
+
+    if _shutil.which("journalctl") is None:
+        raise UsageError(
+            "找不到 journalctl（journald 不可用）",
+            hint="用 `frpsctl log` 查看 frp 自己的日志文件，或安装 systemd-journald",
+        )
+    systemd = Systemd(app_ctx.instance)
+    # 终端接管类操作（同 `start --foreground`）：argv 由 core 构造，CLI 负责执行
+    raise typer.Exit(subprocess.call(systemd.journal_argv(lines=lines, follow=follow)))
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -1222,20 +1401,140 @@ def kick(
 ) -> None:
     """下线指定代理（`DELETE /api/proxies`）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
-    client = _admin(app_ctx)
-    if client is None:
-        # 退出码 7 而不是 3：§7.3 把"dashboard 不可达/未启用"定义为 7，
-        # 脚本据此区分"配置写错了"与"这个功能当前不可用"。
-        raise AdminUnreachable(
-            "dashboard 未启用（webServer.port = 0），无法下线代理",
-            hint="kick 依赖 Admin API；请在配置里设置 webServer.port",
-        )
+    client = _require_admin(app_ctx, feature="下线代理")
     with client:
         client.kick(proxy_name)
     if app_ctx.json:
         ui.emit_json({"kicked": proxy_name})
     else:
         ui.emit(f"已下线代理 {proxy_name}")
+
+
+@app.command()
+def clients(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出在线客户端（v2 Admin API，自动翻页取全量）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    admin = _require_admin(app_ctx, feature="列出客户端")
+    with admin:
+        items = admin.list_clients()
+
+    if app_ctx.json:
+        ui.emit_json({"clients": items})
+        return
+    if not items:
+        ui.emit("没有在线客户端")
+        return
+    ui.emit(f"{'name':<28} {'user':<10} {'hostname':<20} {'online':<7} {'ip':<16} version")
+    for item in items:
+        ui.emit(
+            f"{_text(item.get('key')):<28} {_text(item.get('user')):<10} "
+            f"{_text(item.get('hostname')):<20} {str(bool(item.get('online'))):<7} "
+            f"{_text(item.get('clientIP')):<16} {_text(item.get('version'))}"
+        )
+
+
+@app.command()
+def proxies(
+    ctx: typer.Context,
+    ptype: str = typer.Option("", "--type", help="只看某类型（tcp/udp/http/https/stcp/xtcp/tcpmux/sudp）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出代理（v2 Admin API，自动翻页取全量）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    admin = _require_admin(app_ctx, feature="列出代理")
+    with admin:
+        items = admin.list_proxies()
+    if ptype:
+        items = [item for item in items if item.type == ptype]
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "proxies": [
+                    {
+                        "name": item.name,
+                        "user": item.user,
+                        "type": item.type,
+                        "remote_port": item.remote_port,
+                        "phase": item.phase,
+                        "cur_conns": item.cur_conns,
+                        "today_traffic_in": item.today_traffic_in,
+                        "today_traffic_out": item.today_traffic_out,
+                    }
+                    for item in items
+                ]
+            }
+        )
+        return
+    if not items:
+        ui.emit("没有代理")
+        return
+    ui.emit(f"{'name':<28} {'user':<10} {'type':<7} {'port':<6} {'phase':<8} {'conns':<6} traffic(in/out)")
+    for item in items:
+        port = str(item.remote_port) if item.remote_port else "-"
+        traffic = f"{ui.human_bytes(item.today_traffic_in)} / {ui.human_bytes(item.today_traffic_out)}"
+        ui.emit(
+            f"{item.name:<28} {item.user:<10} {item.type:<7} {port:<6} "
+            f"{item.phase:<8} {item.cur_conns:<6} {traffic}"
+        )
+
+
+@app.command()
+def instances(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    health: bool = typer.Option(
+        False, "--health", help="同时做三层健康探测（每个运行中的实例一次网络往返）"
+    ),
+) -> None:
+    """列出全部实例的一行式概览（多实例运维入口）。
+
+    默认只读本地状态（owner / state / pid / 版本），不做网络探测；
+    `--health` 会额外跑三层健康检查。逐实例用各自的配置与软链，
+    不继承 `--binary`（巡检关心的是"每个实例现在什么情况"）。
+    """
+    from dataclasses import replace
+
+    app_ctx = _ctx(ctx).with_json(json_output)
+    root = app_ctx.instance.instances_root
+    found = list_instances(root, data_home=app_ctx.instance.data_home)
+
+    reports = []
+    for inst in found:
+        lc = Lifecycle(inst)
+        report = lc.status()
+        if health and report.state in (State.RUNNING, State.SYSTEMD_ACTIVE):
+            with contextlib.suppress(FrpsctlError):
+                report = replace(
+                    report, health=lc.check_health(expect_pid=report.systemd_main_pid)
+                )
+        reports.append(report)
+
+    if app_ctx.json:
+        ui.emit_json({"instances": [_status_payload(report) for report in reports]})
+        return
+    if not reports:
+        ui.emit(f"未找到任何实例（{root}）")
+        ui.emit("用 `frpsctl init` 创建第一个实例。")
+        return
+    for report in reports:
+        if report.state is State.RUNNING:
+            state_text = f"RUNNING (pid {report.pid}, up {ui.human_duration(report.uptime_seconds)})"
+        elif report.state is State.SYSTEMD_ACTIVE:
+            state_text = f"SYSTEMD_ACTIVE (pid {report.systemd_main_pid})"
+        else:
+            state_text = report.state.value
+        version_text = f"  frps {report.binary_version}" if report.binary_version else ""
+        health_text = f"  {report.health.render()}" if report.health is not None else ""
+        ui.emit(f"{report.instance:<16} {report.owner.value:<8} {state_text}{version_text}{health_text}")
+
+
+def _text(value: object) -> str:
+    """渲染用：None 显示为 "-"，其余 str()。"""
+    return "-" if value is None or value == "" else str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -1498,6 +1797,113 @@ def plugin_serve(
         # 覆盖 Ctrl-C 与 systemd stop；它自己负责 close()（含审计刷盘），此处不重复。
         ui.emit("")
         ui.emit(f"已停止。{server.audit.describe()}")
+
+
+def _frpsctl_executable() -> Path:
+    """当前 frpsctl 的可执行文件路径（写进插件 unit 的 ExecStart）。
+
+    systemd 不读 PATH，必须是绝对路径。优先 `shutil.which`（全局安装时最可靠），
+    其次 `sys.argv[0]`（开发态直接跑 venv 脚本）。`python -m frpsctl` 时
+    argv[0] 是 `__main__.py`、不可直接执行——两种都拿不到就明确报错，
+    而不是把一个坏路径写进 unit（错误会在 systemctl start 时才炸）。
+    """
+    import shutil as _shutil
+    import sys as _sys
+
+    found = _shutil.which("frpsctl")
+    if found is not None:
+        return Path(found).resolve()
+    argv0 = Path(_sys.argv[0])
+    if argv0.exists() and os.access(argv0, os.X_OK) and "frpsctl" in argv0.name:
+        return argv0.resolve()
+    raise UsageError(
+        "无法确定 frpsctl 可执行文件路径（unit 的 ExecStart 需要绝对路径）",
+        hint="请用 PATH 里的 `frpsctl` 命令运行本命令（而不是 python -m frpsctl）",
+    )
+
+
+@plugin_service_app.command("install")
+def plugin_service_install(
+    ctx: typer.Context,
+    bind: str = typer.Option("127.0.0.1:8080", "--bind", help="监听地址（必须回环）"),
+    handler_path: str = typer.Option(
+        "/handler", "--path", help="回调路径（需与 frps 的 httpPlugins.path 一致）"
+    ),
+    policy: Path = typer.Option(None, "--policy", help="策略文件（默认 <实例>/plugin-policy.json）"),
+    user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行插件的系统用户（需已存在）"),
+    group: str = typer.Option(None, "--group", help="运行插件的系统组（默认与 --user 相同）"),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """安装 frpsctl-plugin@.service 并 enable（需要 root）。
+
+    渲染前体检：服务账户存在、frpsctl 对服务用户可达且不在家目录
+    （`ProtectHome=true`）、策略文件存在且合法、绑定地址为回环。
+    任何一项不满足都当场拒绝——装一个起不来的 unit 比不装更浪费时间。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    policy_path, _ = _load_policy(app_ctx, policy)  # 不存在/非法 JSON 在这里就会拒绝
+    service = PluginService(app_ctx.instance)
+    path = service.install_template(
+        exec_start=_frpsctl_executable(),
+        policy=policy_path,
+        bind=bind,
+        handler_path=handler_path,
+        force=force,
+        user=user,
+        group=group,
+    )
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "unit": service.unit_name,
+                "template": str(path),
+                "bind": bind,
+                "policy": str(policy_path),
+                "user": user,
+                "group": group or user,
+            }
+        )
+        return
+    ui.emit(f"已安装 {path}")
+    ui.emit(f"实例 unit：{service.unit_name}（User={user}, Group={group or user}）")
+    ui.emit("")
+    ui.emit(f"启动：sudo systemctl start {service.unit_name}")
+    ui.emit("已 enable（开机自启）；停用：frpsctl plugin service uninstall")
+
+
+@plugin_service_app.command("uninstall")
+def plugin_service_uninstall(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停用并删除插件 unit 模板（需要 root）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = PluginService(app_ctx.instance)
+    service.uninstall()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "removed": True})
+    else:
+        ui.emit(f"已停用并移除 {service.unit_name}")
+
+
+@plugin_service_app.command("status")
+def plugin_service_status(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """显示插件服务的 systemd 托管状态。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = PluginService(app_ctx.instance)
+    active = service.is_active()
+    pid = service.main_pid() if active else None
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "active": active, "main_pid": pid})
+        return
+    ui.emit(f"unit     : {service.unit_name}")
+    ui.emit(f"active   : {active}")
+    if pid:
+        ui.emit(f"main pid : {pid}")
 
 
 def main() -> None:
