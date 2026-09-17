@@ -70,7 +70,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # 测试里断言宽泛、参数未用、硬编码口令都是刻意的
-"tests/*" = ["ARG001", "ARG002", "PT011", "S105", "S106", "S108", "B011"]
+"tests/*" = ["ARG001", "ARG002", "S105", "S106", "S108", "B011"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

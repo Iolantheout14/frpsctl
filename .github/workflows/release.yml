@@ -57,6 +57,7 @@ jobs:
               "frpsctl/core/lifecycle.py",
               "frpsctl/core/diagnostics.py",
               "frpsctl/core/uninstall.py",
+              "frpsctl/core/auditlog.py",
               # 前端是 package data：丢它 = 管理台页面 500，而 CLI 测试全绿
               "frpsctl/web/static/index.html",
           }

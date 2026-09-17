@@ -82,6 +82,12 @@ jobs:
           .venv/bin/frpsctl config set maxPortsPerClient 30
           .venv/bin/frpsctl status --json
           .venv/bin/frpsctl doctor
+          # v0.2.6：doctor --json 的 counts 三键必须存在（可见性增强的冒烟面）
+          .venv/bin/frpsctl doctor --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert set(d['counts']) == {'error','warn','info'}, d"
+          # v0.2.6：策略级设置的结构化编辑（策略放实例目录——Web 审计视图按同一规则查找）
+          .venv/bin/frpsctl plugin init
+          .venv/bin/frpsctl plugin config set reject_log_burst 40
+          .venv/bin/frpsctl plugin config list --json | python3 -c "import json,sys; assert json.load(sys.stdin)['settings']['reject_log_burst'] == 40"
           .venv/bin/frpsctl stop
           .venv/bin/frpsctl status
 
@@ -95,7 +101,7 @@ jobs:
           WEB_PID=$!
           sleep 2
           python3 - "$WP" <<'EOF'
-          import json, sys, urllib.request
+          import json, sys, urllib.error, urllib.request
 
           base = f"http://127.0.0.1:{int(sys.argv[1])}"
           login = urllib.request.Request(
@@ -142,7 +148,18 @@ jobs:
           assert favicon.status == 204
           html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
           assert "frpsctl 管理台" in html
-          print("web 冒烟通过：login / session / status / config / history / diff / favicon / 静态页")
+          # v0.2.6：只读体检（counts 三键）与审计视图（策略已由 CLI 冒烟生成于实例目录）
+          doctor = call("/api/doctor")
+          assert set(doctor["counts"]) == {"error", "warn", "info"}, doctor
+          audit = call("/api/audit")
+          assert audit["available"] is True and audit["path"].endswith("plugin-audit.jsonl"), audit
+          # 统计类端点在实例未运行时报 502（dashboard 不可达）——语义化错误契约
+          try:
+              call("/api/traffic")
+              raise AssertionError("实例未运行时 /api/traffic 应当 502")
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 502, exc.code
+          print("web 冒烟通过：login / session / status / config / history / diff / doctor / audit / traffic-502 / favicon / 静态页")
           EOF
           kill "$WEB_PID"
           wait "$WEB_PID" 2>/dev/null || true
