@@ -54,9 +54,12 @@ _INDEX_CSP = (
 @dataclass(frozen=True)
 class WebSettings:
     bind: str = "127.0.0.1:8787"
-    password: str = ""
     #: 是否打访问日志（默认关闭：每请求两行太吵；排查时打开）。
     access_log: bool = False
+    #: 在反向代理后运行时，用 `X-Forwarded-For` 的**最后一跳**作为登录限速来源。
+    #: **默认关闭**：不开启时该头完全不被读取——伪造它既不能绕开限速，也不能
+    #: 制造新来源。开启的前提是"前面确实有一层会重写该头的可信代理"。
+    trusted_proxy: bool = False
 
     @property
     def host(self) -> str:
@@ -157,7 +160,7 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
         def _handle_login(self, payload: dict[str, Any]) -> None:
             session = ctx.auth.login(
                 str(payload.get("password") or ""),
-                source=f"{self.client_address[0]}",
+                source=self._login_source(),
             )
             if session is None:
                 # 口令错误与被限速的响应**完全一致**（不给爆破者信号）
@@ -185,6 +188,21 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 return None
             morsel = cookie.get(SESSION_COOKIE)
             return ctx.auth.check_session(morsel.value if morsel is not None else None)
+
+        def _login_source(self) -> str:
+            """登录限速的来源标识。
+
+            **为什么只取 XFF 的最后一跳**：该头是链式的，最左端可被客户端伪造；
+            最后一跳是最靠近我们的代理写入的——反代的两种标准写法
+            （`$proxy_add_x_forwarded_for` 追加、`$remote_addr` 覆盖）都保证
+            它就是真实来源。默认（trusted_proxy=False）**完全不读该头**。
+            """
+            if settings.trusted_proxy:
+                forwarded = self.headers.get("X-Forwarded-For", "")
+                hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+                if hops:
+                    return hops[-1]
+            return f"{self.client_address[0]}"
 
         # --- 请求体 ----------------------------------------------------
 
@@ -281,6 +299,11 @@ class WebServer:
         handler = _make_handler(self.ctx, self.settings, self._static or STATIC_INDEX)
         self._httpd = ThreadingHTTPServer((self.settings.host, self.settings.port), handler)
         self._httpd.daemon_threads = True
+        # 未 accept 的连接队列上限（backlog）。管理台不面向高并发，设一个小值
+        # 让过载时的行为可预期（多出的连接被内核拒绝，而不是无限排队）。
+        # 注意这是**唯一**的并发护栏：请求线程数没有上限（单机管理工具，
+        # 见 README"已知边界"）。
+        self._httpd.request_queue_size = 64
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="frpsctl-web", daemon=True
         )

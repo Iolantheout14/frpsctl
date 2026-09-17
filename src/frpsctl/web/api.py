@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import secrets
 import threading
 import time
@@ -28,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from ..core import config as cfg
-from ..core.admin import AdminClient
+from ..core.admin import TRAFFIC_MAX_PROXIES, AdminClient
 from ..core.healthcheck import parse_dashboard
 from ..core.instance import Instance
 from ..core.lifecycle import HealthReport, Lifecycle, State
@@ -51,9 +53,6 @@ PREVIEW_TTL = 600.0
 
 #: 未消费的预览条目上限：已登录用户正常交互远小于它；上限防内存堆积。
 MAX_PENDING_PREVIEWS = 32
-
-#: 趋势端点最多查多少个代理（每个一次 dashboard 请求）。
-TRAFFIC_MAX_PROXIES = 50
 
 #: 日志接口一次最多返回的行数（防止把大日志一次性拉爆浏览器）。
 MAX_LOG_LINES = 2000
@@ -170,6 +169,8 @@ def _route(
             return 200, traffic_payload(ctx)
         if path == "/api/config":
             return 200, config_payload(ctx)
+        if path == "/api/config/history":
+            return 200, history_payload(ctx)
         if path == "/api/logs":
             return 200, logs_payload(ctx, query.get("lines"))
         return 404, {"error": f"未知接口：GET {path}"}
@@ -309,6 +310,36 @@ def config_payload(ctx: WebContext) -> dict:
     return {"entries": entries}
 
 
+def history_payload(ctx: WebContext) -> dict:
+    """配置快照列表（新 → 旧）。`steps` 与 `config rollback N` 语义一致。
+
+    只读 `meta.json`（时间 / 动作 / 是否有配置），**不读快照里的配置原文**：
+    快照是完整配置副本（含 token 与口令），没有理由把它们读进 Web 进程再考虑
+    "要不要打码下发"。回滚仍由 `rollback_to` 在服务端执行（它与 CLI 共用）。
+    """
+    entries = []
+    for index, entry in enumerate(ctx.inst.history_entries()):
+        meta: dict = {}
+        meta_path = entry / "meta.json"
+        if meta_path.exists():
+            try:
+                data = json.loads(meta_path.read_text("utf-8"))
+                if isinstance(data, dict):
+                    meta = data
+            except (OSError, ValueError):
+                meta = {}  # 元数据损坏不该让整个历史列表不可用
+        entries.append(
+            {
+                "steps": index + 1,
+                "name": entry.name,
+                "at": str(meta.get("at") or ""),
+                "action": str(meta.get("action") or ""),
+                "has_config": (entry / "frps.toml").exists(),
+            }
+        )
+    return {"entries": entries}
+
+
 def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
     try:
         lines = int(lines_raw) if lines_raw else 200
@@ -326,13 +357,13 @@ def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
 
 def action_payload(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
     lc = Lifecycle(ctx.inst)
-    health_timeout = _float(body.get("health_timeout"), 10.0)
+    health_timeout = _bounded_float(body.get("health_timeout"), 10.0)
 
     if action == "start":
         report = lc.start(health_timeout=health_timeout)
         return {"pid": report.pid, "healthy": report.healthy, "health": _health(report.health)}
     if action == "stop":
-        lc.stop(timeout=_float(body.get("timeout"), 10.0))
+        lc.stop(timeout=_bounded_float(body.get("timeout"), 10.0))
         return {"stopped": True}
     if action == "restart":
         report = lc.restart(health_timeout=health_timeout)
@@ -347,7 +378,7 @@ def action_payload(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
     if action == "rollback":
         outcome = rollback_to(
             ctx.inst,
-            steps=_int(body.get("steps"), 1),
+            steps=_bounded_int(body.get("steps"), 1),
             lifecycle=lc,
             restart=True,
             health_timeout=health_timeout,
@@ -438,15 +469,41 @@ def config_apply(ctx: WebContext, body: dict[str, Any]) -> dict:
     }
 
 
-def _float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+def _bounded_float(value: Any, default: float, *, minimum: float = 0.0, maximum: float = 3600.0) -> float:
+    """动作参数里的秒数：缺失/None → 默认值；给出但越界或非数值 → 用法错误(400)。
+
+    **不能宽松回退默认**：`stop` 的 `timeout` 负值会让 `_wait_gone` 的 deadline
+    落在过去、直接升级 SIGKILL（CLI 侧的同类问题在 v0.2.0 已修，这里是它的
+    镜像）。参数笔误绝不该造成不可逆动作，因此越界一律拒绝并说明范围。
+
+    `bool` 必须显式排除：`float(True) == 1.0`，否则 `{"timeout": true}` 会被
+    当成"1 秒"静默接受（与 `_bounded_int` 同一条纪律）。
+    """
+    if value is None:
         return default
+    if isinstance(value, bool):
+        raise UsageError(f"数值参数不能是布尔值：{value!r}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise UsageError(f"数值参数非法：{value!r}") from None
+    if math.isnan(parsed) or not (minimum <= parsed <= maximum):
+        raise UsageError(f"数值越界（{minimum:g}..{maximum:g}）：{value!r}")
+    return parsed
 
 
-def _int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 1000) -> int:
+    """整数动作参数（rollback steps）：语义同 `_bounded_float`。"""
+    if value is None:
         return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        try:
+            text = str(value).strip()
+            parsed = int(text)
+        except (TypeError, ValueError):
+            raise UsageError(f"整数参数非法：{value!r}") from None
+    else:
+        parsed = value
+    if not (minimum <= parsed <= maximum):
+        raise UsageError(f"整数越界（{minimum}..{maximum}）：{value!r}")
+    return parsed

@@ -34,6 +34,12 @@ SESSION_COOKIE = "frpsctl_session"
 FAILURE_WINDOW = 60.0
 MAX_FAILURES = 5
 
+#: 失败来源表上限。窗口清理只在 login 时发生——持续、分散的失败请求会在
+#: 窗口内堆积任意多的来源条目（慢速内存放大）。超过上限时驱逐最早失败的来源；
+#: 攻击者要借此"挤掉"某个来源的限速记录，必须先把窗口内的失败来源填满
+#: （上限 1024 个），成本远高于直接停手。
+MAX_TRACKED_SOURCES = 1024
+
 #: 默认会话有效期（8 小时）。
 DEFAULT_SESSION_TTL = 8 * 3600.0
 
@@ -91,6 +97,9 @@ class AuthManager:
             if not hmac.compare_digest(password, self._password):
                 fails.append(now)
                 self._failures[source] = fails
+                # 追加后立刻收敛到上限：任意时刻来源表都保持有界（若只在下次
+                # login 的 prune 里收敛，表会长到 MAX+1 且"有界"语义变得模糊）。
+                self._cap_sources()
                 return None
             self._failures.pop(source, None)
             session = Session(
@@ -140,3 +149,12 @@ class AuthManager:
                 self._failures[source] = kept
             else:
                 self._failures.pop(source, None)
+        # 来源表上限（见 MAX_TRACKED_SOURCES 的说明）：窗口内的来源数也必须
+        # 有界，否则"每次失败一个新来源"就能持续放大内存。
+        self._cap_sources()
+
+    def _cap_sources(self) -> None:
+        """把来源表收敛到上限，驱逐最早失败的来源（持锁调用）。"""
+        while len(self._failures) > MAX_TRACKED_SOURCES:
+            oldest = min(self._failures, key=lambda source: self._failures[source][0])
+            self._failures.pop(oldest, None)

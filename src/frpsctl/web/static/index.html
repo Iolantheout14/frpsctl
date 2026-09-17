@@ -192,9 +192,7 @@
       </section>
       <section class="card">
         <h2>历史与回滚</h2>
-        <div class="row">
-          <button id="cfg-rollback">回滚到上一份快照（重启服务）</button>
-        </div>
+        <div id="history-table" class="muted">加载中…</div>
       </section>
     </div>
   </main>
@@ -535,6 +533,7 @@ async function loadConfig() {
   dirty.clear();
   updateDirtyCount();
   $("cfg-preview-card").classList.add("hidden");
+  loadHistory();
   try {
     const data = await api("/api/config");
     configEntries = data.entries || [];
@@ -601,14 +600,34 @@ $("cfg-preview").addEventListener("click", previewChanges);
 $("cfg-apply").addEventListener("click", applyPreview);
 $("cfg-cancel").addEventListener("click", () => $("cfg-preview-card").classList.add("hidden"));
 $("cfg-reset").addEventListener("click", loadConfig);
-$("cfg-rollback").addEventListener("click", async () => {
-  if (!confirm("确认回滚到上一份配置快照并重启？")) return;
+
+/* ---------- 历史与回滚 ---------- */
+async function loadHistory() {
   try {
-    await api("/api/actions/rollback", { method: "POST", body: { steps: 1 } });
+    const data = await api("/api/config/history");
+    const rows = (data.entries || []).map((entry) => el("tr", {}, [
+      el("td", { text: entry.name }),
+      el("td", { text: entry.action || "-" }),
+      el("td", { text: entry.at || "-" }),
+      el("td", {}, [el("button", {
+        text: "回滚到此份",
+        onclick: () => rollbackTo(entry.steps, entry.name),
+      })]),
+    ]));
+    $("history-table").replaceChildren(tableOf(["快照", "操作", "时间", ""], rows));
+  } catch (err) {
+    $("history-table").textContent = "历史读取失败：" + err.message;
+  }
+}
+async function rollbackTo(steps, name) {
+  if (!confirm(`确认回滚到快照 ${name}（${steps} 步前）并重启服务？`)) return;
+  try {
+    await api("/api/actions/rollback", { method: "POST", body: { steps } });
     toast("已回滚并重启", "ok");
-    loadConfig(); refresh();
+    loadConfig();
+    refresh();
   } catch (err) { toast("回滚失败：\n" + err.message, "err"); }
-});
+}
 
 /* ---------- 启动 ---------- */
 async function restoreSession() {
