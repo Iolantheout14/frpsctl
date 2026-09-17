@@ -90,6 +90,7 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
     findings.extend(_check_ownership(inst, owner=owner, state=state, ref=ref))
     findings.extend(_check_lock(inst))
     findings.extend(_check_plugins(inst))
+    findings.extend(_check_web_password_file(inst))
 
     return DoctorReport(instance=inst.name, findings=findings)
 
@@ -463,6 +464,34 @@ def _check_lock(inst: Instance) -> list[Finding]:
             )
         ]
     return []
+
+
+def _check_web_password_file(inst: Instance) -> list[Finding]:
+    """Web 管理台口令文件的权限（`web service install` 生成，0600）。
+
+    未部署管理台时文件不存在——那是常态，不产生任何输出。文件存在却权限过宽
+    时必须报出来：它含登录口令，同一台机器上的其他用户能读到就等于拿到了
+    管理台的完整控制权（改配置、停服务）。
+    """
+    from .systemd import WebService
+
+    path = WebService(inst).password_file
+    if not path.exists():
+        return []
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return [Finding("Web 口令文件", Severity.WARN, f"无法读取权限：{path}")]
+    if mode & 0o077:
+        return [
+            Finding(
+                "Web 口令文件",
+                Severity.WARN,
+                f"{path} 权限为 {oct(mode)[2:].zfill(4)}（应 0600）",
+                "它含管理台登录口令：chmod 600 该文件",
+            )
+        ]
+    return [Finding("Web 口令文件", Severity.INFO, "0600 正常")]
 
 
 def _check_plugins(inst: Instance) -> list[Finding]:

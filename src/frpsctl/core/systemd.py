@@ -219,13 +219,19 @@ def render_web_unit(
     user: str = DEFAULT_SERVICE_USER,
     group: str | None = None,
     allow_non_loopback: bool = False,
+    trusted_proxy: bool = False,
 ) -> str:
     """渲染 Web 管理台 unit 模板。
 
     口令走 `--password-file`（0600），**绝不写进 unit 命令行**——unit 文件是
-    0644，写明文等于向本机所有用户公开管理台。`--allow-non-loopback` 只在
-    绑定地址非回环时渲染出来（CLI 层已要求显式开关）。
+    0644，写明文等于向本机所有用户公开管理台。`--allow-non-loopback` 与
+    `--trusted-proxy` 只在显式要求时渲染（CLI 层已做前置校验）。
     """
+    flags: list[str] = []
+    if allow_non_loopback:
+        flags.append("--allow-non-loopback")
+    if trusted_proxy:
+        flags.append("--trusted-proxy")
     return WEB_UNIT_TEMPLATE.format(
         exec_start=exec_start,
         bind=bind,
@@ -233,7 +239,7 @@ def render_web_unit(
         workdir=workdir,
         user=user,
         group=group or user,
-        extra=" --allow-non-loopback" if allow_non_loopback else "",
+        extra=f" {' '.join(flags)}" if flags else "",
     )
 
 
@@ -837,6 +843,7 @@ class WebService:
         force: bool = False,
         user: str = DEFAULT_SERVICE_USER,
         group: str | None = None,
+        trusted_proxy: bool = False,
     ) -> tuple[Path, str]:
         """安装 `frpsctl-web@.service` 并准备口令文件。**需要 root**。
 
@@ -904,6 +911,7 @@ class WebService:
             user=user,
             group=group,
             allow_non_loopback=not is_loopback(bind),
+            trusted_proxy=trusted_proxy,
         )
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         self.template_path.write_text(content, "utf-8")
