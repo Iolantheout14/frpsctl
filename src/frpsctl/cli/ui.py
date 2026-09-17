@@ -63,15 +63,16 @@ def trace(text: str) -> None:
 
 
 def mask_secret(value: object, *, reveal: bool = False) -> str:
-    """打码。空值显示为 `(empty)`，便于区分"没设"和"设了但打码"。"""
+    """打码。空值显示为 `(empty)`，便于区分"没设"和"设了但打码"。
+
+    实现委托 `core.config.mask_value`（全项目唯一实现）——Web 管理台与 CLI
+    必须用同一套打码规则。
+    """
     if reveal:
         return str(value)
-    text = "" if value is None else str(value)
-    if not text:
-        return "(empty)"
-    if len(text) <= 4:
-        return _MASK
-    return f"{text[:2]}{_MASK}{text[-2:]}"
+    from ..core.config import mask_value
+
+    return mask_value(value)
 
 
 def emit(text: str = "") -> None:

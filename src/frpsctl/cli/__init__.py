@@ -25,14 +25,15 @@ from ..core import doctor as doc
 from ..core import healthcheck, release
 from ..core import platform as plat
 from ..core.admin import AdminClient, sum_proxy_types
-from ..core.instance import Instance, list_instances
+from ..core.instance import list_instances
 from ..core.lifecycle import Lifecycle, StartReport, State
 from ..core.lock import instance_lock
-from ..core.systemd import DEFAULT_SERVICE_USER, PluginService, Systemd
+from ..core.systemd import DEFAULT_SERVICE_USER, PluginService, Systemd, WebService
 from ..core.transaction import apply_edit, apply_set, rollback_to
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
+from ..web import WebServer, WebSettings, build_web_context
 from ..errors import (
     AdminUnreachable,
     ConfigError,
@@ -128,10 +129,14 @@ config_app = typer.Typer(no_args_is_help=True, help="配置读写与变更闭环
 service_app = typer.Typer(no_args_is_help=True, help="systemd 集成。")
 plugin_app = typer.Typer(no_args_is_help=True, help="服务端插件：多用户鉴权 + 端口白名单 + 审计。")
 plugin_service_app = typer.Typer(no_args_is_help=True, help="插件服务的 systemd 集成。")
+web_app = typer.Typer(no_args_is_help=True, help="Web 管理台（内置界面，含进程控制与配置编辑）。")
+web_service_app = typer.Typer(no_args_is_help=True, help="Web 管理台的 systemd 集成。")
 app.add_typer(config_app, name="config")
 app.add_typer(service_app, name="service")
 app.add_typer(plugin_app, name="plugin")
+app.add_typer(web_app, name="web")
 plugin_app.add_typer(plugin_service_app, name="service")
+web_app.add_typer(web_service_app, name="service")
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +663,7 @@ def _require_healthy(report: StartReport) -> None:
     """健康 gate（L1 ∧ L2）未通过时以退出码 12 收场（§3.7）。
 
     为什么必须非零：`start` 的语义是"服务可用"，而 gate 失败意味着控制面
-    （dashboard / Admin API）不可达——status 的统计、kick、以及依赖它的
+    （dashboard / Admin API）不可达——status 的统计、prune、以及依赖它的
     运维动作全都取不到数。此前这条路径**完全静默**（退出码 0、stderr 无
     告警），脚本会把"dashboard 起不来"当成成功；这正是"降级必须可见"要防的。
 
@@ -837,7 +842,9 @@ def log(
     """
     app_ctx = _ctx(ctx)
     inst = app_ctx.instance
-    target = _resolve_log_target(inst, app_ctx.config_path)
+    from ..core.logs import resolve_log_target
+
+    target = resolve_log_target(inst)
 
     if not target.exists():
         # 不是"实例未运行"——实例可能在跑，只是配置里的 log.to 指向了别处。
@@ -902,22 +909,6 @@ def _reopen_if_rotated(path: Path, handle):
         # 文件刚被移走、新的还没建：保持旧 handle，下一轮再试
         pass
     return handle
-
-
-def _resolve_log_target(inst: Instance, config_path: Path) -> Path:
-    """从配置的 `log.to` 解析日志路径；为 `console` 或缺失时回退。"""
-    import tomllib
-
-    try:
-        data = tomllib.loads(config_path.read_text("utf-8"))
-    except Exception:
-        data = {}
-    to = (data.get("log") or {}).get("to")
-    if isinstance(to, str) and to and to.lower() != "console":
-        candidate = Path(to)
-        return candidate if candidate.is_absolute() else (config_path.parent / candidate)
-    latest = inst.latest_startup_log()
-    return latest or inst.log_file
 
 
 # ---------------------------------------------------------------------------
@@ -1250,7 +1241,7 @@ def config_rollback(
 
 
 # ---------------------------------------------------------------------------
-# service / doctor / kick
+# service / doctor / prune
 # ---------------------------------------------------------------------------
 
 
@@ -1394,20 +1385,26 @@ def doctor(
 
 
 @app.command()
-def kick(
+def prune(
     ctx: typer.Context,
-    proxy_name: str = typer.Argument(..., help="要下线的代理名"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
-    """下线指定代理（`DELETE /api/proxies`）。"""
+    """清理 dashboard 统计里的离线代理记录。
+
+    ⚠️ frp **没有**强制下线在线代理的 API：`DELETE /api/proxies` 的实际语义是
+    `ClearOfflineProxies()`（只接受 `?status=offline`），真机实测确认。要断开
+    某个客户端请停掉它的 frpc（或在其侧下线代理）。
+
+    此前存在的 `kick` 命令基于对该端点的误读，从未真正工作过，已由本命令取代。
+    """
     app_ctx = _ctx(ctx).with_json(json_output)
-    client = _require_admin(app_ctx, feature="下线代理")
-    with client:
-        client.kick(proxy_name)
+    admin = _require_admin(app_ctx, feature="清理离线代理记录")
+    with admin:
+        admin.clear_offline_proxies()
     if app_ctx.json:
-        ui.emit_json({"kicked": proxy_name})
+        ui.emit_json({"cleared": True})
     else:
-        ui.emit(f"已下线代理 {proxy_name}")
+        ui.emit("已清理离线代理记录")
 
 
 @app.command()
@@ -1895,6 +1892,178 @@ def plugin_service_status(
     """显示插件服务的 systemd 托管状态。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
+    active = service.is_active()
+    pid = service.main_pid() if active else None
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "active": active, "main_pid": pid})
+        return
+    ui.emit(f"unit     : {service.unit_name}")
+    ui.emit(f"active   : {active}")
+    if pid:
+        ui.emit(f"main pid : {pid}")
+
+
+def _web_password_from_file(path: Path | None) -> str | None:
+    """从 `--password-file` 读口令；文件缺失/为空给出配置错误(3)。"""
+    if path is None:
+        return None
+    try:
+        value = path.read_text("utf-8").strip()
+    except FileNotFoundError:
+        raise ConfigError(
+            f"口令文件不存在：{path}",
+            hint="先运行 `frpsctl web service install` 生成，或去掉 --password-file 用自动生成的口令",
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"无法读取口令文件 {path}：{exc}") from None
+    if not value:
+        raise ConfigError(
+            f"口令文件为空：{path}",
+            hint="删除该文件让服务重新生成，或手工写入一个口令",
+        )
+    return value
+
+
+@web_app.command("serve")
+def web_serve(
+    ctx: typer.Context,
+    bind: str = typer.Option("127.0.0.1:8787", "--bind", help="监听地址（默认只绑回环）"),
+    password: str = typer.Option(
+        None,
+        "--password",
+        help="登录口令（默认自动生成并打印一次；也可用 FRPSCTL_WEB_PASSWORD。"
+        "⚠ 命令行参数对本机其他用户可见，生产建议用环境变量或 --password-file）",
+    ),
+    password_file: Path = typer.Option(
+        None, "--password-file", help="从文件读取口令（systemd 部署用；文件需 0600）"
+    ),
+    allow_non_loopback: bool = typer.Option(
+        False, "--allow-non-loopback", help="显式允许绑定非回环地址（建议配合反向代理 + TLS）"
+    ),
+) -> None:
+    """启动 Web 管理台（前台运行）。
+
+    内置界面提供仪表盘、客户端/代理列表、日志、进程启停与配置编辑（带预览与
+    回滚）——比 frp 自带 dashboard 多出**控制面**。
+
+    默认只绑 127.0.0.1；绑非回环必须显式加 --allow-non-loopback：界面能改配置、
+    停服务，而会话 Cookie 没有 TLS 保护时公网暴露等于把控制权交出去。
+    """
+    app_ctx = _ctx(ctx)
+    if not healthcheck.is_loopback(bind) and not allow_non_loopback:
+        raise UsageError(
+            f"拒绝绑定非回环地址：{bind}",
+            hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
+        )
+    resolved = (
+        password
+        or os.environ.get("FRPSCTL_WEB_PASSWORD")
+        or _web_password_from_file(password_file)
+    )
+    generated = False
+    if not resolved:
+        resolved = secrets.token_urlsafe(18)
+        generated = True
+    web_ctx = build_web_context(app_ctx.instance, resolved)
+    server = WebServer(web_ctx, WebSettings(bind=bind, password=resolved))
+    try:
+        server.start()
+    except OSError as exc:
+        raise UsageError(f"无法绑定 {bind}：{exc}", hint="换一个端口，或检查是否有其他进程占用") from None
+    ui.emit(f"Web 管理台：{server.url()}")
+    if generated:
+        ui.emit(f"登录口令（仅显示这一次）：{resolved}")
+    else:
+        ui.emit("登录口令：已从参数 / 环境变量 / 口令文件读取（不显示）")
+    ui.emit("Ctrl-C 停止。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        ui.emit("")
+        ui.emit("已停止")
+
+
+@web_service_app.command("install")
+def web_service_install(
+    ctx: typer.Context,
+    bind: str = typer.Option("127.0.0.1:8787", "--bind", help="监听地址（默认只绑回环）"),
+    allow_non_loopback: bool = typer.Option(
+        False, "--allow-non-loopback", help="显式允许绑定非回环地址（建议配合反向代理 + TLS）"
+    ),
+    user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行管理台的系统用户（需已存在）"),
+    group: str = typer.Option(None, "--group", help="运行管理台的系统组（默认与 --user 相同）"),
+    force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """安装 frpsctl-web@.service 并 enable（需要 root）。
+
+    安装时生成 0600 的登录口令文件（unit 只引用路径，明文不进 unit），
+    并执行与 frps/插件同样的四项体检（账户 / frpsctl 可达且不在家目录 /
+    实例目录不在家目录）。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    if not healthcheck.is_loopback(bind) and not allow_non_loopback:
+        raise UsageError(
+            f"拒绝绑定非回环地址：{bind}",
+            hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
+        )
+    service = WebService(app_ctx.instance)
+    path, generated = service.install_template(
+        exec_start=_frpsctl_executable(),
+        bind=bind,
+        force=force,
+        user=user,
+        group=group,
+    )
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "unit": service.unit_name,
+                "template": str(path),
+                "bind": bind,
+                "password_file": str(service.password_file),
+                "password_generated": bool(generated),
+                "user": user,
+                "group": group or user,
+            }
+        )
+        return
+    ui.emit(f"已安装 {path}")
+    ui.emit(f"实例 unit：{service.unit_name}（User={user}, Group={group or user}）")
+    if generated:
+        ui.emit("")
+        ui.emit(f"登录口令（仅显示这一次，已写入 {service.password_file}）：{generated}")
+    else:
+        ui.emit(f"登录口令：沿用已有文件 {service.password_file}")
+    ui.emit("")
+    ui.emit(f"启动：sudo systemctl start {service.unit_name}")
+    ui.emit("已 enable（开机自启）；停用：frpsctl web service uninstall")
+
+
+@web_service_app.command("uninstall")
+def web_service_uninstall(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停用并删除 Web 管理台 unit 模板（需要 root）。口令文件保留。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = WebService(app_ctx.instance)
+    service.uninstall()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "removed": True})
+    else:
+        ui.emit(f"已停用并移除 {service.unit_name}")
+        ui.emit(f"（登录口令文件保留在 {service.password_file}）")
+
+
+@web_service_app.command("status")
+def web_service_status(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """显示 Web 管理台的 systemd 托管状态。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = WebService(app_ctx.instance)
     active = service.is_active()
     pid = service.main_pid() if active else None
     if app_ctx.json:
