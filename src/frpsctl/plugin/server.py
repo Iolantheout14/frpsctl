@@ -101,15 +101,7 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
                 self._note(f"内部异常 {type(exc).__name__}: {exc}")
 
             body = json.dumps(response.to_payload(), ensure_ascii=False).encode("utf-8")
-            try:
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                # 客户端（frps）已经不在了——不是我们的问题，但值得记一笔
-                self._note("frps 在响应写出前断开连接")
+            self._send_body(status, body)
 
             elapsed_ms = (time.monotonic() - started) * 1000
             if elapsed_ms > SLOW_REQUEST_MS:
@@ -189,11 +181,23 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_body(status, body)
+
+        def _send_body(self, status: int, body: bytes) -> None:
+            """写响应。客户端提前断开是**正常事件**，不能让 traceback 污染 stderr。
+
+            `do_POST` 与 `do_GET`（探活）都要保护：探活方一个 `connect` 后立刻
+            断开是完全常见的模式，而 socketserver 会把未捕获异常打成回溯进
+            stderr——插件的 stderr 是运维观察面，不能有这种噪声。
+            """
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
 
         def _note(self, message: str) -> None:
             import sys

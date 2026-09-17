@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .audit import AuditLog, AuditRecord
 from .policy import PluginPolicy, decide_login, decide_new_proxy
@@ -34,7 +35,41 @@ from .types import (
     PluginResponse,
 )
 
-__all__ = ["DecisionEngine", "EngineResult"]
+__all__ = ["DecisionEngine", "EngineResult", "RejectLimiter"]
+
+
+class RejectLimiter:
+    """拒绝审计记录的限速器（`reject_log_burst` / `reject_log_window`）。
+
+    语义：同一用户在 `window` 秒内最多产生 `burst` 条 deny 审计记录。超出部分
+    **仍然拒绝请求**（安全语义不变），只是不再逐条刷日志——否则一个每秒重试
+    的客户端能把审计文件刷爆，真正有用的记录被淹没（§11.3）。
+
+    被抑制的条数会累计，在下一条被记录的拒绝上以 `suppressed` 字段汇报：
+    审计可以降采样，但"降了多少"必须看得见（降级必须可见原则）。
+    """
+
+    def __init__(self, burst: int, window: float, clock=time.monotonic) -> None:
+        self.burst = max(1, burst)
+        self.window = max(0.1, window)
+        self._clock = clock
+        self._hits: dict[str, tuple[float, int]] = {}  # user -> (窗口起点, 已记条数)
+        self._suppressed: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def check(self, user: str) -> tuple[bool, int]:
+        """返回 `(本条是否应记录, 需附加汇报的被抑制条数)`。"""
+        now = self._clock()
+        with self._lock:
+            start, count = self._hits.get(user, (now, 0))
+            if now - start >= self.window:
+                start, count = now, 0  # 新窗口：记数从头来（抑制存量留待下条汇报）
+            if count >= self.burst:
+                self._suppressed[user] = self._suppressed.get(user, 0) + 1
+                self._hits[user] = (start, count)
+                return False, 0
+            self._hits[user] = (start, count + 1)
+            return True, self._suppressed.pop(user, 0)
 
 
 @dataclass(frozen=True)
@@ -60,6 +95,7 @@ class DecisionEngine:
             admin_user=policy.admin_user,
             admin_password=policy.admin_password,
         )
+        self._reject_limiter = RejectLimiter(policy.reject_log_burst, policy.reject_log_window)
 
     def handle(self, request: PluginRequest, *, source: str = "") -> PluginResponse:
         started = time.monotonic()
@@ -158,7 +194,13 @@ class DecisionEngine:
     def _write_audit(self, record: AuditRecord, elapsed_ms: float) -> None:
         if self.audit is None:
             return
+        # 拒绝风暴限速：请求仍被拒绝，只是不再逐条刷审计；被抑制的条数累计到
+        # 下一条记录上（`suppressed` 字段），降采样必须可见。
+        if record.decision == "deny":
+            keep, suppressed = self._reject_limiter.check(record.user)
+            if not keep:
+                return
+            if suppressed:
+                record = replace(record, suppressed=suppressed)
         # AuditRecord 是 frozen 的，用 dataclasses.replace 补上耗时
-        from dataclasses import replace
-
         self.audit.record(replace(record, elapsed_ms=elapsed_ms))

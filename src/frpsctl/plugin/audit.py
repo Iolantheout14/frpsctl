@@ -42,6 +42,10 @@ class AuditRecord:
     elapsed_ms: float = 0.0
     #: 配额计数的来源（`dashboard` 权威 / `local` 退化 / 空表示未涉及配额）。
     quota_source: str = ""
+    #: 本条之前**被限速抑制**的同类拒绝条数（`reject_log_burst`）。
+    #: 拒绝风暴时限速器停止逐条记录，但把条数累计到下一条上如实汇报——
+    #: "降级必须可见"：审计可以降采样，但绝不能让人以为拒绝只发生了那几次。
+    suppressed: int = 0
 
     @property
     def at(self) -> float:
@@ -65,6 +69,7 @@ class AuditRecord:
             "source": self.source,
             "elapsed_ms": round(self.elapsed_ms, 2),
             "quota_source": self.quota_source,
+            "suppressed": self.suppressed,
         }
 
 

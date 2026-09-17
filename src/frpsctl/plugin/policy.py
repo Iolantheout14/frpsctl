@@ -122,15 +122,19 @@ class UserPolicy:
         if not isinstance(raw, dict):
             raise ConfigError(f"用户 {name!r} 的配置必须是对象")
         ports: list[PortRange] = []
-        for item in raw.get("allowed_ports") or []:
+        for item in _strict_list(raw, "allowed_ports", context=f"用户 {name!r}"):
             ports.append(PortRange.parse(str(item)))
         return cls(
             name=name,
             allowed_ports=tuple(ports),
-            allow_random_port=bool(raw.get("allow_random_port", False)),
-            allowed_proxy_names=tuple(str(x) for x in (raw.get("allowed_proxy_names") or [])),
-            allowed_proxy_types=tuple(str(x) for x in (raw.get("allowed_proxy_types") or [])),
-            max_proxies=max(0, int(raw.get("max_proxies", 0) or 0)),
+            allow_random_port=_strict_bool(raw, "allow_random_port", False),
+            allowed_proxy_names=tuple(
+                str(x) for x in _strict_list(raw, "allowed_proxy_names", context=f"用户 {name!r}")
+            ),
+            allowed_proxy_types=tuple(
+                str(x) for x in _strict_list(raw, "allowed_proxy_types", context=f"用户 {name!r}")
+            ),
+            max_proxies=_strict_int(raw, "max_proxies", 0, minimum=0),
             note=str(raw.get("note") or ""),
         )
 
@@ -157,14 +161,19 @@ class AuditSettings:
 
     @classmethod
     def parse(cls, raw: dict[str, Any] | None) -> AuditSettings:
-        raw = raw or {}
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            # `"audit": "false"` 这类写法此前会走到 `"false".get(...)` → 裸
+            # AttributeError → "未分类错误(1)"。
+            raise ConfigError(f"audit 必须是对象，实际是 {type(raw).__name__}")
         # 显式 {"path": null} 才表示"仅内存"；键缺失则用默认路径
         path = raw.get("path", AuditSettings.path)
         return cls(
             path=Path(str(path)).expanduser() if path else None,
-            enabled=bool(raw.get("enabled", True)),
-            flush_every=max(1, int(raw.get("flush_every", 32))),
-            flush_interval=max(0.1, float(raw.get("flush_interval", 2.0))),
+            enabled=_strict_bool(raw, "enabled", True),
+            flush_every=_strict_int(raw, "flush_every", 32, minimum=1),
+            flush_interval=_strict_float(raw, "flush_interval", 2.0, minimum=0.1),
         )
 
 
@@ -217,9 +226,6 @@ class PluginPolicy:
             for item in user.allowed_ports:
                 if item.start < 1 or item.end > 65535:
                     raise ConfigError(f"用户 {name!r} 的端口段越界：{item.render()}")
-        if not self.audit.enabled:
-            # 关掉审计是允许的，但要让人知道代价
-            pass
 
     # --- 查询 ----------------------------------------------------------
 
@@ -281,14 +287,14 @@ class PluginPolicy:
         users = {str(name): UserPolicy.parse(str(name), value) for name, value in users_raw.items()}
         return cls(
             users=users,
-            allow_unknown_user=bool(raw.get("allow_unknown_user", False)),
-            require_client_id=bool(raw.get("require_client_id", True)),
+            allow_unknown_user=_strict_bool(raw, "allow_unknown_user", False),
+            require_client_id=_strict_bool(raw, "require_client_id", True),
             audit=AuditSettings.parse(raw.get("audit")),
             admin_url=str(raw.get("admin_url") or ""),
             admin_user=str(raw.get("admin_user") or ""),
             admin_password=str(raw.get("admin_password") or ""),
-            reject_log_burst=int(raw.get("reject_log_burst", 20)),
-            reject_log_window=float(raw.get("reject_log_window", 10.0)),
+            reject_log_burst=_strict_int(raw, "reject_log_burst", 20, minimum=1),
+            reject_log_window=_strict_float(raw, "reject_log_window", 10.0, minimum=0.1),
         )
 
 
@@ -427,6 +433,62 @@ def decide_new_proxy(
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
+
+
+def _strict_bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    """严格布尔：只接受 JSON 的 `true` / `false`。
+
+    **为什么不能 `bool(value)`**：JSON 里写 `"false"`（带引号的字符串）会被
+    Python 的 `bool()` 判成 **True**——对 `allow_unknown_user` 而言，用户以为
+    "关掉了放行未知用户"，实际把鉴权后门**完全打开**；`allow_random_port`
+    同理（白名单形同虚设）。这是 fail-open 方向的静默错误，必须硬拒绝。
+    """
+    value = raw.get(key, default)
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(
+        f"策略字段 {key} 必须是布尔值（true / false），实际是 {type(value).__name__}：{value!r}"
+    )
+
+
+def _strict_int(raw: dict[str, Any], key: str, default: int, *, minimum: int | None = None) -> int:
+    """严格整数。`bool` 是 `int` 的子类，必须显式排除（`true` 不是 1）。
+
+    `minimum` 保留原有的钳制语义（负数刷盘间隔修正为最小值），类型错误则拒绝。
+    """
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"策略字段 {key} 必须是整数，实际是 {type(value).__name__}：{value!r}"
+        )
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
+def _strict_float(
+    raw: dict[str, Any], key: str, default: float, *, minimum: float | None = None
+) -> float:
+    """严格数值（int 或 float 均可，bool 除外）。"""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"策略字段 {key} 必须是数字，实际是 {type(value).__name__}：{value!r}"
+        )
+    if minimum is not None and value < minimum:
+        return float(minimum)
+    return float(value)
+
+
+def _strict_list(raw: dict[str, Any], key: str, *, context: str = "") -> list[Any]:
+    """严格数组。字符串会被逐字符迭代——那种"看似能跑"的行为必须变成明确报错。"""
+    value = raw.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        prefix = f"{context} 的 " if context else ""
+        raise ConfigError(f"{prefix}{key} 必须是数组，实际是 {type(value).__name__}：{value!r}")
+    return value
 
 
 def _host_of(bind: str) -> str:
