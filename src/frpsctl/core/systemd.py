@@ -102,7 +102,7 @@ Wants=network-online.target
 Type=simple
 User={user}
 Group={group}
-ExecStart={exec_start} --instance %i plugin serve --policy {policy} --bind {bind} --path {handler_path}
+ExecStart={exec_start} --instance %i plugin serve --policy {policy} --bind {bind} --path {handler_path}{extra}
 WorkingDirectory={workdir}
 # 插件是全部客户端登录的单点（fail-closed）：任何退出都必须被立刻拉起。
 Restart=always
@@ -192,13 +192,18 @@ def render_plugin_unit(
     workdir: Path,
     user: str = DEFAULT_SERVICE_USER,
     group: str | None = None,
+    access_log: bool = False,
 ) -> str:
     """渲染插件 unit 模板。
 
     `ExecStart` 写**具体路径**（不是 `frpsctl` 命令名）：systemd 不读 PATH。
     pipx 默认装到 `~/.local/bin`，那条路径会被 `ProtectHome=true` 挡住——
     由 `PluginService.install_template` 的体检在安装前拒绝并给出替代方案。
+
+    `access_log` 对应 `plugin serve --access-log`（逐请求日志进 journald）；
+    不开时模板与历史版本逐字节一致。
     """
+    extra = " --access-log" if access_log else ""
     return PLUGIN_UNIT_TEMPLATE.format(
         exec_start=exec_start,
         bind=bind,
@@ -207,6 +212,7 @@ def render_plugin_unit(
         workdir=workdir,
         user=user,
         group=group or user,
+        extra=extra,
     )
 
 
@@ -220,18 +226,22 @@ def render_web_unit(
     group: str | None = None,
     allow_non_loopback: bool = False,
     trusted_proxy: bool = False,
+    access_log: bool = False,
 ) -> str:
     """渲染 Web 管理台 unit 模板。
 
     口令走 `--password-file`（0600），**绝不写进 unit 命令行**——unit 文件是
-    0644，写明文等于向本机所有用户公开管理台。`--allow-non-loopback` 与
-    `--trusted-proxy` 只在显式要求时渲染（CLI 层已做前置校验）。
+    0644，写明文等于向本机所有用户公开管理台。`--allow-non-loopback`、
+    `--trusted-proxy` 与 `--access-log` 只在显式要求时渲染（CLI 层已做前置
+    校验）。
     """
     flags: list[str] = []
     if allow_non_loopback:
         flags.append("--allow-non-loopback")
     if trusted_proxy:
         flags.append("--trusted-proxy")
+    if access_log:
+        flags.append("--access-log")
     return WEB_UNIT_TEMPLATE.format(
         exec_start=exec_start,
         bind=bind,
@@ -348,6 +358,7 @@ class PluginService:
         force: bool = False,
         user: str = DEFAULT_SERVICE_USER,
         group: str | None = None,
+        access_log: bool = False,
     ) -> Path:
         """安装 `frpsctl-plugin@.service` 并 `daemon-reload` + `enable`。**需要 root**。
 
@@ -421,6 +432,7 @@ class PluginService:
             workdir=self.inst.dir.resolve(),
             user=user,
             group=group,
+            access_log=access_log,
         )
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         self.template_path.write_text(content, "utf-8")
@@ -901,6 +913,7 @@ class WebService:
         user: str = DEFAULT_SERVICE_USER,
         group: str | None = None,
         trusted_proxy: bool = False,
+        access_log: bool = False,
     ) -> tuple[Path, str]:
         """安装 `frpsctl-web@.service` 并准备口令文件。**需要 root**。
 
@@ -969,6 +982,7 @@ class WebService:
             group=group,
             allow_non_loopback=not is_loopback(bind),
             trusted_proxy=trusted_proxy,
+            access_log=access_log,
         )
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         self.template_path.write_text(content, "utf-8")
