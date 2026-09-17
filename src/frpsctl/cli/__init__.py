@@ -24,7 +24,23 @@ from ..core import config as cfg
 from ..core import doctor as doc
 from ..core import healthcheck, release
 from ..core import platform as plat
-from ..core.admin import TRAFFIC_MAX_PROXIES, AdminClient, sum_proxy_types
+from ..core.admin import (
+    PROXY_TYPES,
+    TRAFFIC_MAX_PROXIES,
+    AdminClient,
+    aggregate_days,
+    fetch_histories,
+    sum_proxy_types,
+    traffic_total,
+)
+from ..core.auditlog import (
+    DEFAULT_AUDIT_FILE,
+    load_view,
+    parse_since,
+    read_tail,
+    resolve_policy_path,
+    summarize,
+)
 from ..core.instance import list_instances
 from ..core.lifecycle import Lifecycle, StartReport, State
 from ..core.lock import instance_lock
@@ -40,7 +56,7 @@ from ..core.uninstall import execute_uninstall, plan_uninstall
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
-from ..web import WebServer, WebSettings, build_web_context
+from ..web import WebServer, WebSettings, build_web_context, generate_password
 from ..errors import (
     AdminUnreachable,
     ConfigError,
@@ -139,6 +155,10 @@ plugin_service_app = typer.Typer(no_args_is_help=True, help="插件服务的 sys
 plugin_user_app = typer.Typer(
     no_args_is_help=True, help="策略里的用户管理（结构化编辑，避免手写 JSON）。"
 )
+plugin_audit_app = typer.Typer(no_args_is_help=True, help="审计日志的只读查看（tail / stats）。")
+plugin_config_app = typer.Typer(
+    no_args_is_help=True, help="策略级设置（用户表用 `plugin user`；此处是其余字段）。"
+)
 web_app = typer.Typer(no_args_is_help=True, help="Web 管理台（内置界面，含进程控制与配置编辑）。")
 web_service_app = typer.Typer(no_args_is_help=True, help="Web 管理台的 systemd 集成。")
 web_password_app = typer.Typer(no_args_is_help=True, help="Web 管理台的登录口令管理。")
@@ -148,6 +168,8 @@ app.add_typer(plugin_app, name="plugin")
 app.add_typer(web_app, name="web")
 plugin_app.add_typer(plugin_service_app, name="service")
 plugin_app.add_typer(plugin_user_app, name="user")
+plugin_app.add_typer(plugin_audit_app, name="audit")
+plugin_app.add_typer(plugin_config_app, name="config")
 web_app.add_typer(web_service_app, name="service")
 web_app.add_typer(web_password_app, name="password")
 
@@ -170,11 +192,35 @@ def _show_version(value: bool) -> bool:
     return value
 
 
+def _complete_instance(ctx, args, incomplete):  # noqa: ANN001, ARG001 - Typer autocompletion 接口
+    """`--instance` 的 shell 补全：列出实例根下的实例名。
+
+    接口是 Typer 的 `autocompletion(ctx, args, incomplete)`（返回字符串列表）。
+    补全回调必须**零副作用**：只读目录、不建目录、任何失败都返回空列表
+    （补全环境千奇百怪，绝不能因为补全把命令行本身搞坏）。它尽力读取
+    `FRPSCTL_ROOT` / `FRPSCTL_DATA_HOME`；同一个命令行里另写的 `--root`
+    在补全阶段尚未解析，属于已知局限。
+    """
+    try:
+        from ..core.instance import resolve_data_home, resolve_instances_root
+
+        data_home = resolve_data_home()
+        root = resolve_instances_root()
+        names = [inst.name for inst in list_instances(root, data_home=data_home)]
+    except Exception:  # noqa: BLE001 - 补全失败绝不影响命令行
+        return []
+    return [name for name in names if name.startswith(incomplete or "")]
+
+
 @app.callback()
 def _root(
     ctx: typer.Context,
     instance: str = typer.Option(
-        None, "--instance", "-i", help="实例名（默认 default，可用 FRPSCTL_INSTANCE 覆盖）"
+        None,
+        "--instance",
+        "-i",
+        help="实例名（默认 default，可用 FRPSCTL_INSTANCE 覆盖）",
+        autocompletion=_complete_instance,
     ),
     root: Path = typer.Option(None, "--root", help="实例根目录（默认 ~/.local/share/frpsctl/instances）"),
     config: Path = typer.Option(None, "--config", help="直接指定配置文件（覆盖实例默认）"),
@@ -826,6 +872,11 @@ def status(
             # --watch --json 用**单行** JSON（NDJSON）：多行缩进格式在连续
             # 输出时无法被逐行消费（脚本会拿到一串无法解析的片段）。
             _print_status(app_ctx, compact=app_ctx.json)
+            # 持续刷新必须**逐轮 flush**：stdout 重定向到管道/文件时是块缓冲，
+            # 不冲刷的话 `status --watch --json | jq` 会攒满 4KB 才吐数据——
+            # "watch" 失去意义（v0.2.6 回归 review 与 audit tail 一并修复）。
+            with contextlib.suppress(OSError):
+                sys.stdout.flush()
             time.sleep(interval)
     except KeyboardInterrupt:
         return
@@ -1518,16 +1569,20 @@ def service_status(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
-    """显示 systemd 托管状态。"""
+    """显示 systemd 托管状态（active 与 enabled 分开报告）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     systemd = Systemd(app_ctx.instance)
     active = systemd.is_active()
+    enabled = systemd.is_enabled()
     pid = systemd.main_pid() if active else None
     if app_ctx.json:
-        ui.emit_json({"unit": systemd.unit_name, "active": active, "main_pid": pid})
+        ui.emit_json(
+            {"unit": systemd.unit_name, "active": active, "enabled": enabled, "main_pid": pid}
+        )
     else:
         ui.emit(f"unit     : {systemd.unit_name}")
         ui.emit(f"active   : {active}")
+        ui.emit(f"enabled  : {enabled}（开机自启）")
         if pid:
             ui.emit(f"main pid : {pid}")
 
@@ -1570,6 +1625,7 @@ def doctor(
             {
                 "instance": report.instance,
                 "ok": report.ok,
+                "counts": report.counts,
                 "findings": [
                     {
                         "check": f.check,
@@ -1586,8 +1642,13 @@ def doctor(
             ui.emit(f"[{finding.severity.value:5}] {finding.check}: {finding.message}")
             if finding.hint:
                 ui.emit(f"        ↳ {finding.hint}")
+        counts = report.counts
+        suffix = f"（WARN {counts['warn']} / INFO {counts['info']}）"
         ui.emit("")
-        ui.emit("体检通过" if report.ok else f"发现 {len(report.errors)} 个 ERROR")
+        if report.ok:
+            ui.emit(f"体检通过{suffix}")
+        else:
+            ui.emit(f"发现 {counts['error']} 个 ERROR{suffix}")
 
     if not report.ok:
         raise typer.Exit(1)
@@ -1609,11 +1670,23 @@ def prune(
     app_ctx = _ctx(ctx).with_json(json_output)
     admin = _require_admin(app_ctx, feature="清理离线代理记录")
     with admin:
-        admin.clear_offline_proxies()
+        outcome = admin.prune_offline_proxies()
     if app_ctx.json:
-        ui.emit_json({"cleared": True})
+        ui.emit_json(
+            {
+                "cleared": True,
+                "count": outcome.cleared,
+                "before": outcome.before,
+                "exact": outcome.exact,
+            }
+        )
+        return
+    if outcome.exact:
+        ui.emit(f"已清理 {outcome.cleared} 条离线代理记录（清理前 {outcome.before} 条）")
     else:
-        ui.emit("已清理离线代理记录")
+        # 列表翻页被上限截断时差值只是下界——降级必须可见
+        ui.warn("⚠ 代理列表被截断，清理条数只是下界")
+        ui.emit(f"已清理（至少 {outcome.cleared} 条；清理前至少 {outcome.before} 条）")
 
 
 @app.command()
@@ -1625,14 +1698,17 @@ def clients(
     app_ctx = _ctx(ctx).with_json(json_output)
     admin = _require_admin(app_ctx, feature="列出客户端")
     with admin:
-        items = admin.list_clients()
+        page = admin.page_clients()
+    items = page.items
 
     if app_ctx.json:
-        ui.emit_json({"clients": items})
+        ui.emit_json({"clients": items, "total": page.total, "truncated": page.truncated})
         return
     if not items:
         ui.emit("没有在线客户端")
         return
+    if page.truncated:
+        ui.warn(f"⚠ 客户端列表被截断：服务端声明共 {page.total} 条，仅取回 {len(items)} 条")
     ui.emit(f"{'name':<28} {'user':<10} {'hostname':<20} {'online':<7} {'ip':<16} version")
     for item in items:
         ui.emit(
@@ -1640,6 +1716,7 @@ def clients(
             f"{_text(item.get('hostname')):<20} {str(bool(item.get('online'))):<7} "
             f"{_text(item.get('clientIP')):<16} {_text(item.get('version'))}"
         )
+    ui.emit(f"共 {page.total} 条")
 
 
 @app.command()
@@ -1648,11 +1725,21 @@ def proxies(
     ptype: str = typer.Option("", "--type", help="只看某类型（tcp/udp/http/https/stcp/xtcp/tcpmux/sudp）"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
-    """列出代理（v2 Admin API，自动翻页取全量）。"""
+    """列出代理（v2 Admin API，自动翻页取全量）。
+
+    `--type` 的取值必须在 frp 支持的类型集合内：拼错类型名过去会静默返回空
+    列表，用户以为"没有代理"——用法错误(2) 比一个空表诚实（ADR-7）。
+    """
     app_ctx = _ctx(ctx).with_json(json_output)
+    if ptype and ptype not in PROXY_TYPES:
+        raise UsageError(
+            f"未知代理类型：{ptype!r}",
+            hint=f"合法类型：{'/'.join(sorted(PROXY_TYPES))}",
+        )
     admin = _require_admin(app_ctx, feature="列出代理")
     with admin:
-        items = admin.list_proxies()
+        page = admin.page_proxies()
+    items = page.items
     if ptype:
         items = [item for item in items if item.type == ptype]
 
@@ -1666,25 +1753,39 @@ def proxies(
                         "type": item.type,
                         "remote_port": item.remote_port,
                         "phase": item.phase,
+                        "client_id": item.client_id,
                         "cur_conns": item.cur_conns,
                         "today_traffic_in": item.today_traffic_in,
                         "today_traffic_out": item.today_traffic_out,
+                        "last_start_at": item.last_start_at,
                     }
                     for item in items
-                ]
+                ],
+                "total": page.total,
+                "truncated": page.truncated,
             }
         )
         return
     if not items:
         ui.emit("没有代理")
         return
-    ui.emit(f"{'name':<28} {'user':<10} {'type':<7} {'port':<6} {'phase':<8} {'conns':<6} traffic(in/out)")
+    if page.truncated:
+        ui.warn(f"⚠ 代理列表被截断：服务端声明共 {page.total} 条，仅取回 {len(page.items)} 条")
+    header = (
+        f"{'name':<28} {'user':<10} {'type':<7} {'port':<6} "
+        f"{'phase':<8} {'up':<8} {'conns':<6} traffic(in/out)"
+    )
+    ui.emit(header)
+    now = time.time()
     for item in items:
         port = str(item.remote_port) if item.remote_port else "-"
+        uptime = (
+            ui.human_duration(max(0.0, now - item.last_start_at)) if item.last_start_at else "-"
+        )
         traffic = f"{ui.human_bytes(item.today_traffic_in)} / {ui.human_bytes(item.today_traffic_out)}"
         ui.emit(
             f"{item.name:<28} {item.user:<10} {item.type:<7} {port:<6} "
-            f"{item.phase:<8} {item.cur_conns:<6} {traffic}"
+            f"{item.phase:<8} {uptime:<8} {item.cur_conns:<6} {traffic}"
         )
 
 
@@ -1706,7 +1807,7 @@ def traffic(
     if name:
         with admin:
             history = admin.proxy_traffic(name)
-        total = _traffic_total(history)
+        total = traffic_total(history)
         if app_ctx.json:
             ui.emit_json({"name": name, "history": history, "total": total})
             return
@@ -1719,18 +1820,16 @@ def traffic(
         return
 
     with admin:
-        all_proxies = admin.list_proxies()
-        truncated = len(all_proxies) > TRAFFIC_MAX_PROXIES
-        series: list[list[dict]] = []
-        for item in all_proxies[:TRAFFIC_MAX_PROXIES]:
-            try:
-                series.append(admin.proxy_traffic(item.name))
-            except FrpsctlError:
-                series.append([])  # 单代理失败记空曲线：不拖垮整体（与 Web 一致）
+        page = admin.page_proxies()
+        truncated = page.total > TRAFFIC_MAX_PROXIES
+        names = [item.name for item in page.items[:TRAFFIC_MAX_PROXIES]]
+        series = fetch_histories(admin, names)
 
-    days = _aggregate_days(series)
+    days = aggregate_days(series)
     if app_ctx.json:
-        ui.emit_json({"days": days, "proxies": len(series), "truncated": truncated})
+        ui.emit_json(
+            {"days": days, "proxies": len(series), "total": page.total, "truncated": truncated}
+        )
         return
     if not days:
         ui.emit("没有流量数据（没有代理，或全部代理都没有历史）")
@@ -1739,29 +1838,7 @@ def traffic(
         ui.warn(f"⚠ 代理数超过 {TRAFFIC_MAX_PROXIES}，仅统计前 {TRAFFIC_MAX_PROXIES} 个")
     ui.emit("全部代理的逐日流量（近 7 天）：")
     _render_traffic_rows(days)
-    _render_traffic_total(_traffic_total(days))
-
-
-def _traffic_total(points: list[dict]) -> dict[str, int]:
-    """逐日数据的合计（in/out）。"""
-    return {
-        "in": sum(int(point.get("in") or 0) for point in points),
-        "out": sum(int(point.get("out") or 0) for point in points),
-    }
-
-
-def _aggregate_days(series: list[list[dict]]) -> list[dict]:
-    """把多个代理的日粒度历史按日期求和（按日期排序）。"""
-    days: dict[str, dict[str, int]] = {}
-    for history in series:
-        for point in history:
-            date = str(point.get("date") or "")
-            if not date:
-                continue
-            bucket = days.setdefault(date, {"date": date, "in": 0, "out": 0})
-            bucket["in"] += int(point.get("in") or 0)
-            bucket["out"] += int(point.get("out") or 0)
-    return [days[key] for key in sorted(days)]
+    _render_traffic_total(traffic_total(days))
 
 
 def _render_traffic_rows(points: list[dict]) -> None:
@@ -1798,8 +1875,7 @@ def instances(
     root = app_ctx.instance.instances_root
     found = list_instances(root, data_home=app_ctx.instance.data_home)
 
-    reports = []
-    for inst in found:
+    def inspect(inst) -> object:
         lc = Lifecycle(inst)
         report = lc.status()
         if health and report.state in (State.RUNNING, State.SYSTEMD_ACTIVE):
@@ -1807,7 +1883,17 @@ def instances(
                 report = replace(
                     report, health=lc.check_health(expect_pid=report.systemd_main_pid)
                 )
-        reports.append(report)
+        return report
+
+    # `--health` 是逐实例的网络探测：多实例巡检时串行会让总耗时线性叠加，
+    # 结果顺序与输入顺序保持一致（`pool.map` 保证），输出因此稳定可比。
+    if health and len(found) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(found))) as pool:
+            reports = list(pool.map(inspect, found))
+    else:
+        reports = [inspect(inst) for inst in found]
 
     if app_ctx.json:
         ui.emit_json({"instances": [_status_payload(report) for report in reports]})
@@ -1839,17 +1925,12 @@ def _text(value: object) -> str:
 
 
 def _policy_path(app_ctx: AppContext, override: Path | None) -> Path:
-    """策略文件位置：`--policy` > 环境变量 > 实例目录下的 plugin-policy.json。
+    """策略文件位置：`--policy` > `FRPSCTL_PLUGIN_POLICY` > `<实例>/plugin-policy.json`。
 
-    默认放进实例目录，是为了让"这个实例的策略"跟它的配置、历史待在一起——
-    迁移实例时不会漏掉鉴权规则。
+    实现在 `core/auditlog.resolve_policy_path`——CLI、插件服务与 Web 审计视图
+    必须指向**同一个**文件，因此规则只有一份。
     """
-    if override is not None:
-        return override.expanduser()
-    env = os.environ.get("FRPSCTL_PLUGIN_POLICY")
-    if env:
-        return Path(env).expanduser()
-    return app_ctx.instance.dir / "plugin-policy.json"
+    return resolve_policy_path(app_ctx.instance, override)
 
 
 def _load_policy(app_ctx: AppContext, override: Path | None) -> tuple[Path, PluginPolicy]:
@@ -1909,6 +1990,12 @@ def _render_policy_template() -> str:
             "（重启归零、多实例各算各的）"
         ),
         "admin_url": "",
+        "_reject_log_comment": (
+            "拒绝风暴限速：同一用户在 reject_log_window 秒内最多记录 reject_log_burst 条"
+            "拒绝审计（超出部分仍被拒绝，只是不再逐条刷日志；被抑制的条数会累计汇报）"
+        ),
+        "reject_log_burst": 20,
+        "reject_log_window": 10.0,
         "admin_user": "",
         "admin_password": "",
         "users": {
@@ -2053,7 +2140,11 @@ def plugin_serve(
     app_ctx = _ctx(ctx).with_json(json_output)
     policy_file, loaded = _load_policy(app_ctx, policy)
 
-    settings = ServerSettings(bind=bind, path=path, access_log=access_log)
+    # policy_path 进 settings：审计的 audit.path 相对**策略文件目录**解析
+    # （读取侧同一规则），否则落点跟随 CWD，与 systemd 托管不一致。
+    settings = ServerSettings(
+        bind=bind, path=path, access_log=access_log, policy_path=policy_file
+    )
     server = PluginServer(loaded, settings)  # 非回环会在这里被拒绝
 
     if app_ctx.json:
@@ -2283,6 +2374,365 @@ def _save_policy_raw(path: Path, raw: dict) -> PluginPolicy:
     return loaded
 
 
+# ---------------------------------------------------------------------------
+# plugin audit（只读查看）
+# ---------------------------------------------------------------------------
+
+
+def _audit_line(record: dict) -> str:
+    """一条审计记录的人读单行（文本模式与 `-f` 跟随共用）。"""
+    at = str(record.get("at") or "-")
+    decision = str(record.get("decision") or "?")
+    mark = "允许" if decision == "allow" else "拒绝"
+    user = str(record.get("user") or "-")
+    op = str(record.get("op") or "-")
+    port = record.get("remote_port")
+    port_text = f" port={port}" if port else ""
+    detail = str(record.get("reason") or "")
+    line = f"{at} [{mark}] {op} {user}{port_text} {detail}".rstrip()
+    suppressed = int(record.get("suppressed") or 0)
+    if suppressed:
+        # 降级必须可见：限速期间被抑制的同类拒绝条数如实附上
+        line += f"（此前 {suppressed} 条同类拒绝被限速抑制）"
+    return line
+
+
+def _audit_target(view) -> Path:
+    """把审计视图收口成"可读的文件路径"；不可用时给出可行动的错误(3)。"""
+    if not view.available:
+        raise ConfigError(
+            view.reason or "策略文件不可用",
+            hint="先运行 `frpsctl plugin init` 生成策略模板，或用 --policy 指定路径",
+        )
+    if not view.enabled:
+        raise ConfigError(
+            "审计已被策略关闭（audit.enabled = false）",
+            hint="用 `frpsctl plugin config set audit.enabled true` 开启后重试",
+        )
+    if view.path is None:
+        raise ConfigError(
+            "审计未配置落盘路径（audit.path = null，仅内存）",
+            hint="用 `frpsctl plugin config set audit.path plugin-audit.jsonl` 指定路径",
+        )
+    return view.path
+
+
+@plugin_audit_app.command("tail")
+def plugin_audit_tail(
+    ctx: typer.Context,
+    lines: int = typer.Option(50, "--lines", "-n", min=1, max=10_000, help="显示条数"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪新记录（Ctrl-C 退出）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出（不能与 -f 同用）"),
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+) -> None:
+    """看审计日志的尾部（JSONL，与 `frpsctl log` 同规格的反向读取）。
+
+    `-f` 跟随新记录（含日志轮转重开）：插件是登录单点，排查"某用户为什么
+    登录不了"时这是第一手现场。`--json` 是**一次性**导出，因此与 `-f` 互斥
+    ——流式 JSONL 请直接消费审计文件本身。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    view = load_view(app_ctx.instance, policy_override=policy)
+    path = _audit_target(view)
+    if follow and app_ctx.json:
+        raise UsageError(
+            "--json 不能与 --follow 同时使用",
+            hint="跟随请用文本模式；流式 JSON 请直接 tail 审计文件（每行一个 JSON 对象）",
+        )
+
+    tail = read_tail(path, lines)
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(view.policy_path),
+                "path": str(path),
+                "records": tail.records,
+                "bad_lines": tail.bad_lines,
+            }
+        )
+        return
+
+    for record in tail.records:
+        _emit_stream_line(_audit_line(record))
+    if tail.bad_lines:
+        ui.warn(f"⚠ {tail.bad_lines} 行无法解析（进程被 kill 时最后一行可能是半截 JSON）")
+    if not tail.records and not follow:
+        ui.emit(f"审计文件为空或不存在：{path}")
+        return
+
+    if not follow:
+        return
+    _follow_audit(path)
+
+
+def _emit_stream_line(text: str) -> None:
+    """流式输出单行并**立即 flush**。
+
+    `ui.emit` 是一次性输出的语义（依赖进程退出时冲刷），而跟随类是**长驻**
+    进程：stdout 重定向到文件/管道时是块缓冲，不 flush 的话新记录会延迟到
+    缓冲满（或进程被杀）才出现——跟随就失去了意义。`frpsctl log -f` 的
+    `_follow_file` 一直是这么做的，这里保持一致。
+
+    **不吞 BrokenPipeError**：`plugin audit tail | head` 类管道提前关闭时，
+    异常冒泡到 `map_exceptions` 的 BrokenPipeError 分支（静默退出 0）——
+    若在这里 suppress，跟随循环会带着一个断掉的管道永远转下去。
+    """
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def _follow_audit(path: Path) -> None:
+    """持续输出新追加的审计记录（渲染行；文件轮转时自动重开）。"""
+    handle = open(path, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
+    try:
+        handle.seek(0, os.SEEK_END)
+        while True:
+            line = handle.readline()
+            if line:
+                text = line.strip()
+                if text:
+                    try:
+                        record = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue  # 半截行（正在写入）：跳过，下一轮可能补全
+                    if isinstance(record, dict):
+                        _emit_stream_line(_audit_line(record))
+                continue
+            time.sleep(FOLLOW_INTERVAL)
+            handle = _reopen_if_rotated(path, handle)
+    except KeyboardInterrupt:
+        return
+    finally:
+        with contextlib.suppress(OSError):
+            handle.close()
+
+
+@plugin_audit_app.command("stats")
+def plugin_audit_stats(
+    ctx: typer.Context,
+    since: str = typer.Option(
+        None, "--since", help="窗口起点：24h / 7d / 30m、ISO 时间或 unix 时间戳（默认全量）"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+) -> None:
+    """统计审计：总量 / 允许 / 拒绝 / 用户与操作分布 / 限速抑制累计。
+
+    流式扫描整个审计文件（只计数、不驻留内存）；大文件配合 `--since` 限定
+    窗口更快。坏行计入 `bad_lines` 并如实报告——它通常意味着进程被 kill 时
+    最后一行是半截 JSON。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    view = load_view(app_ctx.instance, policy_override=policy)
+    path = _audit_target(view)
+    window = parse_since(since) if since else None
+
+    summary = summarize(path, since=window)
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(view.policy_path),
+                "path": str(path),
+                "since": window,
+                "total": summary.total,
+                "allow": summary.allow,
+                "deny": summary.deny,
+                "suppressed_total": summary.suppressed_total,
+                "bad_lines": summary.bad_lines,
+                "first_at": summary.first_at,
+                "last_at": summary.last_at,
+                "by_user": summary.by_user,
+                "by_op": summary.by_op,
+                "elapsed_avg_ms": summary.elapsed_avg_ms,
+                "elapsed_max_ms": summary.elapsed_max_ms,
+                "elapsed_count": summary.elapsed_count,
+            }
+        )
+        return
+
+    ui.emit(f"审计文件：{path}")
+    ui.emit(f"记录：{summary.total} 条（允许 {summary.allow} / 拒绝 {summary.deny}）")
+    if summary.elapsed_count:
+        ui.emit(
+            f"裁决耗时：平均 {summary.elapsed_avg_ms:.1f} ms / "
+            f"最大 {summary.elapsed_max_ms:.1f} ms（{summary.elapsed_count} 条带耗时）"
+        )
+    if summary.suppressed_total:
+        ui.emit(f"限速抑制：{summary.suppressed_total} 条同类拒绝未逐条记录")
+    if summary.bad_lines:
+        ui.emit(f"坏行：{summary.bad_lines}（进程被 kill 时最后一行可能是半截 JSON）")
+    if summary.first_at is not None and summary.last_at is not None:
+        first = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(summary.first_at))
+        last = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(summary.last_at))
+        ui.emit(f"时间范围：{first} → {last}")
+    if summary.by_op:
+        detail = "  ".join(f"{op}={count}" for op, count in sorted(summary.by_op.items()))
+        ui.emit(f"按操作：{detail}")
+    if summary.by_user:
+        ui.emit("按用户：")
+        for user, bucket in sorted(summary.by_user.items()):
+            ui.emit(f"  {user or '(未声明)'}: 允许 {bucket['allow']} / 拒绝 {bucket['deny']}")
+
+
+# ---------------------------------------------------------------------------
+# plugin config（策略级设置）
+# ---------------------------------------------------------------------------
+
+#: 可编辑的策略级字段（用户表由 `plugin user` 管理，不在此列）。
+_POLICY_KEYS: dict[str, str] = {
+    "allow_unknown_user": "布尔：未列出的用户是否放行（默认 false；true = 鉴权形同虚设）",
+    "require_client_id": "布尔：是否要求 client_id 与 user 一致（默认 true）",
+    "reject_log_burst": "整数：拒绝风暴限速——窗口内最多记录几条 deny（默认 20）",
+    "reject_log_window": "数值：限速窗口秒数（默认 10）",
+    "admin_url": "字符串：dashboard 地址（max_proxies 配额读取权威计数用）",
+    "admin_user": "字符串：dashboard 用户",
+    "admin_password": "字符串：dashboard 口令（敏感，建议 --stdin）",
+    "audit.enabled": "布尔：是否开启审计（默认 true）",
+    "audit.path": "字符串：审计文件路径（相对策略文件目录）；字面 null = 仅内存",
+}
+
+
+def _policy_value(raw: dict, key: str):
+    """从策略字典取 `key` 的当前值（`audit.x` 走子对象）。"""
+    if key.startswith("audit."):
+        audit = raw.get("audit")
+        if not isinstance(audit, dict):
+            return DEFAULT_AUDIT_FILE if key == "audit.path" else True
+        return audit.get(key.split(".", 1)[1], DEFAULT_AUDIT_FILE if key == "audit.path" else True)
+    return raw.get(key)
+
+
+@plugin_config_app.command("list")
+def plugin_config_list(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出策略级设置（不显示用户表——那用 `plugin user list`）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path = _policy_path(app_ctx, policy)
+    raw = _load_policy_raw(path)
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(path),
+                "settings": {
+                    key: (
+                        "***"
+                        if key == "admin_password" and _policy_value(raw, key)
+                        else _policy_value(raw, key)
+                    )
+                    for key in _POLICY_KEYS
+                },
+            }
+        )
+        return
+    ui.emit(f"策略文件：{path}")
+    for key, description in _POLICY_KEYS.items():
+        value = _policy_value(raw, key)
+        if key == "admin_password" and value:
+            value = "***"
+        ui.emit(f"  {key} = {json.dumps(value, ensure_ascii=False)}")
+        ui.emit(f"      {description}")
+    ui.emit("")
+    ui.emit("用户表：`frpsctl plugin user list`；修改后插件服务重启才生效。")
+
+
+@plugin_config_app.command("set")
+def plugin_config_set(
+    ctx: typer.Context,
+    key: str = typer.Argument(..., help="字段名（见 `plugin config list`）"),
+    value: str = typer.Argument(None, help="新值；或用 --stdin / --prompt（敏感值不进 argv）"),
+    read_stdin: bool = typer.Option(False, "--stdin", help="从标准输入读值"),
+    prompt: bool = typer.Option(False, "--prompt", help="交互式隐藏输入值"),
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """设置一个策略级字段，写入前用与 `plugin check` 相同的判据复验。
+
+    未知字段直接拒绝（ADR-7：不猜测）——拼错字段名的"成功写入"会让人以为
+    某个安全开关生效了。`audit.path` 写字面 `null` 表示"仅内存"。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    if key not in _POLICY_KEYS:
+        raise UsageError(
+            f"未知的策略字段：{key!r}",
+            hint="可用字段：" + "、".join(_POLICY_KEYS),
+        )
+    raw_value = _resolve_value_input(value, read_stdin=read_stdin, prompt=prompt)
+    parsed = _parse_policy_value(key, raw_value)
+
+    path = _policy_path(app_ctx, policy)
+    with instance_lock(app_ctx.instance.lock):
+        raw = _load_policy_raw(path)
+        before = _policy_value(raw, key)
+        if key.startswith("audit."):
+            audit = raw.get("audit")
+            if audit is None:
+                audit = {}
+                raw["audit"] = audit
+            elif not isinstance(audit, dict):
+                # 不静默覆盖非法值：把它改掉等于替用户"修正"了配置，而严格
+                # 校验（plugin check / serve）会用另一套判断——两处不一致。
+                raise ConfigError(
+                    f"策略里的 audit 不是对象（实际是 {type(audit).__name__}）",
+                    hint="先用 `frpsctl plugin check` 查看详情并修正策略文件",
+                )
+            audit[key.split(".", 1)[1]] = parsed
+        else:
+            raw[key] = parsed
+        _save_policy_raw(path, raw)  # 严格复验 + 0600 原子写
+
+    shown_before = "***" if key == "admin_password" and before else before
+    shown_after = "***" if key == "admin_password" and parsed else parsed
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(path),
+                "key": key,
+                "before": shown_before,
+                "after": shown_after,
+            }
+        )
+        return
+    before_text = json.dumps(shown_before, ensure_ascii=False)
+    after_text = json.dumps(shown_after, ensure_ascii=False)
+    ui.emit(f"{key}: {before_text} → {after_text}")
+    if key == "allow_unknown_user" and parsed is True:
+        ui.warn("⚠ allow_unknown_user 已开启：未列出的用户会被放行，鉴权形同虚设")
+    ui.emit("提示：插件服务重启后载入新策略（`frpsctl plugin service status` 查看托管情况）。")
+
+
+def _parse_policy_value(key: str, raw: str):
+    """把命令行字符串转成策略字段的类型（严格：类型写错直接拒绝）。"""
+    text = raw.strip()
+    if key in ("allow_unknown_user", "require_client_id", "audit.enabled"):
+        lowered = text.lower()
+        if lowered not in ("true", "false"):
+            raise UsageError(f"{key} 必须是 true / false，实际是 {raw!r}")
+        return lowered == "true"
+    if key == "reject_log_burst":
+        try:
+            parsed = int(text)
+        except ValueError:
+            raise UsageError(f"{key} 必须是整数，实际是 {raw!r}") from None
+        if parsed < 1:
+            raise UsageError(f"{key} 必须 >= 1，实际是 {parsed}")
+        return parsed
+    if key == "reject_log_window":
+        try:
+            parsed = float(text)
+        except ValueError:
+            raise UsageError(f"{key} 必须是数字，实际是 {raw!r}") from None
+        if parsed < 0.1:
+            raise UsageError(f"{key} 必须 >= 0.1，实际是 {parsed}")
+        return parsed
+    if key == "audit.path":
+        # 字面 null = 仅内存（JSON 语义；空串会被值输入层按"漏填"拒绝）
+        return None if text == "null" else raw
+    return raw
+
+
 def _frpsctl_executable() -> Path:
     """当前 frpsctl 的可执行文件路径（写进插件 unit 的 ExecStart）。
 
@@ -2317,9 +2767,15 @@ def plugin_service_install(
     user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行插件的系统用户（需已存在）"),
     group: str = typer.Option(None, "--group", help="运行插件的系统组（默认与 --user 相同）"),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
+    access_log: bool = typer.Option(
+        False, "--access-log", help="把逐请求日志写进 journald（排查用；unit 模板为全部实例共享）"
+    ),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
     """安装 frpsctl-plugin@.service 并 enable（需要 root）。
+
+    注意：unit 模板（frpsctl-plugin@.service）为**全部实例共享**——bind、策略路径
+    与 access-log 等都写在这一个模板里，多实例环境里重装会覆盖这些参数。
 
     渲染前体检：服务账户存在、frpsctl 对服务用户可达且不在家目录
     （`ProtectHome=true`）、策略文件存在且合法、绑定地址为回环。
@@ -2336,6 +2792,7 @@ def plugin_service_install(
         force=force,
         user=user,
         group=group,
+        access_log=access_log,
     )
     if app_ctx.json:
         ui.emit_json(
@@ -2352,8 +2809,61 @@ def plugin_service_install(
     ui.emit(f"已安装 {path}")
     ui.emit(f"实例 unit：{service.unit_name}（User={user}, Group={group or user}）")
     ui.emit("")
-    ui.emit(f"启动：sudo systemctl start {service.unit_name}")
-    ui.emit("已 enable（开机自启）；停用：frpsctl plugin service uninstall")
+    ui.emit("启动：frpsctl plugin service start（该命令在此，无需手工 systemctl）")
+    ui.emit("已 enable（开机自启）；停止/重启/停用：plugin service stop|restart|uninstall")
+
+
+@plugin_service_app.command("start")
+def plugin_service_start(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """启动插件服务（systemd，需要 root）。
+
+    与 `frpsctl start` 的区别：那是 frps 进程的生命周期，这里动的是**插件
+    服务**这个独立 unit（`frpsctl-plugin@<实例>`）。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = PluginService(app_ctx.instance)
+    service.start()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "started": True})
+    else:
+        ui.emit(f"已启动 {service.unit_name}")
+        ui.emit("查看状态：frpsctl plugin service status")
+
+
+@plugin_service_app.command("stop")
+def plugin_service_stop(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停止插件服务（systemd，需要 root）。⚠️ 停止期间所有客户端都无法登录（fail-closed）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = PluginService(app_ctx.instance)
+    service.stop()
+    # 告警**无条件**进 stderr：即使 --json（脚本收集 stderr 时也必须看到）
+    # ——插件 fail-closed，停它等于停掉所有人的登录入口。
+    ui.warn("⚠ 插件已停止：期间所有客户端都无法登录（fail-closed），请尽快恢复")
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "stopped": True})
+    else:
+        ui.emit(f"已停止 {service.unit_name}")
+
+
+@plugin_service_app.command("restart")
+def plugin_service_restart(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """重启插件服务（systemd，需要 root）——改完策略后让它载入新配置的常用动作。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = PluginService(app_ctx.instance)
+    service.restart()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "restarted": True})
+    else:
+        ui.emit(f"已重启 {service.unit_name}（策略已重新载入）")
 
 
 @plugin_service_app.command("uninstall")
@@ -2376,16 +2886,20 @@ def plugin_service_status(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
-    """显示插件服务的 systemd 托管状态。"""
+    """显示插件服务的 systemd 托管状态（active 与 enabled 分开报告）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
     active = service.is_active()
+    enabled = service.is_enabled()
     pid = service.main_pid() if active else None
     if app_ctx.json:
-        ui.emit_json({"unit": service.unit_name, "active": active, "main_pid": pid})
+        ui.emit_json(
+            {"unit": service.unit_name, "active": active, "enabled": enabled, "main_pid": pid}
+        )
         return
     ui.emit(f"unit     : {service.unit_name}")
     ui.emit(f"active   : {active}")
+    ui.emit(f"enabled  : {enabled}（开机自启）")
     if pid:
         ui.emit(f"main pid : {pid}")
 
@@ -2432,6 +2946,9 @@ def web_serve(
         "--trusted-proxy",
         help="信任反向代理的 X-Forwarded-For（取最后一跳作为登录限速来源；默认关闭）",
     ),
+    access_log: bool = typer.Option(
+        False, "--access-log", help="把每个 HTTP 请求打进 stderr（排查用；默认关闭）"
+    ),
 ) -> None:
     """启动 Web 管理台（前台运行）。
 
@@ -2458,10 +2975,14 @@ def web_serve(
     )
     generated = False
     if not resolved:
-        resolved = secrets.token_urlsafe(18)
+        # 单点生成器（core.systemd.generate_web_password，经 web 包再导出）
+        resolved = generate_password()
         generated = True
     web_ctx = build_web_context(app_ctx.instance, resolved)
-    server = WebServer(web_ctx, WebSettings(bind=bind, trusted_proxy=trusted_proxy))
+    server = WebServer(
+        web_ctx,
+        WebSettings(bind=bind, trusted_proxy=trusted_proxy, access_log=access_log),
+    )
     try:
         server.start()
     except OSError as exc:
@@ -2491,6 +3012,11 @@ def web_service_install(
         "--trusted-proxy",
         help="信任反向代理的 X-Forwarded-For（写入 unit 的 serve 参数）",
     ),
+    access_log: bool = typer.Option(
+        False,
+        "--access-log",
+        help="把逐请求日志写进 journald（写入 unit 的 serve 参数；unit 模板为全部实例共享）",
+    ),
     user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行管理台的系统用户（需已存在）"),
     group: str = typer.Option(None, "--group", help="运行管理台的系统组（默认与 --user 相同）"),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
@@ -2501,6 +3027,10 @@ def web_service_install(
     安装时生成 0600 的登录口令文件（unit 只引用路径，明文不进 unit），
     并执行与 frps/插件同样的四项体检（账户 / frpsctl 可达且不在家目录 /
     实例目录不在家目录）。
+
+    注意：unit 模板（frpsctl-web@.service）为**全部实例共享**——bind、
+    trusted-proxy 与 access-log 等都写在这一个模板里，多实例环境里重装会
+    覆盖这些参数。
     """
     app_ctx = _ctx(ctx).with_json(json_output)
     if not healthcheck.is_loopback(bind) and not allow_non_loopback:
@@ -2516,6 +3046,7 @@ def web_service_install(
         user=user,
         group=group,
         trusted_proxy=trusted_proxy,
+        access_log=access_log,
     )
     if app_ctx.json:
         ui.emit_json(
@@ -2538,8 +3069,54 @@ def web_service_install(
     else:
         ui.emit(f"登录口令：沿用已有文件 {service.password_file}")
     ui.emit("")
-    ui.emit(f"启动：sudo systemctl start {service.unit_name}")
-    ui.emit("已 enable（开机自启）；停用：frpsctl web service uninstall")
+    ui.emit("启动：frpsctl web service start（该命令在此，无需手工 systemctl）")
+    ui.emit("已 enable（开机自启）；停止/重启/停用：web service stop|restart|uninstall")
+
+
+@web_service_app.command("start")
+def web_service_start(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """启动 Web 管理台（systemd，需要 root）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = WebService(app_ctx.instance)
+    service.start()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "started": True})
+    else:
+        ui.emit(f"已启动 {service.unit_name}")
+        ui.emit("查看状态：frpsctl web service status（地址见 unit 的 --bind）")
+
+
+@web_service_app.command("stop")
+def web_service_stop(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停止 Web 管理台（systemd，需要 root）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = WebService(app_ctx.instance)
+    service.stop()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "stopped": True})
+    else:
+        ui.emit(f"已停止 {service.unit_name}")
+
+
+@web_service_app.command("restart")
+def web_service_restart(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """重启 Web 管理台（systemd，需要 root）——口令轮换等改动重启后生效。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    service = WebService(app_ctx.instance)
+    service.restart()
+    if app_ctx.json:
+        ui.emit_json({"unit": service.unit_name, "restarted": True})
+    else:
+        ui.emit(f"已重启 {service.unit_name}")
 
 
 @web_service_app.command("uninstall")
@@ -2563,18 +3140,72 @@ def web_service_status(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
-    """显示 Web 管理台的 systemd 托管状态。"""
+    """显示 Web 管理台的 systemd 托管状态（active 与 enabled 分开报告）。"""
     app_ctx = _ctx(ctx).with_json(json_output)
     service = WebService(app_ctx.instance)
     active = service.is_active()
+    enabled = service.is_enabled()
     pid = service.main_pid() if active else None
     if app_ctx.json:
-        ui.emit_json({"unit": service.unit_name, "active": active, "main_pid": pid})
+        ui.emit_json(
+            {"unit": service.unit_name, "active": active, "enabled": enabled, "main_pid": pid}
+        )
         return
     ui.emit(f"unit     : {service.unit_name}")
     ui.emit(f"active   : {active}")
+    ui.emit(f"enabled  : {enabled}（开机自启）")
     if pid:
         ui.emit(f"main pid : {pid}")
+
+
+@web_password_app.command("set")
+def web_password_set(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    read_stdin: bool = typer.Option(
+        False, "--stdin", help="从标准输入读新口令（不进 argv 与 shell 历史）"
+    ),
+    prompt: bool = typer.Option(False, "--prompt", help="交互式隐藏输入新口令"),
+) -> None:
+    """设置（轮换）Web 管理台登录口令，写入 0600 口令文件。
+
+    不给输入通道时自动生成一个随机口令并**只显示一次**；用 `--stdin` /
+    `--prompt` 可提供自选口令（不回显）。口令由 systemd 托管的服务在**重启后**
+    生效——正在运行的管理台仍接受旧口令。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    if read_stdin or prompt:
+        value = _resolve_value_input(None, read_stdin=read_stdin, prompt=prompt)
+        generated = False
+    else:
+        value = generate_password()
+        generated = True
+
+    service = WebService(app_ctx.instance)
+    cfg.atomic_write(service.password_file, value + "\n", mode=0o600)
+    active = service.is_active()
+
+    if app_ctx.json:
+        payload: dict = {
+            "password_file": str(service.password_file),
+            "generated": generated,
+            "service_active": active,
+            "restart_required": active,
+        }
+        if generated:
+            payload["password"] = value
+        ui.emit_json(payload)
+        return
+
+    ui.emit(f"口令已写入 {service.password_file}（权限 0600）")
+    if generated:
+        ui.emit(f"新口令（仅显示这一次）：{value}")
+    else:
+        ui.emit("口令已按输入设置（不回显）")
+    if active:
+        ui.emit("⚠ 管理台正在运行：新口令在重启后生效（`systemctl restart frpsctl-web@<实例>`）")
+    else:
+        ui.emit("管理台未在运行；下次启动时生效。")
 
 
 @web_password_app.command("show")

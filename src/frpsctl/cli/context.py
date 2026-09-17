@@ -146,14 +146,21 @@ def map_exceptions() -> Iterator[None]:
             sys.stderr.close()
         raise SystemExit(0) from None
     except Exception as exc:  # noqa: BLE001 - 顶层兜底，必须给退出码
-        # Click 的用法错误族（UsageError / NoSuchOption / BadParameter…）自带
-        # exit_code（默认 2），与 §7.3 的"用法/参数错误"定义一致。
+        # Click 家族的两类异常都带 `exit_code`（用法错误族默认 2）：
+        # - 用法错误族（UsageError / NoSuchOption / BadParameter…）带
+        #   `format_message()`，需要打印消息；
+        # - `Exit`（`raise typer.Exit(1)` / `typer.Exit(subprocess.call(...))`）
+        #   是**静默退出**，不打印消息。
+        # `standalone_mode=False` 时 Click 会把 `Exit` 变成返回值（由调用方
+        # 接收），但直接调用（如测试）若忽略返回值，退出码就会表现为 0——
+        # 这里统一转成 SystemExit 兜底，保证任何调用方式下退出码都真实。
         code = getattr(exc, "exit_code", None)
-        if isinstance(code, int) and hasattr(exc, "format_message"):
-            try:
-                ui.warn(str(exc.format_message()))
-            except Exception:  # noqa: BLE001 - 渲染失败不影响退出码
-                ui.warn(str(exc))
+        if isinstance(code, int):
+            if hasattr(exc, "format_message"):
+                try:
+                    ui.warn(str(exc.format_message()))
+                except Exception:  # noqa: BLE001 - 渲染失败不影响退出码
+                    ui.warn(str(exc))
             raise SystemExit(code) from None
 
         ui.warn(f"未分类错误：{type(exc).__name__}: {exc}")
