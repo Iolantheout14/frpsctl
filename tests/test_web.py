@@ -461,8 +461,8 @@ class TestApiData:
         assert "dashboard 未启用" in payload["error"]
 
     def test_traffic_tolerates_single_proxy_failure(self, web, monkeypatch) -> None:
-        """单个代理的流量查询失败不拖垮整张趋势图（记为空 history）。"""
-        from frpsctl.core.admin import V2Proxy
+        """单个代理的流量查询失败不拖垮整张趋势图（记为空曲线）。"""
+        from frpsctl.core.admin import PageResult, V2Proxy
         from frpsctl.errors import AdminUnreachable
 
         class _FakeAdmin:
@@ -472,8 +472,9 @@ class TestApiData:
             def __exit__(self, *exc: object) -> bool:
                 return False
 
-            def list_proxies(self):
-                return [V2Proxy(name="bad", type="tcp"), V2Proxy(name="good", type="tcp")]
+            def page_proxies(self, **_kwargs):
+                items = [V2Proxy(name="bad", type="tcp"), V2Proxy(name="good", type="tcp")]
+                return PageResult(items=items, total=2)
 
             def proxy_traffic(self, name: str):
                 if name == "bad":
@@ -485,9 +486,15 @@ class TestApiData:
         client.login()
         status, payload, _ = client.call("/api/traffic")
         assert status == 200
-        assert [item["name"] for item in payload["proxies"]] == ["bad", "good"]
-        assert payload["proxies"][0]["history"] == []
-        assert payload["proxies"][1]["history"][0]["in"] == 1
+        # 汇总只包含 good 的数据（bad 记空曲线，不拖垮整体）
+        assert payload["days"] == [{"date": "2026-09-17", "in": 1, "out": 2}]
+        assert payload["proxies"] == 2
+        # 新形状：明细不再随汇总下发（按需走 /api/traffic/{name}）
+        assert "proxies_history" not in payload
+        status, one, _ = client.call("/api/traffic/good")
+        assert status == 200
+        assert one["history"][0]["in"] == 1
+        assert one["total"] == {"in": 1, "out": 2}
 
     def test_logs_endpoint_returns_lines(self, web) -> None:
         client = Client(web)
@@ -509,8 +516,11 @@ class TestApiData:
             def __exit__(self, *exc: object) -> bool:
                 return False
 
-            def list_proxies(self):
-                return [V2Proxy(name=f"p{i}", type="tcp") for i in range(TRAFFIC_MAX_PROXIES + 5)]
+            def page_proxies(self, **_kwargs):
+                from frpsctl.core.admin import PageResult
+
+                items = [V2Proxy(name=f"p{i}", type="tcp") for i in range(TRAFFIC_MAX_PROXIES + 5)]
+                return PageResult(items=items, total=len(items))
 
             def proxy_traffic(self, name: str):
                 return []
@@ -522,7 +532,7 @@ class TestApiData:
         assert status == 200
         assert payload["truncated"] is True
         assert payload["total"] == TRAFFIC_MAX_PROXIES + 5
-        assert len(payload["proxies"]) == TRAFFIC_MAX_PROXIES
+        assert payload["proxies"] == TRAFFIC_MAX_PROXIES
 
     def test_favicon_is_no_content(self, web) -> None:
         """`/favicon.ico` 返回 204（页面内嵌 data URI 图标；这里是旧工具收尾）。"""
@@ -897,3 +907,174 @@ class TestWebServerLifecycle:
             assert "前端资源缺失" in exc.read().decode("utf-8")
         finally:
             server.stop()
+
+
+
+# ---------------------------------------------------------------------------
+# v0.2.6：doctor / audit / traffic 缓存 / 动作成功路径 / 参数边界
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorEndpoint:
+    def test_doctor_endpoint_reports_counts_and_findings(self, web) -> None:
+        """只读体检：counts 三键 + findings 形状（与 CLI `doctor --json` 同源）。"""
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/doctor")
+        assert status == 200, payload
+        assert set(payload["counts"]) == {"error", "warn", "info"}
+        # 实例目录里没有 frps 二进制 → 至少一条 ERROR（二进制不存在）
+        assert payload["counts"]["error"] >= 1
+        assert payload["ok"] is False
+        assert payload["findings"], "没有任何发现项"
+        assert all({"check", "severity", "message", "hint"} <= set(f) for f in payload["findings"])
+
+
+class TestAuditEndpoint:
+    def test_audit_endpoint_reads_policy_and_log(self, web) -> None:
+        """审计视图：路径按"相对策略文件目录"解析，stats/tail 来自真实 JSONL。"""
+        import json as _json
+
+        inst = web.ctx.inst
+        (inst.dir / "plugin-policy.json").write_text(_json.dumps({"users": {}}), "utf-8")
+        audit_path = inst.dir / "plugin-audit.jsonl"
+        with open(audit_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                _json.dumps(
+                    {
+                        "at_unix": 100.0,
+                        "at": "2026-09-17T10:00:00",
+                        "op": "Login",
+                        "user": "alice",
+                        "decision": "deny",
+                        "reason": "未知用户",
+                    }
+                )
+                + "\n"
+            )
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit")
+        assert status == 200, payload
+        assert payload["available"] is True and payload["enabled"] is True
+        assert payload["path"] == str(audit_path), "审计路径没有相对策略文件目录解析"
+        assert payload["stats"]["deny"] == 1
+        assert payload["tail"][0]["user"] == "alice"
+
+    def test_audit_endpoint_without_policy_is_available_false(self, web) -> None:
+        """策略缺失不是 4xx/5xx：视图如实说明"为什么看不到审计"。"""
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit")
+        assert status == 200
+        assert payload["available"] is False and payload["reason"]
+        assert payload["stats"] is None and payload["tail"] == []
+
+
+class TestTrafficEndpointCache:
+    def test_repeated_calls_hit_server_side_cache(self, web, monkeypatch) -> None:
+        """30s 服务端缓存：浏览器 5 秒轮询不会每轮重放 dashboard 查询。"""
+        from frpsctl.core.admin import PageResult, V2Proxy
+
+        calls = {"pages": 0}
+
+        class _FakeAdmin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def page_proxies(self, **_kwargs):
+                calls["pages"] += 1
+                return PageResult(items=[V2Proxy(name="p1", type="tcp")], total=1)
+
+            def proxy_traffic(self, name: str):
+                return [{"date": "2026-09-17", "in": 1, "out": 1}]
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(web.ctx, "clock", lambda: clock["t"])
+        monkeypatch.setattr("frpsctl.web.api._admin", lambda _ctx: _FakeAdmin())
+        client = Client(web)
+        client.login()
+        assert client.call("/api/traffic")[0] == 200
+        assert client.call("/api/traffic")[0] == 200
+        assert calls["pages"] == 1, "第二次请求没有走服务端缓存"
+        clock["t"] += 31  # 超过 TTL
+        assert client.call("/api/traffic")[0] == 200
+        assert calls["pages"] == 2, "缓存过期后没有重新查询"
+
+
+class TestLogsParameterBounds:
+    def test_lines_are_clamped_and_bad_values_fall_back(self, web) -> None:
+        client = Client(web)
+        client.login()
+        log_file = web.ctx.inst.dir / "frps.log"
+        log_file.write_text("".join(f"line-{i}\n" for i in range(3000)), "utf-8")
+        cases = (("lines=abc", 200), ("lines=99999", 2000), ("lines=0", 1), ("lines=-5", 1))
+        for query, expected in cases:
+            status, payload, _ = client.call(f"/api/logs?{query}")
+            assert status == 200, query
+            assert len(payload["lines"]) == expected, (query, len(payload["lines"]))
+
+    def test_unnormalized_paths_do_not_serve_files(self, web) -> None:
+        """未规范化的路径片段不会穿越到文件系统（配置文件内容绝不出现在响应里）。"""
+        import http.client
+
+        client = Client(web)
+        client.login()
+        conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
+        try:
+            conn.request("GET", "/api/../frps.toml", headers={"Cookie": client.cookie})
+            resp = conn.getresponse()
+            body = resp.read()
+            assert resp.status in (401, 404), resp.status
+            assert b"test-token" not in body
+
+            conn.request("GET", "/../frps.toml")
+            resp = conn.getresponse()
+            body = resp.read()
+            assert resp.status == 404, resp.status
+            assert b"test-token" not in body
+        finally:
+            conn.close()
+
+
+class TestActionSuccessPaths:
+    """`/api/actions/restart|rollback` 的成功路径（v0.2.6 补齐）。
+
+    此前 Web 测试只覆盖了拒绝路径（409/400）——"动作真的能做到"没有得到证明。
+    """
+
+    def test_restart_success_path(self, web) -> None:
+        make_fake_frps(web.ctx.inst.bin_dir)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/start", method="POST", body={})
+        assert status == 200, payload
+        try:
+            status, payload, _ = client.call("/api/actions/restart", method="POST", body={})
+            assert status == 200, payload
+            assert payload["pid"]
+            assert payload["healthy"] is True
+        finally:
+            client.call("/api/actions/stop", method="POST", body={})
+
+    def test_rollback_success_path(self, web) -> None:
+        """回滚：快照 → 改配置 → 回滚 → 文件恢复且响应含打码 diff。"""
+        from frpsctl.core.transaction import config_snapshot
+
+        make_fake_frps(web.ctx.inst.bin_dir)
+        inst = web.ctx.inst
+        config_snapshot(inst, action="set bindPort")
+        original = inst.config.read_text("utf-8")
+        inst.config.write_text(original.replace("bindPort = 17000", "bindPort = 17001"), "utf-8")
+
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/rollback", method="POST", body={"steps": 1})
+        assert status == 200, payload
+        assert "bindPort = 17000" in inst.config.read_text("utf-8")
+        assert payload["diff"]
+        # 回滚不泄露机密（diff 打码；快照里带 test-token）
+        assert "test-token" not in payload["diff"]

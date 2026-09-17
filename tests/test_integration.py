@@ -1217,3 +1217,211 @@ class TestUninstall:
         with pytest.raises(OwnershipConflict, match="systemd 托管"):
             execute_uninstall(plan_uninstall(inst))
         assert inst.dir.exists()
+
+
+
+class TestWebServeProcess:
+    """`web serve` 成功路径全链路（v0.2.6 补齐：此前"成功路径零覆盖"）。
+
+    起真实子进程 → 未登录 401 → 登录 → 拉状态 → SIGTERM 优雅退出（退出码 0）。
+    这层验证的是"启动 → 可用 → 信号退出"整条链路，而不是单个函数。
+    """
+
+    def test_serve_login_status_and_sigterm(self, tmp_path) -> None:
+        import signal
+        import subprocess
+        import sys
+        import urllib.error
+        import urllib.request
+
+        from .conftest import wait_port
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        env.pop("FRPSCTL_WEB_PASSWORD", None)
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+
+        init = subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        assert init.returncode == 0, init.stderr
+
+        port = free_port()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "frpsctl",
+                "web",
+                "serve",
+                "--bind",
+                f"127.0.0.1:{port}",
+                "--password",
+                "smoke-password",  # noqa: S106 - 测试口令
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        try:
+            assert wait_port("127.0.0.1", port, timeout=15), "web serve 未在超时内就绪"
+            base = f"http://127.0.0.1:{port}"
+
+            # 未登录 → 401
+            try:
+                urllib.request.urlopen(base + "/api/status", timeout=5)  # noqa: S310 - 固定回环
+                raise AssertionError("未登录访问 /api/status 应当 401")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+
+            # 登录 → 会话可用
+            req = urllib.request.Request(  # noqa: S310
+                base + "/api/login",
+                method="POST",
+                data=json.dumps({"password": "smoke-password"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                cookie = resp.headers["Set-Cookie"].split(";")[0]
+            req = urllib.request.Request(base + "/api/status", headers={"Cookie": cookie})  # noqa: S310
+            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                payload = json.load(resp)
+            assert payload["state"] == "STOPPED"
+            assert payload["instance"] == "default"
+
+            # 静态页面可访问
+            with urllib.request.urlopen(base + "/", timeout=5) as resp:  # noqa: S310
+                assert resp.status == 200
+                assert "frpsctl 管理台" in resp.read().decode("utf-8")
+
+            # SIGTERM → 优雅退出（退出码 0）
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=15) == 0, "SIGTERM 未优雅退出"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+
+class TestAuditTailFollowFlush:
+    """`plugin audit tail -f` 必须**实时**输出（stdout 缓冲回归守卫）。
+
+    回归（v0.2.6 回归 review 实测复现）：跟随循环用 `ui.emit`（无 flush），
+    stdout 重定向到文件/管道时新记录被块缓冲吞住——`-f` 的核心语义
+    （实时）失效，直到进程退出或缓冲写满才出现。
+    """
+
+    def test_follow_emits_without_waiting_for_process_exit(self, tmp_path) -> None:
+        import json
+        import select
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        env.pop("FRPSCTL_PLUGIN_POLICY", None)
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "plugin", "init"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        audit = tmp_path / "instances" / "default" / "plugin-audit.jsonl"
+        audit.write_text("", "utf-8")
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "frpsctl", "plugin", "audit", "tail", "-f"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            time.sleep(1.2)  # 等它进入跟随循环
+            with open(audit, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "at": "2026-09-17T10:00:00",
+                            "at_unix": 100.0,
+                            "op": "Ping",
+                            "user": "",
+                            "decision": "allow",
+                        }
+                    )
+                    + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            # 在 3 秒内应能从管道读到新行（不杀进程、不依赖退出 flush）
+            ready, _, _ = select.select([proc.stdout], [], [], 3.0)
+            assert ready, "跟随输出没有实时到达（stdout 缓冲未 flush？）"
+            line = proc.stdout.readline()
+            assert "Ping" in line, line
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+
+class TestWatchStreamFlush:
+    """`status --watch --json` 必须逐轮 flush（NDJSON 流式消费回归守卫）。
+
+    回归（v0.2.6 回归 review 实测复现）：`| jq` 或重定向场景下块缓冲攒满
+    4KB 才吐数据——"watch"失去意义；与 `plugin audit tail -f` 同型、同一
+    轮修复。
+    """
+
+    def test_watch_json_lines_arrive_without_buffering(self, tmp_path) -> None:
+        import json
+        import select
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "frpsctl", "status", "--watch", "--interval", "1", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            lines: list[dict] = []
+            deadline = time.monotonic() + 6
+            while len(lines) < 2 and time.monotonic() < deadline:
+                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                line = proc.stdout.readline()
+                if line.strip():
+                    lines.append(json.loads(line))
+            assert len(lines) >= 2, f"6 秒内只收到 {len(lines)} 行（缓冲未冲刷？）"
+            assert lines[0]["state"] == "STOPPED"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)

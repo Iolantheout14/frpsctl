@@ -1081,3 +1081,33 @@ class TestServeForeverLifecycle:
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert record["op"] == "Login" and record["user"] == "alice"
+
+
+
+class TestAuditPathResolution:
+    """审计相对路径相对**策略文件**解析（v0.2.6）。
+
+    旧行为：`audit.path` 相对进程 CWD——`plugin serve` 手工前台运行与 systemd
+    托管（WorkingDirectory=实例目录）会写到两个地方，同一份策略因启动方式
+    不同而"审计消失"。现在写入与读取都相对策略文件目录。
+    """
+
+    def test_server_settings_policy_path_resolves_audit(self, tmp_path) -> None:
+        policy_path = tmp_path / "conf" / "plugin-policy.json"
+        policy_path.parent.mkdir()
+        policy_path.write_text(json.dumps({"users": {}}), "utf-8")
+        policy = PluginPolicy.load(policy_path)
+        server = PluginServer(policy, ServerSettings(bind="127.0.0.1:0", policy_path=policy_path))
+        try:
+            assert server.audit.path == policy_path.parent / "plugin-audit.jsonl"
+        finally:
+            server.close()
+
+    def test_without_policy_path_relative_stays_relative(self) -> None:
+        """未提供策略路径时保持旧语义（原样相对路径）——不引入意外行为。"""
+        policy = PluginPolicy.parse({"users": {}, "audit": {"path": "audit.jsonl"}})
+        server = PluginServer(policy, ServerSettings(bind="127.0.0.1:0"))
+        try:
+            assert server.audit.path == Path("audit.jsonl")
+        finally:
+            server.close()

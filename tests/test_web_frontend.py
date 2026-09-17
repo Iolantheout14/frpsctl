@@ -135,3 +135,70 @@ class TestFrontendDiscipline:
         defined = set(re.findall(r'\bid="([^"]+)"', html))
         assert not (referenced - defined), f"JS 引用了未定义的 id：{sorted(referenced - defined)}"
         assert not (defined - referenced), f"HTML 里有从未被引用的 id：{sorted(defined - referenced)}"
+
+
+class TestFrontendPureFunctionsRuntime:
+    """前端纯逻辑的**动态执行**守卫（node 执行从单文件里抽取的函数源码）。
+
+    静态守卫（`node --check` / id 核对）抓不到"逻辑错了但语法正确"。此前对
+    前端行为的验证全靠人工点验（v0.2.4 的 DOM stub 试验没有固化成测试），
+    这里把纯函数的边界变成 CI 断言。配置页的数组值校验（`looksBalanced`）
+    是 v0.2.6 新增启发式，属于此类。
+    """
+
+    @staticmethod
+    def _extract(script: str, name: str) -> str:
+        match = re.search(rf"function {name}\(.*?\n\}}", script, re.S)
+        assert match is not None, f"找不到函数 {name}（重构后请同步本测试的抽取逻辑）"
+        return match.group(0)
+
+    def _run(self, tmp_path: Path, source: str, checks: list[str]) -> None:
+        assert shutil.which("node") is not None, "需要 node"
+        js = source + "\n" + "\n".join(checks) + "\nconsole.log('ok');\n"
+        target = tmp_path / "check.js"
+        target.write_text(js, "utf-8")
+        proc = subprocess.run(
+            ["node", str(target)], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_looks_balanced_boundaries(self, tmp_path: Path) -> None:
+        script = "\n".join(_script_blocks(_index_html()))
+        source = self._extract(script, "looksBalanced")
+        import json as _json
+
+        cases = [
+            ("7000", True),
+            ("true", True),
+            ('"text"', True),
+            ("[1, 2, 3]", True),
+            ("[{ single = 6000 }, { start = 7000, end = 7100 }]", True),
+            ('{ token = "with ] bracket" }', True),
+            ("[1, 2", False),
+            ("{ a = 1 ]", False),
+            ('"unclosed', False),
+            ("]", False),
+            ("", True),
+            ("   ", True),
+        ]
+        checks = [
+            f"if (looksBalanced({_json.dumps(value)}) !== {str(expected).lower()}) "
+            f"{{ console.error({_json.dumps(f'looksBalanced({value}) != {expected}')}); process.exit(1); }}"
+            for value, expected in cases
+        ]
+        self._run(tmp_path, source, checks)
+
+    def test_human_bytes_and_duration_boundaries(self, tmp_path: Path) -> None:
+        script = "\n".join(_script_blocks(_index_html()))
+        source = "\n".join(
+            [self._extract(script, "humanBytes"), self._extract(script, "humanDuration")]
+        )
+        checks = [
+            "if (humanBytes(0) !== '0 B') { console.error(humanBytes(0)); process.exit(1); }",
+            "if (humanBytes(1024) !== '1.0 KiB') { console.error(humanBytes(1024)); process.exit(1); }",
+            "if (humanBytes(null) !== '-') process.exit(1);",
+            "if (humanDuration(90) !== '1m30s') { console.error(humanDuration(90)); process.exit(1); }",
+            "if (humanDuration(3600) !== '1h0m') { console.error(humanDuration(3600)); process.exit(1); }",
+            "if (humanDuration(null) !== '-') process.exit(1);",
+        ]
+        self._run(tmp_path, source, checks)

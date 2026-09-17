@@ -2675,3 +2675,506 @@ class TestSystemdDisableOnly:
         assert systemd.is_enabled() is True
         fake_run.exists, fake_run.state = True, "disabled"
         assert systemd.is_enabled() is False
+
+
+
+# ---------------------------------------------------------------------------
+# v0.2.6：日志反向读 / 分页 total / 审计读取 / doctor counts
+# ---------------------------------------------------------------------------
+
+
+class TestTailLinesReverseRead:
+    """`core/logs.tail_lines` 从文件尾反向按块读（v0.2.6）。
+
+    旧实现用 `deque(maxlen)` 全量扫描：100MB 日志每看一次读 100MB、Web 每 5 秒
+    轮询一次再读一遍。反向读之后读取量与"需要几行"相关，与日志总量解耦。
+    """
+
+    def test_basic_tail(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("1\n2\n3\n4\n5\n", "utf-8")
+        assert tail_lines(path, 2) == ["4\n", "5\n"]
+        assert tail_lines(path, 5) == ["1\n", "2\n", "3\n", "4\n", "5\n"]
+
+    def test_lines_larger_than_file(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("x\ny\n", "utf-8")
+        assert tail_lines(path, 100) == ["x\n", "y\n"]
+
+    def test_no_trailing_newline(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("a\nb\nc", "utf-8")
+        assert tail_lines(path, 2) == ["b\n", "c"]
+        assert tail_lines(path, 1) == ["c"]
+        assert tail_lines(path, 4) == ["a\n", "b\n", "c"]
+
+    def test_single_line_without_newline(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("only", "utf-8")
+        assert tail_lines(path, 5) == ["only"]
+
+    def test_empty_missing_and_zero(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("", "utf-8")
+        assert tail_lines(path, 5) == []
+        assert tail_lines(tmp_path / "missing.log", 5) == []
+        assert tail_lines(path, 0) == []
+
+    def test_crlf_and_multibyte(self, tmp_path) -> None:
+        from frpsctl.core.logs import tail_lines
+
+        path = tmp_path / "a.log"
+        path.write_text("第一行\r\n第二行\r\n", "utf-8")
+        assert tail_lines(path, 1) == ["第二行\r\n"]
+
+    def test_cross_block_boundary(self, tmp_path, monkeypatch) -> None:
+        """把块大小改到极小，逼出多块回扫与边界切分路径。"""
+        from frpsctl.core import logs
+
+        monkeypatch.setattr(logs, "TAIL_BLOCK_BYTES", 7)
+        path = tmp_path / "a.log"
+        path.write_text("".join(f"line-{i}\n" for i in range(50)), "utf-8")
+        assert logs.tail_lines(path, 3) == ["line-47\n", "line-48\n", "line-49\n"]
+        assert logs.tail_lines(path, 50)[0] == "line-0\n"
+
+    def test_multibyte_across_block_boundary(self, tmp_path, monkeypatch) -> None:
+        from frpsctl.core import logs
+
+        monkeypatch.setattr(logs, "TAIL_BLOCK_BYTES", 4)
+        path = tmp_path / "a.log"
+        path.write_text("aaaa\n汉字汉字\n", "utf-8")
+        assert logs.tail_lines(path, 1) == ["汉字汉字\n"]
+
+    def test_reads_only_tail_region(self, tmp_path, monkeypatch) -> None:
+        """I/O 量必须与"需要几行"相关而不是文件大小（全量扫描的回归守卫）。"""
+        import builtins
+
+        from frpsctl.core import logs
+
+        path = tmp_path / "big.log"
+        with open(path, "wb") as handle:
+            handle.write(b"filler filler filler\n" * 200_000)  # ~4.6 MB
+            handle.write("".join(f"line-{i}\n" for i in range(100)).encode("utf-8"))
+        stats = {"bytes": 0}
+        real_open = builtins.open
+
+        class _Counting:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+
+            def read(self, size=-1):
+                data = self._handle.read(size)
+                stats["bytes"] += len(data)
+                return data
+
+            def seek(self, *args):
+                return self._handle.seek(*args)
+
+            def tell(self):
+                return self._handle.tell()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                self._handle.close()
+
+        monkeypatch.setattr(builtins, "open", lambda *a, **k: _Counting(real_open(*a, **k)))
+        lines = logs.tail_lines(path, 50)
+        assert len(lines) == 50
+        assert lines[-1] == "line-99\n"
+        assert stats["bytes"] < 300_000, f"读取了 {stats['bytes']} 字节（应只读尾部区域）"
+
+
+class TestAdminPages:
+    """`core/admin`：全量翻页的 total/截断汇报与清理计数（v0.2.6）。"""
+
+    @staticmethod
+    def _client(monkeypatch, payloads):
+        from frpsctl.core.admin import AdminClient
+
+        client = AdminClient("http://127.0.0.1:1")
+        queue = list(payloads)
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, payload) -> None:
+                self._payload = payload
+
+            def json(self):
+                return {"code": 0, "data": self._payload}
+
+        def fake_get(path, params=None):  # noqa: ANN001, ARG001
+            assert queue, f"多余的请求：{path}"
+            return _Resp(queue.pop(0))
+
+        monkeypatch.setattr(client, "_get", fake_get)
+        return client
+
+    def test_page_result_total_and_multi_page(self, monkeypatch) -> None:
+        client = self._client(
+            monkeypatch,
+            [
+                {"items": [{"key": "a"}, {"key": "b"}], "total": 3},
+                {"items": [{"key": "c"}], "total": 3},
+            ],
+        )
+        page = client.page_clients()
+        assert [item["key"] for item in page.items] == ["a", "b", "c"]
+        assert page.total == 3
+        assert page.truncated is False
+
+    def test_truncation_is_reported_when_max_pages_exhausted(self, monkeypatch) -> None:
+        """翻页上限用尽仍未拉全 → `truncated` 必须为真（旧实现静默截断）。"""
+        client = self._client(
+            monkeypatch,
+            [
+                {"items": [{"key": "a"}], "total": 10},
+                {"items": [{"key": "b"}], "total": 10},
+            ],
+        )
+        page = client._paged("/api/v2/clients", max_pages=2)
+        assert page.truncated is True
+        assert page.total == 10
+        assert len(page.items) == 2
+
+    def test_prune_offline_counts_before_and_after(self, monkeypatch) -> None:
+        from frpsctl.core.admin import AdminClient, PageResult, V2Proxy
+
+        client = AdminClient("http://127.0.0.1:1")
+        deletes = {"count": 0}
+        pages = [
+            PageResult(
+                items=[
+                    V2Proxy(name="a", phase="offline"),
+                    V2Proxy(name="b", phase="online"),
+                    V2Proxy(name="c", phase="offline"),
+                ],
+                total=3,
+            ),
+            PageResult(items=[V2Proxy(name="b", phase="online")], total=1),
+        ]
+        monkeypatch.setattr(client, "page_proxies", lambda **_kw: pages.pop(0))
+        monkeypatch.setattr(
+            client, "clear_offline_proxies", lambda: deletes.__setitem__("count", deletes["count"] + 1)
+        )
+        outcome = client.prune_offline_proxies()
+        assert (outcome.before, outcome.cleared, outcome.exact) == (2, 2, True)
+        assert deletes["count"] == 1
+
+
+class TestAggregateDays:
+    """趋势聚合下沉到 core 后的口径（CLI 与 Web 共用同一实现）。"""
+
+    def test_sums_by_date_sorted(self) -> None:
+        from frpsctl.core.admin import aggregate_days, traffic_total
+
+        series = [
+            [
+                {"date": "2026-09-17", "in": 1, "out": 2},
+                {"date": "2026-09-16", "in": 5, "out": 0},
+            ],
+            [{"date": "2026-09-17", "in": 10, "out": 20}],
+        ]
+        days = aggregate_days(series)
+        assert days == [
+            {"date": "2026-09-16", "in": 5, "out": 0},
+            {"date": "2026-09-17", "in": 11, "out": 22},
+        ]
+        assert traffic_total(days) == {"in": 16, "out": 22}
+
+    def test_points_without_date_are_ignored(self) -> None:
+        from frpsctl.core.admin import aggregate_days
+
+        assert aggregate_days([[{"date": "", "in": 1, "out": 1}, {"in": 2, "out": 2}]]) == []
+        assert aggregate_days([]) == []
+
+
+class TestDoctorCounts:
+    def test_counts_by_severity(self) -> None:
+        from frpsctl.core.doctor import DoctorReport, Finding, Severity
+
+        report = DoctorReport(
+            instance="x",
+            findings=[
+                Finding("a", Severity.ERROR, "e"),
+                Finding("b", Severity.WARN, "w"),
+                Finding("c", Severity.WARN, "w2"),
+                Finding("d", Severity.INFO, "i"),
+            ],
+        )
+        assert report.counts == {"error": 1, "warn": 2, "info": 1}
+        assert report.ok is False
+
+
+class TestAuditlog:
+    """`core/auditlog`：策略定位 / 审计路径解析 / tail / stats。"""
+
+    def test_resolve_policy_path_precedence(self, tmp_path, monkeypatch, inst) -> None:
+        from frpsctl.core.auditlog import DEFAULT_POLICY_FILE, resolve_policy_path
+
+        override = tmp_path / "custom.json"
+        assert resolve_policy_path(inst, override) == override
+        monkeypatch.setenv("FRPSCTL_PLUGIN_POLICY", str(tmp_path / "env.json"))
+        assert resolve_policy_path(inst, None) == tmp_path / "env.json"
+        monkeypatch.delenv("FRPSCTL_PLUGIN_POLICY")
+        assert resolve_policy_path(inst, None) == inst.dir / DEFAULT_POLICY_FILE
+
+    def test_resolve_audit_path_relative_to_policy(self, tmp_path) -> None:
+        from frpsctl.core.auditlog import resolve_audit_path
+
+        policy = tmp_path / "sub" / "policy.json"
+        assert resolve_audit_path(policy, "audit.jsonl") == policy.parent / "audit.jsonl"
+        assert resolve_audit_path(policy, "/var/log/a.jsonl") == Path("/var/log/a.jsonl")
+        assert resolve_audit_path(policy, None) is None
+
+    def test_load_view_defaults_match_strict_parser(self, inst) -> None:
+        """宽容视图与严格解析的默认值必须一致（防两处默认漂移）。"""
+        import json
+
+        from frpsctl.core.auditlog import DEFAULT_AUDIT_FILE, load_view
+        from frpsctl.plugin.policy import PluginPolicy
+
+        policy_path = inst.dir / "plugin-policy.json"
+        policy_path.write_text(json.dumps({"users": {}}), "utf-8")
+        view = load_view(inst)
+        assert view.available is True and view.enabled is True
+        assert view.path == policy_path.parent / DEFAULT_AUDIT_FILE
+        strict = PluginPolicy.parse({"users": {}})
+        assert strict.audit.enabled is view.enabled
+        assert view.path is not None and view.path.name == strict.audit.path.name
+
+    def test_load_view_reports_missing_and_broken(self, inst) -> None:
+        from frpsctl.core.auditlog import load_view
+
+        view = load_view(inst)
+        assert view.available is False and view.reason
+        (inst.dir / "plugin-policy.json").write_text("{broken", "utf-8")
+        view = load_view(inst)
+        assert view.available is False and "不合法" in view.reason
+
+    def test_load_view_disabled_and_memory_only(self, inst) -> None:
+        import json
+
+        from frpsctl.core.auditlog import load_view
+
+        policy = inst.dir / "plugin-policy.json"
+        policy.write_text(json.dumps({"users": {}, "audit": {"enabled": False}}), "utf-8")
+        view = load_view(inst)
+        assert view.available is True and view.enabled is False
+        policy.write_text(json.dumps({"users": {}, "audit": {"path": None}}), "utf-8")
+        view = load_view(inst)
+        assert view.available is True and view.enabled is True and view.path is None
+
+    def test_load_view_invalid_audit_shapes(self, inst) -> None:
+        import json
+
+        from frpsctl.core.auditlog import load_view
+
+        policy = inst.dir / "plugin-policy.json"
+        policy.write_text(json.dumps({"users": {}, "audit": "false"}), "utf-8")
+        assert load_view(inst).enabled is False
+        policy.write_text(json.dumps({"users": {}, "audit": {"enabled": "yes"}}), "utf-8")
+        assert load_view(inst).enabled is False
+
+    def test_parse_since_formats(self) -> None:
+        from datetime import datetime
+
+        from frpsctl.core.auditlog import parse_since
+        from frpsctl.errors import UsageError
+
+        now = 1_000_000.0
+        assert parse_since("24h", now=now) == now - 86400
+        assert parse_since("90m", now=now) == now - 5400
+        assert parse_since("123", now=now) == 123.0
+        expected = datetime.fromisoformat("2026-09-17T10:00:00").timestamp()
+        assert parse_since("2026-09-17T10:00:00") == expected
+        for bad in ("", "abc", "24x"):
+            with pytest.raises(UsageError):
+                parse_since(bad)
+
+    def test_summarize_counts_window_and_bad_lines(self, tmp_path) -> None:
+        import json
+
+        from frpsctl.core.auditlog import summarize
+
+        path = tmp_path / "audit.jsonl"
+        records = [
+            {"at_unix": 100.0, "op": "Login", "user": "alice", "decision": "allow"},
+            {"at_unix": 200.0, "op": "Login", "user": "mallory", "decision": "deny", "suppressed": 3},
+            {"at_unix": 300.0, "op": "NewProxy", "user": "alice", "decision": "allow"},
+        ]
+        with open(path, "w", encoding="utf-8") as handle:
+            for item in records:
+                handle.write(json.dumps(item) + "\n")
+            handle.write("{half\n")  # 进程被 kill 时的半截行
+        summary = summarize(path)
+        assert (summary.total, summary.allow, summary.deny, summary.bad_lines) == (3, 2, 1, 1)
+        assert summary.suppressed_total == 3
+        assert summary.by_user["alice"] == {"allow": 2, "deny": 0}
+        assert summary.by_user["mallory"] == {"allow": 0, "deny": 1}
+        assert summary.by_op == {"Login": 2, "NewProxy": 1}
+        assert (summary.first_at, summary.last_at) == (100.0, 300.0)
+
+        windowed = summarize(path, since=250.0)
+        assert windowed.total == 1 and windowed.by_op == {"NewProxy": 1}
+
+    def test_summarize_bounds_user_table(self, tmp_path) -> None:
+        """`user` 是客户端自报的任意字符串：统计表必须有界（输入驱动表纪律）。"""
+        import json
+
+        from frpsctl.core.auditlog import MAX_STAT_USERS, summarize
+
+        path = tmp_path / "audit.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            for i in range(MAX_STAT_USERS + 50):
+                handle.write(
+                    json.dumps(
+                        {"at_unix": float(i), "op": "Login", "user": f"u{i}", "decision": "deny"}
+                    )
+                    + "\n"
+                )
+        summary = summarize(path)
+        assert len(summary.by_user) == MAX_STAT_USERS + 1  # 上限 + "(其他)"桶
+        assert summary.by_user["(其他)"]["deny"] == 50
+        assert summary.total == MAX_STAT_USERS + 50
+
+    def test_read_tail_skips_bad_lines(self, tmp_path) -> None:
+        import json
+
+        from frpsctl.core.auditlog import read_tail
+
+        path = tmp_path / "audit.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"at_unix": 1.0, "op": "Login", "user": "a", "decision": "allow"}) + "\n")
+            handle.write("not-json\n")
+            handle.write(json.dumps({"at_unix": 2.0, "op": "Login", "user": "b", "decision": "deny"}) + "\n")
+        tail = read_tail(path, 10)
+        assert [r["user"] for r in tail.records] == ["a", "b"]
+        assert tail.bad_lines == 1
+        assert read_tail(tmp_path / "missing.jsonl", 5).records == []
+
+
+
+class TestAuditlogOpBounds:
+    def test_summarize_bounds_op_table(self, tmp_path) -> None:
+        """`op` 来自请求 query（恶意请求可任意制造）：统计表同样必须有界。"""
+        import json
+
+        from frpsctl.core.auditlog import MAX_STAT_OPS, summarize
+
+        path = tmp_path / "audit.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            for i in range(MAX_STAT_OPS + 20):
+                handle.write(
+                    json.dumps(
+                        {"at_unix": float(i), "op": f"Evil{i}", "user": "u", "decision": "deny"}
+                    )
+                    + "\n"
+                )
+        summary = summarize(path)
+        assert len(summary.by_op) == MAX_STAT_OPS + 1
+        assert summary.by_op["(其他)"] == 20
+        assert summary.total == MAX_STAT_OPS + 20
+
+
+
+class TestServiceAccessLogRender:
+    """`--access-log` 的 unit 渲染（v0.2.6：此前 systemd 部署无法开启访问日志，
+    虽然 `plugin serve --access-log` / `web serve --access-log` 早已存在）。"""
+
+    def test_plugin_unit_flag_only_when_requested(self, tmp_path) -> None:
+        from frpsctl.core.systemd import render_plugin_unit
+
+        base = {
+            "exec_start": "/opt/frpsctl",
+            "bind": "127.0.0.1:8080",
+            "handler_path": "/handler",
+            "policy": tmp_path / "p.json",
+            "workdir": tmp_path,
+        }
+        plain = render_plugin_unit(**base)
+        assert "--access-log" not in plain, "默认渲染不应带访问日志开关"
+        line = next(
+            item for item in render_plugin_unit(**base, access_log=True).splitlines()
+            if item.startswith("ExecStart=")
+        )
+        assert line.endswith("--access-log"), line
+
+    def test_web_unit_flag_only_when_requested(self, tmp_path) -> None:
+        from frpsctl.core.systemd import render_web_unit
+
+        base = {
+            "exec_start": "/opt/frpsctl",
+            "bind": "127.0.0.1:8787",
+            "password_file": tmp_path / "web-password",
+            "workdir": tmp_path,
+        }
+        plain = render_web_unit(**base)
+        assert "--access-log" not in plain
+        line = next(
+            item for item in render_web_unit(**base, access_log=True).splitlines()
+            if item.startswith("ExecStart=")
+        )
+        assert line.endswith("--access-log"), line
+        # 与既有旗标可以叠加
+        combined = next(
+            item for item in render_web_unit(
+                **base, access_log=True, trusted_proxy=True
+            ).splitlines()
+            if item.startswith("ExecStart=")
+        )
+        assert combined.endswith("--trusted-proxy --access-log"), combined
+
+
+class TestPasswordGeneratorSingleSource:
+    """口令生成器必须单点（v0.2.6 收敛：此前三处各写一份 token_urlsafe(18)，
+    而 `generate_web_password` 的 docstring 却声称'单点实现'——注释与事实不符）。"""
+
+    def test_web_generator_delegates_to_core(self) -> None:
+        import inspect
+
+        from frpsctl.core.systemd import generate_web_password
+        from frpsctl.web import generate_password
+
+        source = inspect.getsource(generate_password)
+        assert "generate_web_password" in source, "web 侧生成器没有委托 core 单点"
+        assert "secrets" not in source, "web 侧仍在自行实现口令生成"
+        assert len(generate_web_password()) >= 20
+
+
+class TestAuditSummaryElapsed:
+    def test_elapsed_avg_max_and_count(self, tmp_path) -> None:
+        """审计记录 elapsed_ms 的目的就是回答"插件拖慢了登录吗"——统计出口。"""
+        import json
+
+        from frpsctl.core.auditlog import summarize
+
+        path = tmp_path / "audit.jsonl"
+        with open(path, "w", encoding="utf-8") as handle:
+            for i, elapsed in enumerate((10.0, 20.0, 30.0, None)):
+                record = {"at_unix": float(i), "op": "Login", "user": "u", "decision": "allow"}
+                if elapsed is not None:
+                    record["elapsed_ms"] = elapsed
+                handle.write(json.dumps(record) + "\n")
+        summary = summarize(path)
+        assert summary.elapsed_count == 3
+        assert summary.elapsed_avg_ms == 20.0
+        assert summary.elapsed_max_ms == 30.0
+
+    def test_elapsed_absent_is_zero(self, tmp_path) -> None:
+        from frpsctl.core.auditlog import summarize
+
+        summary = summarize(tmp_path / "missing.jsonl")
+        assert (summary.elapsed_count, summary.elapsed_avg_ms, summary.elapsed_max_ms) == (0, 0.0, 0.0)
