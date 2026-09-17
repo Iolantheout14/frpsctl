@@ -16,7 +16,12 @@ import httpx
 
 from ..errors import AdminUnreachable, ApiVersionMismatch
 
-__all__ = ["AdminClient", "ProxyStat", "ServerInfo", "V2Proxy", "sum_proxy_types"]
+__all__ = ["AdminClient", "ProxyStat", "ServerInfo", "V2Proxy", "sum_proxy_types", "TRAFFIC_MAX_PROXIES"]
+
+#: 趋势/汇总类查询最多覆盖多少个代理（每个代理一次 dashboard 请求）。
+#: 放在 core 是因为 CLI `traffic` 与 Web 趋势接口共用同一约束——两处各写一个
+#: 数字迟早漂移，而"查了 50 个还是 100 个"直接决定响应时间。
+TRAFFIC_MAX_PROXIES = 50
 
 
 def _is_loopback_url(base_url: str) -> bool:
@@ -287,11 +292,19 @@ class AdminClient:
 
         `granularity` 查询参数**无效**（实测传 hour 仍返回 day）——趋势图按天画。
         名称里的 `/` 等字符必须转义后才能拼进路径。
+
+        **404 = 无数据**（真机语义，契约 C10）：离线/不存在的代理返回
+        `no proxy info found`。这是常态（已下线的客户端、待清理的离线记录），
+        因此返回空列表而不是把它升级成错误——CLI `traffic` 与 Web 趋势图
+        都依赖"一个离线代理不拖垮整体"。
         """
         from urllib.parse import quote
 
         path = f"/api/v2/proxies/{quote(name, safe='')}/traffic"
-        payload = self._unwrap(self._get(path))
+        resp = self._get(path)
+        if resp.status_code == 404:
+            return []
+        payload = self._unwrap(resp)
         history = payload.get("history") if isinstance(payload, dict) else None
         if not isinstance(history, list):
             return []
