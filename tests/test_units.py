@@ -517,6 +517,53 @@ class TestMaskDiff:
         assert self.SECRET not in cfg.mask_diff(diff)
 
 
+class TestPlanSetMany:
+    """`plan_set_many`：多键一次补丁（Web 配置表单的底座）。"""
+
+    def test_edits_multiple_keys_at_once(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text(SAMPLE, "utf-8")
+
+        plan = cfg.plan_set_many(path, [("bindPort", "8000"), ("webServer.port", "8500")])
+
+        assert "bindPort = 8000" in plan.text
+        assert "port = 8500" in plan.text
+        assert plan.before == {"bindPort": 7000, "webServer.port": 7500}
+        assert plan.after == {"bindPort": 8000, "webServer.port": 8500}
+        assert plan.is_noop is False
+        # 注释与排版照常保留（与单键补丁同一套定点赋值）
+        assert "# frps 示例配置（这段注释必须原样存活）" in plan.text
+        assert "# 行内注释也要活着" in plan.text
+
+    def test_noop_when_all_unchanged(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        assert cfg.plan_set_many(path, [("bindPort", "7000")]).is_noop is True
+
+    def test_last_write_wins_for_same_key(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        plan = cfg.plan_set_many(path, [("bindPort", "8000"), ("bindPort", "9000")])
+        assert plan.after == {"bindPort": 9000}
+        assert "bindPort = 9000" in plan.text
+
+    def test_any_invalid_key_rejects_the_whole_batch(self, tmp_path) -> None:
+        """任一键非法 → 整批拒绝，线上文件零影响（原子性在内存层就成立）。"""
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        before = path.read_text("utf-8")
+        with pytest.raises(ConfigError):
+            cfg.plan_set_many(path, [("bindPort", "8000"), ("bindPort", "99999")])
+        assert path.read_text("utf-8") == before
+
+    def test_empty_changes_is_noop(self, tmp_path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        plan = cfg.plan_set_many(path, [])
+        assert plan.is_noop is True
+        assert plan.text == "bindPort = 7000\n"
+
+
 class TestGetValue:
     def test_missing_key_raises(self, tmp_path) -> None:
         path = tmp_path / "frps.toml"
@@ -1806,6 +1853,60 @@ class TestDoctorBinaryDiagnosis:
         assert "无法读取版本" not in message
 
 
+class TestProxyTrafficParsing:
+    """`proxy_traffic`：真机形状的解析与名称转义（Web 趋势图数据源）。"""
+
+    def test_parses_shape_and_quotes_name(self) -> None:
+        from frpsctl.core.admin import AdminClient
+
+        seen: list[str] = []
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "data": {
+                        "name": "alice/a b",
+                        "unit": "bytes",
+                        "granularity": "day",
+                        "history": [
+                            {"date": "2026-09-16", "trafficIn": 1024, "trafficOut": 2048},
+                            {"date": "2026-09-17", "trafficIn": 0, "trafficOut": 0},
+                        ],
+                    }
+                }
+
+        class _Client(AdminClient):
+            def _get(self, path, *, params=None):
+                seen.append(path)
+                return _Resp()
+
+        client = _Client("http://127.0.0.1:1")
+        history = client.proxy_traffic("alice/a b")
+
+        assert seen == ["/api/v2/proxies/alice%2Fa%20b/traffic"], seen
+        assert history == [
+            {"date": "2026-09-16", "in": 1024, "out": 2048},
+            {"date": "2026-09-17", "in": 0, "out": 0},
+        ]
+
+    def test_missing_history_returns_empty(self) -> None:
+        from frpsctl.core.admin import AdminClient
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"name": "x"}}
+
+        class _Client(AdminClient):
+            def _get(self, path, *, params=None):
+                return _Resp()
+
+        assert _Client("http://127.0.0.1:1").proxy_traffic("x") == []
+
+
 class TestAdminPaging:
     """`_paged` 必须按 `total` 翻页取全量。
 
@@ -1924,6 +2025,123 @@ class TestUiOutputResilience:
         ui.progress("等待健康检查 9s：L1 ok")
         assert "\r" in captured.getvalue()
         assert "\033[K" in captured.getvalue(), "tty 进度缺清行尾码（可能有残影）"
+
+
+class TestWebService:
+    """`web service install` 的 unit 渲染、口令文件与部署体检。"""
+
+    def test_render_web_unit(self) -> None:
+        from frpsctl.core.systemd import render_web_unit
+
+        text = render_web_unit(
+            exec_start="/usr/local/bin/frpsctl",
+            bind="127.0.0.1:8787",
+            password_file=Path("/opt/frpsctl/instances/web/web-password"),
+            workdir=Path("/opt/frpsctl/instances/web"),
+        )
+        assert (
+            "ExecStart=/usr/local/bin/frpsctl --instance %i web serve "
+            "--bind 127.0.0.1:8787 --password-file /opt/frpsctl/instances/web/web-password" in text
+        )
+        # 交互工具：崩了拉起、正常停止不自启
+        assert "Restart=on-failure" in text
+        assert "--allow-non-loopback" not in text
+        assert "ReadWritePaths=/opt/frpsctl/instances/web" in text
+
+    def test_render_web_unit_non_loopback_adds_flag(self) -> None:
+        from frpsctl.core.systemd import render_web_unit
+
+        text = render_web_unit(
+            exec_start="/usr/local/bin/frpsctl",
+            bind="0.0.0.0:8787",
+            password_file=Path("/x/web-password"),
+            workdir=Path("/x"),
+            allow_non_loopback=True,
+        )
+        assert "--allow-non-loopback" in text
+
+    @pytest.fixture
+    def service(self, inst, tmp_path):
+        from frpsctl.core.systemd import WebService
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        return WebService(inst, unit_dir=tmp_path / "systemd-web")
+
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    @pytest.fixture
+    def as_root(self, monkeypatch):
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    @pytest.fixture
+    def fake_accounts(self, monkeypatch):
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._account_ids",
+            lambda *_: (os.getuid(), os.getgid()),
+        )
+
+    def _binary(self, tmp_path) -> Path:
+        binary = tmp_path / "frpsctl"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        return binary
+
+    def test_install_generates_password_file_once(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        """首次安装生成 0600 口令文件并返回明文（只显示一次）；重装不重生成。"""
+        binary = self._binary(tmp_path)
+        path, generated = service.install_template(exec_start=binary)
+
+        assert path.exists()
+        assert generated, "首次安装应返回生成的口令"
+        assert service.password_file.read_text("utf-8").strip() == generated
+        assert service.password_file.stat().st_mode & 0o777 == 0o600
+        assert ["systemctl", "enable", "frpsctl-web@test.service"] in recorded
+
+        _, again = service.install_template(exec_start=binary, force=True)
+        assert again == "", "已有口令文件时不得重新生成/重打"
+
+    def test_install_unit_never_contains_plaintext_password(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        """unit 是 0644：口令明文绝不能进 unit（只以文件路径引用）。"""
+        _, generated = service.install_template(exec_start=self._binary(tmp_path))
+        text = service.template_path.read_text("utf-8")
+        assert generated not in text
+        assert str(service.password_file) in text
+
+    def test_install_rejects_home_instance_dir(self, tmp_path, as_root, fake_accounts) -> None:
+        from frpsctl.core.instance import Instance
+        from frpsctl.core.systemd import WebService
+        from frpsctl.errors import UsageError
+
+        home_inst = Instance(
+            name="t",
+            instances_root=Path("/home/someone/.local/share/frpsctl/instances"),
+            data_home=tmp_path / "data",
+        )
+        service = WebService(home_inst, unit_dir=tmp_path / "systemd-home")
+        with pytest.raises(UsageError, match="ProtectHome"):
+            service.install_template(exec_start=self._binary(tmp_path))
+        assert not service.template_path.exists()
+
+    def test_uninstall_keeps_password_file(
+        self, service, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        service.install_template(exec_start=self._binary(tmp_path))
+        service.uninstall()
+        assert not service.template_path.exists()
+        assert service.password_file.exists(), "口令文件是数据，卸载 unit 不该删它"
 
 
 class TestSystemdOwnerDetection:

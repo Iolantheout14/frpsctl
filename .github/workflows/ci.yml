@@ -85,6 +85,45 @@ jobs:
           .venv/bin/frpsctl stop
           .venv/bin/frpsctl status
 
+      - name: Web 管理台冒烟（后台起服务 + HTTP 全流程）
+        run: |
+          set -euo pipefail
+          export FRPSCTL_ROOT="$RUNNER_TEMP/smoke/instances"
+          export FRPSCTL_DATA_HOME="$RUNNER_TEMP/smoke/data"
+          WP=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1])")
+          .venv/bin/frpsctl web serve --bind "127.0.0.1:$WP" --password smoke-pw &
+          WEB_PID=$!
+          sleep 2
+          python3 - "$WP" <<'EOF'
+          import json, sys, urllib.request
+
+          base = f"http://127.0.0.1:{int(sys.argv[1])}"
+          login = urllib.request.Request(
+              base + "/api/login", method="POST",
+              data=json.dumps({"password": "smoke-pw"}).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          with urllib.request.urlopen(login, timeout=10) as resp:
+              cookie = resp.headers["Set-Cookie"].split(";")[0]
+              csrf = json.load(resp)["csrf"]
+
+          def call(path):
+              req = urllib.request.Request(base + path, headers={"Cookie": cookie})
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  return json.load(resp)
+
+          status = call("/api/status")
+          assert status["state"] == "STOPPED", status
+          assert call("/api/session")["csrf"] == csrf
+          config = call("/api/config")
+          assert any(item["key"] == "bindPort" for item in config["entries"]), config
+          html = urllib.request.urlopen(base + "/", timeout=10).read().decode("utf-8")
+          assert "frpsctl 管理台" in html
+          print("web 冒烟通过：login / session / status / config / 静态页")
+          EOF
+          kill "$WEB_PID"
+          wait "$WEB_PID" 2>/dev/null || true
+
   no-binary:
     name: 无二进制降级路径（Python 3.13）
     runs-on: ubuntu-latest

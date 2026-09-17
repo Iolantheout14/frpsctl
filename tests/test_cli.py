@@ -516,7 +516,7 @@ class TestCommandsThatWereBroken:
             ["service", "status"],
             ["plugin", "check"],
             ["plugin", "--help"],
-            ["kick", "some-proxy"],
+            ["prune"],
             ["stop"],
             ["restart"],
         ):
@@ -640,7 +640,7 @@ class _FakeAdminClient:
 
 class TestClientsAndProxiesCommands:
     def test_clients_requires_dashboard(self, cli_env) -> None:
-        """dashboard 未启用 → 退出码 7（与 kick 同一判据）。"""
+        """dashboard 未启用 → 退出码 7（与 prune 同一判据）。"""
         runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
         result = runner.invoke(app, ["clients"])
         assert result.exit_code == 7, result.output
@@ -761,6 +761,40 @@ class TestConfigListCommand:
         assert "***" in str(token_item["value"])
 
 
+class TestPruneCommand:
+    """`prune`：清理离线代理记录（frp 唯一的代理写操作）。
+
+    背景：`DELETE /api/proxies` 的实际语义是 `ClearOfflineProxies()`（只接受
+    `?status=offline`），frp **没有**强制下线在线代理的 API。此前的 `kick`
+    基于对这个端点的误读，从未真正工作过（真机返回 400）。
+    """
+
+    def test_prune_requires_dashboard(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["prune"])
+        assert result.exit_code == 7, result.output
+
+    def test_prune_reports_success(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        calls: list[str] = []
+
+        class _Admin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def clear_offline_proxies(self) -> None:
+                calls.append("cleared")
+
+        monkeypatch.setattr("frpsctl.cli.AdminClient", lambda *_a, **_k: _Admin())
+        result = runner.invoke(app, ["prune"])
+        assert result.exit_code == 0, result.output
+        assert calls == ["cleared"]
+        assert "已清理" in result.stdout
+
+
 class TestServiceLogs:
     """`service logs`（journald 集成）：argv 构造与缺命令时的一致性报错。"""
 
@@ -859,6 +893,36 @@ class TestHealthWaitHint:
             json.loads(result.stdout)  # 混入提示就会在这里炸
         finally:
             runner.invoke(app, ["stop"])
+
+
+class TestWebCommand:
+    """`web serve` 的启动前置检查（成功路径会阻塞，由 e2e 覆盖）。"""
+
+    def test_serve_rejects_non_loopback_without_flag(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["web", "serve", "--bind", "0.0.0.0:8790"])
+        assert result.exit_code == 2, result.output
+        assert "非回环" in result.output
+
+    def test_serve_missing_password_file_is_config_error(self, cli_env, tmp_path) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["web", "serve", "--password-file", str(tmp_path / "nope")])
+        assert result.exit_code == 3, result.output
+        assert "口令文件不存在" in result.output
+
+    def test_serve_empty_password_file_is_config_error(self, cli_env, tmp_path) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        password_file = tmp_path / "pw"
+        password_file.write_text("\n", "utf-8")
+        result = runner.invoke(app, ["web", "serve", "--password-file", str(password_file)])
+        assert result.exit_code == 3, result.output
+        assert "口令文件为空" in result.output
+
+    def test_service_install_rejects_non_loopback(self, cli_env) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        result = runner.invoke(app, ["web", "service", "install", "--bind", "0.0.0.0:8787"])
+        assert result.exit_code == 2, result.output
+        assert "非回环" in result.output
 
 
 class TestInstallMirrorOption:

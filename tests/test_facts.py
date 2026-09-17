@@ -332,6 +332,83 @@ port = {dash_port}
 
 
 # ---------------------------------------------------------------------------
+# C10 —— v2 traffic 端点：数据源与"无数据 = 404"语义（Web 趋势图的前提）
+# ---------------------------------------------------------------------------
+
+
+@requires_binary
+class TestC10TrafficEndpointSemantics:
+    """`GET /api/v2/proxies/{name}/traffic` 的"无数据"语义。
+
+    Web 管理台的趋势图逐代理拉这个端点；**离线/不存在的代理返回 404**
+    （`no proxy info found`）——这是前端容错（单代理失败记空曲线）的前提。
+    在线代理的完整形状（`{name, unit, granularity:"day", history:[...]}`，
+    固定 7 天）由 Web 的端到端冒烟在真 frpc 上覆盖。
+    """
+
+    def test_unknown_proxy_traffic_is_404(self, real_server) -> None:
+        import httpx
+
+        base_url, user, password, _ = real_server
+        resp = httpx.get(
+            f"{base_url}/api/v2/proxies/never.exists/traffic", auth=(user, password), timeout=5
+        )
+        assert resp.status_code == 404, resp.text
+        assert "no proxy info found" in resp.text
+
+    def test_our_client_treats_it_as_unreachable(self) -> None:
+        """反向断言：客户端把这个 404 归入 `AdminUnreachable`（web 据此容错）。"""
+        import frpsctl.core.admin as admin_module
+
+        source = Path(admin_module.__file__).read_text("utf-8")
+        assert "proxy_traffic" in source
+        # traffic 走 _unwrap：>=400 一律 AdminUnreachable（含 404 的"无数据"）
+        assert "resp.status_code >= 400" in source
+
+
+# ---------------------------------------------------------------------------
+# C9 —— 代理"写" API 的唯一语义：清理离线记录（§3.2）
+# ---------------------------------------------------------------------------
+
+
+@requires_binary
+class TestC9ProxyWriteApiSemantics:
+    """frp 的代理写 API 只有一个，且语义是**清理离线记录**。
+
+    锁定的事实（源码 `server/http/controller.go`：`DeleteProxies` 只接受
+    `?status=offline`，执行 `ClearOfflineProxies()`）：**不存在**强制下线
+    在线代理的 API。此前 frpsctl 的 `kick` 命令按"按 name 下线"实现了这个
+    端点，真机永远返回 400——一个从未工作过的功能（本轮 e2e 暴露，已改为
+    `prune`）。
+    """
+
+    def test_delete_without_status_is_rejected(self, real_server) -> None:
+        import httpx
+
+        base_url, user, password, _ = real_server
+        resp = httpx.delete(f"{base_url}/api/proxies", auth=(user, password), timeout=5)
+        assert resp.status_code == 400, resp.text
+        assert "status only support offline" in resp.text
+
+    def test_delete_with_status_offline_succeeds(self, real_server) -> None:
+        import httpx
+
+        base_url, user, password, _ = real_server
+        resp = httpx.delete(
+            f"{base_url}/api/proxies", params={"status": "offline"}, auth=(user, password), timeout=5
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_our_client_uses_the_documented_semantics(self) -> None:
+        """反向断言：客户端不得再出现"按 name 下线"的调用形状。"""
+        import frpsctl.core.admin as admin_module
+
+        source = Path(admin_module.__file__).read_text("utf-8")
+        assert 'params={"name"' not in source, "DELETE /api/proxies 不支持 name 参数"
+        assert '"status": "offline"' in source
+
+
+# ---------------------------------------------------------------------------
 # C6 —— frps verify 是权威判定
 # ---------------------------------------------------------------------------
 

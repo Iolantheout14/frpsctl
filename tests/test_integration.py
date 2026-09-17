@@ -607,6 +607,63 @@ class TestSystemdStartHealthTimeout:
         assert report.pid == 4242
 
 
+class TestApplySets:
+    """`apply_sets`：多键一次事务（Web 配置表单的语义）。"""
+
+    def test_multi_key_change_is_one_transaction(self, inst, write_config) -> None:
+        """多键变更只产生一份快照、一次落盘。"""
+        from frpsctl.core.transaction import apply_sets
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+
+        outcome = apply_sets(
+            inst,
+            changes=[("bindPort", "18010"), ("maxPortsPerClient", "30")],
+            lifecycle=lc,
+            restart=False,
+        )
+
+        assert outcome.applied is True
+        data = tomllib.loads(inst.config.read_text("utf-8"))
+        assert data["bindPort"] == 18010
+        assert data["maxPortsPerClient"] == 30
+        assert len(inst.history_entries()) == 1, "多键变更只应产生一份快照"
+        meta = json.loads((inst.history_entries()[0] / "meta.json").read_text("utf-8"))
+        assert meta["action"].startswith("set many:"), meta
+
+    def test_cas_rejects_when_file_changed(self, inst, write_config) -> None:
+        """`expected_current` 不匹配 → 拒绝（预览与落盘之间的并发保护）。"""
+        from frpsctl.core.transaction import apply_sets
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        stale = cfg.read_config_text(inst.config)
+
+        apply_set(inst, dotted="maxPortsPerClient", raw="30", lifecycle=lc, restart=False)
+
+        with pytest.raises(ConfigError, match="预览期间"):
+            apply_sets(
+                inst,
+                changes=[("bindPort", "18011")],
+                expected_current=stale,
+                lifecycle=lc,
+                restart=False,
+            )
+        assert "bindPort = 17000" in inst.config.read_text("utf-8")
+
+    def test_multi_key_noop_produces_no_snapshot(self, inst, write_config) -> None:
+        from frpsctl.core.transaction import apply_sets
+
+        write_config(BASIC_CONFIG)
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        outcome = apply_sets(
+            inst, changes=[("bindPort", "17000")], lifecycle=lc, restart=False
+        )
+        assert outcome.noop is True
+        assert not inst.history_entries()
+
+
 class TestHealthTick:
     """健康等待期的进度回调（`on_tick`）——CLI 渲染逐轮进度的唯一通道。"""
 
