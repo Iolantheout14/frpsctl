@@ -24,12 +24,12 @@ from ..core import config as cfg
 from ..core import doctor as doc
 from ..core import healthcheck, release
 from ..core import platform as plat
-from ..core.admin import AdminClient, sum_proxy_types
+from ..core.admin import TRAFFIC_MAX_PROXIES, AdminClient, sum_proxy_types
 from ..core.instance import list_instances
 from ..core.lifecycle import Lifecycle, StartReport, State
 from ..core.lock import instance_lock
 from ..core.systemd import DEFAULT_SERVICE_USER, PluginService, Systemd, WebService
-from ..core.transaction import apply_edit, apply_set, rollback_to
+from ..core.transaction import apply_edit, apply_set, apply_unset, rollback_to
 from ..core.version import RECKONED_VERSION
 from ..plugin.policy import PluginPolicy
 from ..plugin.server import PluginServer, ServerSettings
@@ -129,14 +129,20 @@ config_app = typer.Typer(no_args_is_help=True, help="配置读写与变更闭环
 service_app = typer.Typer(no_args_is_help=True, help="systemd 集成。")
 plugin_app = typer.Typer(no_args_is_help=True, help="服务端插件：多用户鉴权 + 端口白名单 + 审计。")
 plugin_service_app = typer.Typer(no_args_is_help=True, help="插件服务的 systemd 集成。")
+plugin_user_app = typer.Typer(
+    no_args_is_help=True, help="策略里的用户管理（结构化编辑，避免手写 JSON）。"
+)
 web_app = typer.Typer(no_args_is_help=True, help="Web 管理台（内置界面，含进程控制与配置编辑）。")
 web_service_app = typer.Typer(no_args_is_help=True, help="Web 管理台的 systemd 集成。")
+web_password_app = typer.Typer(no_args_is_help=True, help="Web 管理台的登录口令管理。")
 app.add_typer(config_app, name="config")
 app.add_typer(service_app, name="service")
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(web_app, name="web")
 plugin_app.add_typer(plugin_service_app, name="service")
+plugin_app.add_typer(plugin_user_app, name="user")
 web_app.add_typer(web_service_app, name="service")
+web_app.add_typer(web_password_app, name="password")
 
 
 # ---------------------------------------------------------------------------
@@ -1022,15 +1028,27 @@ def _plain(value: object) -> object:
 def config_set(
     ctx: typer.Context,
     key: str = typer.Argument(..., help="点分键，如 bindPort"),
-    value: str = typer.Argument(..., help="新值"),
+    value: str = typer.Argument(None, help="新值；或用 --stdin / --prompt 提供（敏感值不进 argv）"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     no_restart: bool = typer.Option(False, "--no-restart", help="只写不重启（变更尚未生效）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只校验并展示 diff，不写入、不重启"),
+    read_stdin: bool = typer.Option(
+        False, "--stdin", help="从标准输入读值（敏感值不进 argv 与 shell 历史）"
+    ),
+    prompt: bool = typer.Option(
+        False, "--prompt", help="交互式隐藏输入值（敏感值不进 argv 与 shell 历史）"
+    ),
     health_timeout: float = typer.Option(
         10.0, "--health-timeout", min=0, help="健康检查等待秒数"
     ),
 ) -> None:
-    """写单个键，走 §9 事务闭环（校验 → 备份 → 原子替换 → 重启 → 失败回滚）。"""
+    """写单个键，走 §9 事务闭环（校验 → 备份 → 原子替换 → 重启 → 失败回滚）。
+
+    值的三种来源互斥：位置参数 / `--stdin` / `--prompt`。令牌与口令建议用后两者：
+    位置参数会进入 shell 历史，也会出现在 `/proc/<pid>/cmdline` 里。
+    """
     app_ctx = _ctx(ctx).with_json(json_output)
+    raw = _resolve_value_input(value, read_stdin=read_stdin, prompt=prompt)
     lc = _lifecycle(app_ctx)
 
     # 候选生成（plan）与落盘在**同一把实例锁内**完成（apply_set）：锁外生成
@@ -1038,19 +1056,109 @@ def config_set(
     outcome = apply_set(
         app_ctx.instance,
         dotted=key,
-        raw=value,
+        raw=raw,
         lifecycle=lc,
         restart=not no_restart,
         health_timeout=health_timeout,
+        dry_run=dry_run,
     )
+    _render_change_outcome(app_ctx, key, outcome)
 
+
+@config_app.command("unset")
+def config_unset(
+    ctx: typer.Context,
+    key: str = typer.Argument(..., help="要删除的点分键（回落 frp 默认值）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+    no_restart: bool = typer.Option(False, "--no-restart", help="只写不重启（变更尚未生效）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只校验并展示 diff，不写入、不重启"),
+    health_timeout: float = typer.Option(
+        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+    ),
+) -> None:
+    """删除一个键，让它回落到 frp 的默认值。
+
+    与 `config set` 走**同一事务闭环**（校验 → 快照 → 原子替换 → 重启 → 失败
+    自动回滚）；危险组合检查照常生效（删除口令后"非回环 + 无凭据"会被拒绝）。
+    键不存在时是配置错误(3)：拼错键名的"成功删除"会让人以为清掉了某个设置。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    lc = _lifecycle(app_ctx)
+    outcome = apply_unset(
+        app_ctx.instance,
+        dotted=key,
+        lifecycle=lc,
+        restart=not no_restart,
+        health_timeout=health_timeout,
+        dry_run=dry_run,
+    )
+    _render_change_outcome(app_ctx, key, outcome)
+
+
+def _resolve_value_input(value: str | None, *, read_stdin: bool, prompt: bool) -> str:
+    """解析 `config set` 的值来源：位置参数 / `--stdin` / `--prompt`（三者互斥）。
+
+    敏感值走 argv 会进 shell 历史与 `/proc/<pid>/cmdline`——`--stdin`（脚本化）
+    与 `--prompt`（交互）是替代通道。空值一律拒绝：清空字符串值请显式写 `'""'`，
+    删除键请用 `config unset`（空输入几乎总是误操作，而不是"我想写空"）。
+    """
+    sources = [
+        name
+        for name, present in (("值参数", value is not None), ("--stdin", read_stdin), ("--prompt", prompt))
+        if present
+    ]
+    if len(sources) > 1:
+        raise UsageError(f"值的来源只能有一个，同时给了：{' 与 '.join(sources)}")
+    if read_stdin:
+        import sys
+
+        line = sys.stdin.readline()
+        if line == "":
+            raise UsageError("--stdin 没有读到任何内容")
+        text = line.rstrip("\n").rstrip("\r")
+    elif prompt:
+        import getpass
+
+        try:
+            text = getpass.getpass("新值（输入不回显）：")
+        except EOFError:
+            raise UsageError(
+                "未能读取输入：--prompt 需要交互式终端",
+                hint="在脚本 / 管道里请改用 --stdin（如：echo -n \"$PW\" | frpsctl ... --stdin）",
+            ) from None
+    elif value is None:
+        raise UsageError(
+            "缺少值：给出位置参数，或用 --stdin / --prompt",
+            hint="示例：frpsctl config set webServer.password --prompt",
+        )
+    else:
+        text = value
+    if not text.strip():
+        # 纯空白与空输入同视：它们几乎总是误操作（漏填变量、多敲了空格），
+        # 而不是"我想写入空白"。显式空串请写 '""'，删键请用 `config unset`。
+        raise UsageError(
+            "值不能为空",
+            hint='如需把某个字符串值清空，写入 \'""\'；如需删除键，请用 `frpsctl config unset`',
+        )
+    return text
+
+
+def _json_change_value(key: str, value: object) -> object:
+    """变更输出里的值：敏感键打码；`None` 原样（表示"已删除/不存在"）。"""
+    if value is None:
+        return None
+    return ui.mask_secret(value) if cfg.is_secret_key(key) else value
+
+
+def _render_change_outcome(app_ctx: AppContext, key: str, outcome) -> None:
+    """`config set` / `config unset` 共用的人读与 `--json` 渲染。"""
     if outcome.noop:
         if app_ctx.json:
             ui.emit_json(
                 {
                     "key": key,
-                    "before": ui.mask_secret(outcome.before) if cfg.is_secret_key(key) else outcome.before,
-                    "after": ui.mask_secret(outcome.after) if cfg.is_secret_key(key) else outcome.after,
+                    "before": _json_change_value(key, outcome.before),
+                    "after": _json_change_value(key, outcome.after),
                     "applied": False,
                     "restarted": False,
                     "noop": True,
@@ -1064,11 +1172,12 @@ def config_set(
         ui.emit_json(
             {
                 "key": outcome.dotted,
-                "before": ui.mask_secret(outcome.before) if cfg.is_secret_key(key) else outcome.before,
-                "after": ui.mask_secret(outcome.after) if cfg.is_secret_key(key) else outcome.after,
+                "before": _json_change_value(key, outcome.before),
+                "after": _json_change_value(key, outcome.after),
                 "applied": outcome.applied,
                 "restarted": outcome.restarted,
                 "note": outcome.note,
+                "dry_run": outcome.dry_run,
             }
         )
         return
@@ -1176,7 +1285,7 @@ def config_edit(
 @config_app.command("diff")
 def config_diff(
     ctx: typer.Context,
-    steps: int = typer.Option(1, "--steps", help="与第 N 新的快照比较"),
+    steps: int = typer.Option(1, "--steps", min=1, help="与第 N 新的快照比较"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
     """当前配置 vs 历史快照（unified diff）。"""
@@ -1208,7 +1317,7 @@ def config_diff(
 @config_app.command("rollback")
 def config_rollback(
     ctx: typer.Context,
-    steps: int = typer.Argument(1, help="回滚到 N 份之前的快照"),
+    steps: int = typer.Argument(1, min=1, help="回滚到 N 份之前的快照"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     health_timeout: float = typer.Option(
         10.0, "--health-timeout", min=0, help="健康检查等待秒数"
@@ -1477,6 +1586,96 @@ def proxies(
             f"{item.name:<28} {item.user:<10} {item.type:<7} {port:<6} "
             f"{item.phase:<8} {item.cur_conns:<6} {traffic}"
         )
+
+
+@app.command()
+def traffic(
+    ctx: typer.Context,
+    name: str = typer.Argument("", help="只看某个代理（留空 = 全部代理逐日汇总）"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """代理流量历史（近 7 天，日粒度）。
+
+    数据源与 Web 趋势图相同（v2 traffic 端点）。离线/已删除的代理按"无数据"
+    处理（真机语义是 404），单个代理查询失败也不会拖垮整体。默认输出全部代理的
+    **逐日汇总**；给出代理名则输出该代理明细。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    admin = _require_admin(app_ctx, feature="读取流量历史")
+
+    if name:
+        with admin:
+            history = admin.proxy_traffic(name)
+        total = _traffic_total(history)
+        if app_ctx.json:
+            ui.emit_json({"name": name, "history": history, "total": total})
+            return
+        if not history:
+            ui.emit(f"没有 {name} 的流量记录（代理不存在、已离线或从未产生流量）")
+            return
+        ui.emit(f"代理 {name} 的流量（近 7 天）：")
+        _render_traffic_rows(history)
+        _render_traffic_total(total)
+        return
+
+    with admin:
+        all_proxies = admin.list_proxies()
+        truncated = len(all_proxies) > TRAFFIC_MAX_PROXIES
+        series: list[list[dict]] = []
+        for item in all_proxies[:TRAFFIC_MAX_PROXIES]:
+            try:
+                series.append(admin.proxy_traffic(item.name))
+            except FrpsctlError:
+                series.append([])  # 单代理失败记空曲线：不拖垮整体（与 Web 一致）
+
+    days = _aggregate_days(series)
+    if app_ctx.json:
+        ui.emit_json({"days": days, "proxies": len(series), "truncated": truncated})
+        return
+    if not days:
+        ui.emit("没有流量数据（没有代理，或全部代理都没有历史）")
+        return
+    if truncated:
+        ui.warn(f"⚠ 代理数超过 {TRAFFIC_MAX_PROXIES}，仅统计前 {TRAFFIC_MAX_PROXIES} 个")
+    ui.emit("全部代理的逐日流量（近 7 天）：")
+    _render_traffic_rows(days)
+    _render_traffic_total(_traffic_total(days))
+
+
+def _traffic_total(points: list[dict]) -> dict[str, int]:
+    """逐日数据的合计（in/out）。"""
+    return {
+        "in": sum(int(point.get("in") or 0) for point in points),
+        "out": sum(int(point.get("out") or 0) for point in points),
+    }
+
+
+def _aggregate_days(series: list[list[dict]]) -> list[dict]:
+    """把多个代理的日粒度历史按日期求和（按日期排序）。"""
+    days: dict[str, dict[str, int]] = {}
+    for history in series:
+        for point in history:
+            date = str(point.get("date") or "")
+            if not date:
+                continue
+            bucket = days.setdefault(date, {"date": date, "in": 0, "out": 0})
+            bucket["in"] += int(point.get("in") or 0)
+            bucket["out"] += int(point.get("out") or 0)
+    return [days[key] for key in sorted(days)]
+
+
+def _render_traffic_rows(points: list[dict]) -> None:
+    ui.emit(f"{'date':<12}{'in':>12}{'out':>12}")
+    for point in points:
+        ui.emit(
+            f"{point['date']:<12}"
+            f"{ui.human_bytes(int(point['in'])):>12}"
+            f"{ui.human_bytes(int(point['out'])):>12}"
+        )
+
+
+def _render_traffic_total(total: dict[str, int]) -> None:
+    ui.emit(f"{'合计':<12}{ui.human_bytes(total['in']):>12}{ui.human_bytes(total['out']):>12}")
 
 
 @app.command()
@@ -1796,6 +1995,194 @@ def plugin_serve(
         ui.emit(f"已停止。{server.audit.describe()}")
 
 
+@plugin_user_app.command("list")
+def plugin_user_list(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出策略里的用户与权限摘要（不显示策略级凭据）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path, loaded = _load_policy(app_ctx, policy)
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "policy": str(path),
+                "allow_unknown_user": loaded.allow_unknown_user,
+                "require_client_id": loaded.require_client_id,
+                "users": [
+                    {
+                        "name": user.name,
+                        "allowed_ports": [item.render() for item in user.allowed_ports],
+                        "allow_random_port": user.allow_random_port,
+                        "allowed_proxy_types": list(user.allowed_proxy_types),
+                        "allowed_proxy_names": list(user.allowed_proxy_names),
+                        "max_proxies": user.max_proxies,
+                        "note": user.note,
+                    }
+                    for user in (loaded.users[key] for key in sorted(loaded.users))
+                ],
+            }
+        )
+        return
+    ui.emit(f"策略文件：{path}")
+    for line in loaded.describe():
+        ui.emit(f"  {line}")
+
+
+@plugin_user_app.command("set")
+def plugin_user_set(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="用户名"),
+    ports: str = typer.Option(
+        None, "--ports", help="允许的端口/端口段，逗号分隔（如 6000-6010,7000）；空串 = 清空白名单"
+    ),
+    types: str = typer.Option(None, "--types", help="允许的代理类型，逗号分隔（如 tcp,udp）；空串 = 不限"),
+    names: str = typer.Option(
+        None, "--names", help="允许的代理名通配，逗号分隔（如 'alice-*'）；空串 = 不限名称"
+    ),
+    max_proxies: int = typer.Option(None, "--max-proxies", min=0, help="代理数上限（0 = 不限）"),
+    random_port: bool = typer.Option(False, "--random-port", help="允许 remote_port = 0（由 frps 分配）"),
+    no_random_port: bool = typer.Option(False, "--no-random-port", help="不允许随机端口"),
+    note: str = typer.Option(None, "--note", help="备注（空串 = 清除）"),
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """新增或修改一个用户：只改**显式给出**的字段，其余保持原值。
+
+    写入前用与 `plugin check` 相同的判据复验（严格类型、端口段格式、回环约束），
+    并以 0600 原子写落盘；未覆盖的键（包括 `_comment` 等自定义字段）原样保留。
+    插件服务在启动时载入策略——改完记得重启它才生效。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    if random_port and no_random_port:
+        raise UsageError("--random-port 与 --no-random-port 不能同时给出")
+    path = _policy_path(app_ctx, policy)
+    # 读-改-写必须串行化（与 config 写共用同一把实例锁）：两个并发
+    # `plugin user set` 会各基于旧文本生成完整新文件，后写者静默覆盖前者
+    # ——与第四轮修复的 `config set` 并发丢失是同一形态。
+    with instance_lock(app_ctx.instance.lock):
+        raw = _load_policy_raw(path)
+        users = raw.get("users")
+        if users is None:
+            users = {}
+            raw["users"] = users
+        if not isinstance(users, dict):
+            raise ConfigError("策略文件的 users 必须是对象（用户名为键）")
+        entry = users.get(name)
+        if entry is None:
+            entry = {}
+        elif not isinstance(entry, dict):
+            raise ConfigError(f"用户 {name!r} 的配置必须是对象")
+        created = name not in users
+
+        if ports is not None:
+            if ports.strip():
+                entry["allowed_ports"] = _split_spec(ports)
+            else:
+                entry.pop("allowed_ports", None)
+        if types is not None:
+            if types.strip():
+                entry["allowed_proxy_types"] = _split_spec(types)
+            else:
+                entry.pop("allowed_proxy_types", None)
+        if names is not None:
+            if names.strip():
+                entry["allowed_proxy_names"] = _split_spec(names)
+            else:
+                entry.pop("allowed_proxy_names", None)
+        if max_proxies is not None:
+            entry["max_proxies"] = max_proxies
+        if random_port:
+            entry["allow_random_port"] = True
+        if no_random_port:
+            entry["allow_random_port"] = False
+        if note is not None:
+            if note:
+                entry["note"] = note
+            else:
+                entry.pop("note", None)
+        users[name] = entry
+
+        loaded = _save_policy_raw(path, raw)
+    if app_ctx.json:
+        ui.emit_json({"policy": str(path), "user": name, "created": created})
+        return
+    verb = "新增" if created else "更新"
+    ui.emit(f"已{verb}用户 {name!r}（{path}）")
+    user = loaded.user(name)
+    assert user is not None
+    quota = f"，最多 {user.max_proxies} 个代理" if user.max_proxies else ""
+    ui.emit(f"  端口 {user.render_ports()}{quota}")
+    ui.emit("")
+    ui.emit("提示：`frpsctl plugin check` 可离线复核裁决；插件服务需重启后载入新策略。")
+
+
+@plugin_user_app.command("remove")
+def plugin_user_remove(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="用户名"),
+    policy: Path = typer.Option(None, "--policy", help="策略文件路径"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """删除一个用户（不存在时报配置错误，不静默成功）。"""
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path = _policy_path(app_ctx, policy)
+    with instance_lock(app_ctx.instance.lock):
+        raw = _load_policy_raw(path)
+        users = raw.get("users")
+        if not isinstance(users, dict) or name not in users:
+            raise ConfigError(
+                f"策略里没有用户 {name!r}", hint="用 `frpsctl plugin user list` 查看现有用户"
+            )
+        del users[name]
+        _save_policy_raw(path, raw)
+    if app_ctx.json:
+        ui.emit_json({"policy": str(path), "user": name, "removed": True})
+        return
+    ui.emit(f"已删除用户 {name!r}（{path}）")
+    ui.emit("提示：插件服务需重启后载入新策略。")
+
+
+def _split_spec(spec: str) -> list[str]:
+    """把 `6000-6010,7000` 拆成列表（空项忽略）。"""
+    return [chunk.strip() for chunk in spec.split(",") if chunk.strip()]
+
+
+def _load_policy_raw(path: Path) -> dict:
+    """读策略文件的**原始字典**——结构化编辑必须保留未知键（`_comment` 等）。"""
+    import json as _json
+
+    try:
+        text = path.read_text("utf-8")
+    except FileNotFoundError:
+        raise ConfigError(
+            f"策略文件不存在：{path}",
+            hint="先运行 `frpsctl plugin init --policy <path>` 生成一份模板",
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"无法读取策略文件 {path}：{exc}") from None
+    try:
+        raw = _json.loads(text)
+    except _json.JSONDecodeError as exc:
+        raise ConfigError(f"策略文件不是合法 JSON：{path}（{exc}）") from None
+    if not isinstance(raw, dict):
+        raise ConfigError("策略文件根节点必须是对象")
+    return raw
+
+
+def _save_policy_raw(path: Path, raw: dict) -> PluginPolicy:
+    """复验（与 `plugin check` 同一判据）→ 0600 原子写；返回解析结果。"""
+    import json as _json
+
+    loaded = PluginPolicy.parse(raw)
+    # bind 是运行期参数；离线校验用默认回环地址——与 `plugin check` 的默认一致，
+    # 保证"写得进去的策略一定通过 check"。
+    loaded.validate(bind="127.0.0.1")
+    cfg.atomic_write(path, _json.dumps(raw, indent=2, ensure_ascii=False) + "\n", mode=0o600)
+    return loaded
+
+
 def _frpsctl_executable() -> Path:
     """当前 frpsctl 的可执行文件路径（写进插件 unit 的 ExecStart）。
 
@@ -1940,6 +2327,11 @@ def web_serve(
     allow_non_loopback: bool = typer.Option(
         False, "--allow-non-loopback", help="显式允许绑定非回环地址（建议配合反向代理 + TLS）"
     ),
+    trusted_proxy: bool = typer.Option(
+        False,
+        "--trusted-proxy",
+        help="信任反向代理的 X-Forwarded-For（取最后一跳作为登录限速来源；默认关闭）",
+    ),
 ) -> None:
     """启动 Web 管理台（前台运行）。
 
@@ -1948,6 +2340,10 @@ def web_serve(
 
     默认只绑 127.0.0.1；绑非回环必须显式加 --allow-non-loopback：界面能改配置、
     停服务，而会话 Cookie 没有 TLS 保护时公网暴露等于把控制权交出去。
+
+    在反向代理后运行时加 `--trusted-proxy`：登录限速按 X-Forwarded-For 的
+    最后一跳区分来源（否则所有请求同源，攻击者的失败会连带锁住管理员）。
+    前提是前面确实有一层会重写该头的可信代理。
     """
     app_ctx = _ctx(ctx)
     if not healthcheck.is_loopback(bind) and not allow_non_loopback:
@@ -1965,7 +2361,7 @@ def web_serve(
         resolved = secrets.token_urlsafe(18)
         generated = True
     web_ctx = build_web_context(app_ctx.instance, resolved)
-    server = WebServer(web_ctx, WebSettings(bind=bind, password=resolved))
+    server = WebServer(web_ctx, WebSettings(bind=bind, trusted_proxy=trusted_proxy))
     try:
         server.start()
     except OSError as exc:
@@ -1989,6 +2385,11 @@ def web_service_install(
     bind: str = typer.Option("127.0.0.1:8787", "--bind", help="监听地址（默认只绑回环）"),
     allow_non_loopback: bool = typer.Option(
         False, "--allow-non-loopback", help="显式允许绑定非回环地址（建议配合反向代理 + TLS）"
+    ),
+    trusted_proxy: bool = typer.Option(
+        False,
+        "--trusted-proxy",
+        help="信任反向代理的 X-Forwarded-For（写入 unit 的 serve 参数）",
     ),
     user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行管理台的系统用户（需已存在）"),
     group: str = typer.Option(None, "--group", help="运行管理台的系统组（默认与 --user 相同）"),
@@ -2014,6 +2415,7 @@ def web_service_install(
         force=force,
         user=user,
         group=group,
+        trusted_proxy=trusted_proxy,
     )
     if app_ctx.json:
         ui.emit_json(
@@ -2073,6 +2475,42 @@ def web_service_status(
     ui.emit(f"active   : {active}")
     if pid:
         ui.emit(f"main pid : {pid}")
+
+
+@web_password_app.command("show")
+def web_password_show(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """显示 `web service install` 生成的口令（文件缺失时报配置错误）。
+
+    这是**显式索取明文**的命令（与 `config get --reveal` 同级）：输出可能进入
+    终端回滚与重定向文件，请自行控制。文件权限过宽时会向 stderr 告警。
+    """
+    app_ctx = _ctx(ctx).with_json(json_output)
+    path = WebService(app_ctx.instance).password_file
+    try:
+        value = path.read_text("utf-8").strip()
+    except FileNotFoundError:
+        raise ConfigError(
+            f"口令文件不存在：{path}",
+            hint="先运行 `frpsctl web service install` 生成，或直接 `web serve`（会自动生成口令）",
+        ) from None
+    except OSError as exc:
+        raise ConfigError(f"无法读取口令文件 {path}：{exc}") from None
+    if not value:
+        raise ConfigError(
+            f"口令文件为空：{path}",
+            hint="删除该文件让服务重新生成，或手工写入一个口令",
+        )
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        ui.warn(f"⚠ {path} 权限为 {oct(mode)[2:].zfill(4)}（应 0600）—— 它含管理台登录口令")
+    if app_ctx.json:
+        ui.emit_json({"password_file": str(path), "password": value})
+    else:
+        ui.emit(f"口令文件：{path}")
+        ui.emit(value)
 
 
 def main() -> None:
