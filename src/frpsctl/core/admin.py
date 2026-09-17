@@ -275,6 +275,36 @@ class AdminClient:
         raw = self._paged("/api/v2/proxies", params=params, page_size=page_size)
         return [V2Proxy.from_api(item) for item in raw]
 
+    def proxy_traffic(self, name: str) -> list[dict]:
+        """某代理的流量历史（**日粒度**，实测固定返回近 7 天）。
+
+        真机 `GET /api/v2/proxies/{name}/traffic` 的形状：
+
+        ```json
+        {"name": "alice.alice-ssh", "unit": "bytes", "granularity": "day",
+         "history": [{"date": "2026-09-11", "trafficIn": 0, "trafficOut": 0}, ...]}
+        ```
+
+        `granularity` 查询参数**无效**（实测传 hour 仍返回 day）——趋势图按天画。
+        名称里的 `/` 等字符必须转义后才能拼进路径。
+        """
+        from urllib.parse import quote
+
+        path = f"/api/v2/proxies/{quote(name, safe='')}/traffic"
+        payload = self._unwrap(self._get(path))
+        history = payload.get("history") if isinstance(payload, dict) else None
+        if not isinstance(history, list):
+            return []
+        return [
+            {
+                "date": str(item.get("date") or ""),
+                "in": _as_int(item.get("trafficIn")),
+                "out": _as_int(item.get("trafficOut")),
+            }
+            for item in history
+            if isinstance(item, dict)
+        ]
+
     def _paged(
         self,
         path: str,
@@ -307,12 +337,19 @@ class AdminClient:
             return int(payload["total"])
         return len(_page_items(payload))
 
-    def kick(self, proxy_name: str) -> None:
-        """下线指定代理。`DELETE /api/proxies`（v1 路径，v2 无对应写接口）。"""
-        resp = self._client.delete("/api/proxies", params={"name": proxy_name})
+    def clear_offline_proxies(self) -> None:
+        """清理 dashboard 统计里的**离线代理记录**（frp 唯一的代理写操作）。
+
+        ⚠️ 这不是"下线在线代理"：frp v0.71.0 的路由表里**没有任何**强制断开
+        在线代理的 API——`DELETE /api/proxies` 的实现是 `ClearOfflineProxies()`，
+        且只接受 `?status=offline`（源码 `server/http/controller.go`，真机实测
+        无参数时返回 `400 status only support offline`）。此前把它当作
+        "kick（下线代理）"是一个**从未真正工作过**的功能。
+        """
+        resp = self._client.delete("/api/proxies", params={"status": "offline"})
         if resp.status_code >= 400:
             raise AdminUnreachable(
-                f"下线代理 {proxy_name} 失败：HTTP {resp.status_code}",
+                f"清理离线代理记录失败：HTTP {resp.status_code}",
                 hint=resp.text.strip()[:200],
             )
 
