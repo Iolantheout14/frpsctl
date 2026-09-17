@@ -687,12 +687,23 @@ Ctrl-C 停止。
 浏览器打开上面的 URL，输入口令即进入主界面。会话默认 8 小时（只存服务端内存，
 重启即失效）；刷新页面不会掉线（Cookie 还在，前端自动恢复会话）。
 
-**忘了口令？** 如果口令是自动生成的（只在启动时打印过一次），用：
-如果口令是 `web service install` 写入文件的：
+**忘了口令？** 分两种情况：
 
-```bash
-frpsctl web password show
-```
+- **systemd 部署**（`web service install` 会把口令写入实例目录的文件）：
+
+  ```bash
+  frpsctl web password show        # 文件不存在时报配置错误；权限过宽时向 stderr 告警
+  ```
+
+- **前台 `web serve` 且口令是自动生成的**：它只在启动时打印一次、**不落盘**，
+  因此无法找回——重新启动并显式指定一个新口令即可：
+
+  ```bash
+  FRPSCTL_WEB_PASSWORD='your-new-password' frpsctl web serve   # 或 --password / --password-file
+  ```
+
+  想以后随时能取回，改用 `sudo frpsctl web service install`：口令会持久化到
+  实例目录的 `web-password`（0600），之后用 `frpsctl web password show` 读回。
 
 ### 仪表盘
 
