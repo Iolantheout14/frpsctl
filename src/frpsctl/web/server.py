@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,7 +30,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..core.healthcheck import parse_bind
-from .api import WebContext, dispatch
+from ..core import web_audit
+from .api import RequestInfo, WebContext, dispatch
 from .auth import SESSION_COOKIE
 
 __all__ = ["WebServer", "WebSettings", "STATIC_INDEX"]
@@ -38,17 +42,26 @@ STATIC_INDEX = Path(__file__).parent / "static" / "index.html"
 #: 请求体上限：管理台的请求都很小，限制它防止有人拿它当上传口。
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
-#: 安全响应头（所有响应都带）。
+#: 安全响应头（所有响应都带）。Cache-Control 不在这里——它按响应类型动态
+#: 决定（见 `_send_json` 的 cacheable 参数）。
 _SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
 
-_INDEX_CSP = (
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-    "connect-src 'self'; img-src data:"
-)
+def _index_csp(nonce: str) -> str:
+    """单文件前端的 CSP：脚本/样式只认**每请求 nonce**。
+
+    0.3.0 起无 `'unsafe-inline'`：`<script>` / `<style>` 标签与全部内联 style
+    属性已改造为 nonce / class（见 index.html 与前端守卫测试）。这层是纵深
+    防御——前端本就没有 innerHTML 注入点，但"万一"的出口现在被 CSP 也堵上。
+    """
+    return (
+        "default-src 'none'; "
+        f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+        "connect-src 'self'; img-src data:; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,12 @@ class WebSettings:
     bind: str = "127.0.0.1:8787"
     #: 是否打访问日志（默认关闭：每请求两行太吵；排查时打开）。
     access_log: bool = False
+    #: 是否暴露 `/metrics`（Prometheus 文本；需 Basic auth，用户名任意、
+    #: 口令 = 管理台口令）。默认关闭：没有监控系统时少一个信息出口。
+    metrics: bool = False
+    #: 请求线程上限：超限的连接立即 503，而不是无限排队（慢 dashboard 下
+    #: 请求线程堆积会吃内存；明确的失败比让浏览器转圈诚实）。
+    max_workers: int = 32
     #: 在反向代理后运行时，用 `X-Forwarded-For` 的**最后一跳**作为登录限速来源。
     #: **默认关闭**：不开启时该头完全不被读取——伪造它既不能绕开限速，也不能
     #: 制造新来源。开启的前提是"前面确实有一层会重写该头的可信代理"。
@@ -70,14 +89,43 @@ class WebSettings:
         return parse_bind(self.bind, default_port=8787)[1]
 
 
+class _LoginFailLimiter:
+    """失败登录的**审计**限速：每来源每 60 秒最多写一条失败记录。
+
+    与认证的失败限速（AuthManager，5 次/60 秒）是两件事：那个决定"还能不能
+    试"，这个决定"失败要不要逐条写审计"。爆破场景下逐条写会把审计文件刷爆，
+    而第一条失败已经足以定位来源；限速窗口与认证侧同量级。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[str, float] = {}
+
+    def allow(self, source: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            last = self._last.get(source, 0.0)
+            if now - last < 60.0:
+                return False
+            self._last[source] = now
+            if len(self._last) > 1024:
+                oldest = min(self._last, key=lambda key: self._last[key])
+                self._last.pop(oldest, None)
+            return True
+
+
+_login_fail_limiter = _LoginFailLimiter()
+
+
 def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
     """构造请求处理器（闭包传状态，避免类属性在多次启动间串味）。"""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "frpsctl-web/0.1"
         protocol_version = "HTTP/1.1"
-        #: keep-alive 连接的空闲超时（同插件服务：防止线程停在 readline）。
-        timeout = 30
+        #: 读请求/空闲超时。管理台每响应关闭连接（见 `_send_json`），这里主要
+        #: 防慢速客户端占住 worker（v0.3.0 review 收紧：30 → 5 秒）。
+        timeout = 5
 
         # --- 入口 ------------------------------------------------------
 
@@ -85,6 +133,9 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             parsed = urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
                 self._send_index()
+                return
+            if parsed.path == "/metrics":
+                self._handle_metrics()
                 return
             if parsed.path == "/favicon.ico":
                 # 页面内嵌 data URI 图标（CSP 零外部资源）；这一条是给仍会请求
@@ -99,9 +150,14 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 # 会话状态查询：刷新页面后 Cookie 还在、但前端内存里的 CSRF
                 # 丢了——用它恢复（否则刷新后的所有变更操作都会 403）。
                 if session is None:
-                    self._send_json(401, {"error": "未登录"})
+                    self._send_json(401, {"error": "未登录"}, cacheable=False)
                     return
-                self._send_json(200, {"csrf": session.csrf, "ttl": ctx.auth.session_ttl})
+                # 含 CSRF：绝不进缓存（否则共享缓存的另一端能拿到）
+                self._send_json(
+                    200,
+                    {"csrf": session.csrf, "ttl": ctx.auth.session_ttl},
+                    cacheable=False,
+                )
                 return
             status, payload = dispatch(
                 ctx,
@@ -122,7 +178,7 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             if payload is None:
                 # 读不出/超限时必须断开连接（HTTP/1.1 下未排空的请求体会串味）
                 self.close_connection = True
-                self._send_json(400, {"error": "请求体不是合法 JSON"})
+                self._send_json(400, {"error": "请求体不是合法 JSON"}, cacheable=False)
                 return
 
             # 登录/登出由 server 直接处理（涉及 Set-Cookie 的 HTTP 细节）
@@ -131,11 +187,11 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 return
             session = self._session()
             if session is None:
-                self._send_json(401, {"error": "未登录"})
+                self._send_json(401, {"error": "未登录"}, cacheable=False)
                 return
             if parsed.path == "/api/logout":
                 if not ctx.auth.check_csrf(session, self.headers.get("X-CSRF-Token")):
-                    self._send_json(403, {"error": "CSRF 校验失败"})
+                    self._send_json(403, {"error": "CSRF 校验失败"}, cacheable=False)
                     return
                 ctx.auth.logout(session.token)
                 self._send_json(
@@ -144,10 +200,11 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                     extra_headers={
                         "Set-Cookie": f"{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
                     },
+                    cacheable=False,
                 )
                 return
             if not ctx.auth.check_csrf(session, self.headers.get("X-CSRF-Token")):
-                self._send_json(403, {"error": "CSRF 校验失败", "hint": "刷新页面后重试"})
+                self._send_json(403, {"error": "CSRF 校验失败", "hint": "刷新页面后重试"}, cacheable=False)
                 return
 
             status, body = dispatch(
@@ -157,20 +214,36 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 query={},
                 body=payload,
                 authenticated=True,
+                request_info=RequestInfo(
+                    source=self._login_source(),
+                    session_id=web_audit.session_fingerprint(session.token),
+                ),
             )
-            self._send_json(status, body)
+            self._send_json(status, body, cacheable=False)
 
         # --- 认证细节 --------------------------------------------------
 
         def _handle_login(self, payload: dict[str, Any]) -> None:
-            session = ctx.auth.login(
-                str(payload.get("password") or ""),
-                source=self._login_source(),
-            )
+            source = self._login_source()
+            session = ctx.auth.login(str(payload.get("password") or ""), source=source)
             if session is None:
+                # 失败留痕（含被限速的请求——限速器让"每来源每分钟记一条"成立，
+                # 攻击者的海量重试不会把审计文件刷爆，但第一次一定看得见）。
+                if _login_fail_limiter.allow(source) and not web_audit.record(
+                    ctx.inst, action="login", result="error", source=source
+                ):
+                    self._note("⚠ Web 操作审计写入失败（登录失败本身已拒绝）：检查实例目录权限与磁盘空间")
                 # 口令错误与被限速的响应**完全一致**（不给爆破者信号）
-                self._send_json(401, {"error": "口令错误", "hint": ""})
+                self._send_json(401, {"error": "口令错误", "hint": ""}, cacheable=False)
                 return
+            if not web_audit.record(
+                ctx.inst,
+                action="login",
+                result="ok",
+                source=source,
+                session_id=web_audit.session_fingerprint(session.token),
+            ):
+                self._note("⚠ Web 操作审计写入失败（登录本身已成功）：检查实例目录权限与磁盘空间")
             max_age = int(session.expires_at - ctx.clock())
             cookie = (
                 f"{SESSION_COOKIE}={session.token}; HttpOnly; SameSite=Strict; "
@@ -180,6 +253,7 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 200,
                 {"csrf": session.csrf, "ttl": ctx.auth.session_ttl},
                 extra_headers={"Set-Cookie": cookie},
+                cacheable=False,
             )
 
         def _session(self):
@@ -230,29 +304,85 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
 
         # --- 输出 ------------------------------------------------------
 
+        _connection_header_sent = False
+
+        def send_header(self, keyword, value) -> None:  # noqa: ANN001
+            if keyword.lower() == "connection":
+                self._connection_header_sent = True
+            super().send_header(keyword, value)
+
+        def end_headers(self) -> None:
+            """按 `close_connection` 显式声明 `Connection: close`。
+
+            我们每响应关闭连接（见 `_send_json`）——但裸 `BaseHTTPRequestHandler`
+            不会自动添加该响应头，HTTP/1.1 客户端会误以为连接可复用（v0.3.0
+            review 冒烟实测）。`send_error` 等 stdlib 路径会自己发该头，这里
+            做去重（v0.3.0 最终 review N4：实测重复两个头）。
+            """
+            if self.close_connection and not self._connection_header_sent:
+                self.send_header("Connection", "close")
+            super().end_headers()
+
         def _send_json(
-            self, status: int, payload: dict[str, Any], *, extra_headers: dict | None = None
+            self,
+            status: int,
+            payload: dict[str, Any],
+            *,
+            extra_headers: dict | None = None,
+            cacheable: bool = True,
         ) -> None:
+            """JSON 响应。`cacheable=True`（只读 GET）时带 ETag 并允许条件请求：
+            `Cache-Control: no-cache` 让浏览器存下但每次验证，命中 `If-None-Match`
+            直接回 304（零 body）——5 秒轮询在"数据没变"时省掉响应体与序列化。
+
+            写响应 / 错误 / 登录（`cacheable=False`）一律 `no-store`：变更结果与
+            鉴权失败不能被任何缓存留存。
+            """
+            # v0.3.0 review：每个响应后关闭连接——worker 槽位按**请求**占用而
+            # 非按 keep-alive 连接。少数标签页的常驻连接因此不会把并发额度
+            # 占满（回环上重建连接的开销可忽略）。
+            self.close_connection = True
             # default=str：配置里可能有 TOML datetime 这类非原生类型
             # （`json.dumps` 直接抛 TypeError 会让整个配置页连接被断开）。
             body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+            etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+            if cacheable and status == 200:
+                if self.headers.get("If-None-Match", "").strip() == etag:
+                    self._send_not_modified(etag)
+                    return
+                cache_headers = {"ETag": etag, "Cache-Control": "no-cache", "Vary": "Cookie"}
+            else:
+                cache_headers = {"Cache-Control": "no-store"}
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                for key, value in _SECURITY_HEADERS.items():
-                    self.send_header(key, value)
-                for key, value in (extra_headers or {}).items():
+                for key, value in {**_SECURITY_HEADERS, **cache_headers, **(extra_headers or {})}.items():
                     self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在响应写出前断开连接")
 
+        def _send_not_modified(self, etag: str) -> None:
+            """304：无 body，但 ETag / 缓存策略 / 安全头必须保持（RFC 9110）。"""
+            try:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Vary", "Cookie")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
+
         def _send_no_content(self) -> None:
             """204：没有响应体（favicon 等"无需内容"的请求）。"""
+            self.close_connection = True
             try:
                 self.send_response(204)
+                self.send_header("Cache-Control", "no-store")
                 for key, value in _SECURITY_HEADERS.items():
                     self.send_header(key, value)
                 self.end_headers()
@@ -260,22 +390,94 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 self._note("客户端在响应写出前断开连接")
 
         def _send_index(self) -> None:
+            """下发前端并注入**每请求 nonce**（CSP 无 unsafe-inline）。"""
+            self.close_connection = True
             try:
-                html = static_index.read_bytes()
+                template = static_index.read_text("utf-8")
             except OSError:
-                self._send_json(500, {"error": "前端资源缺失（static/index.html）"})
+                self._send_json(500, {"error": "前端资源缺失（static/index.html）"}, cacheable=False)
                 return
+            nonce = secrets.token_urlsafe(16)
+            html = template.replace("__CSP_NONCE__", nonce).encode("utf-8")
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(html)))
                 for key, value in _SECURITY_HEADERS.items():
                     self.send_header(key, value)
-                self.send_header("Content-Security-Policy", _INDEX_CSP)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", _index_csp(nonce))
                 self.end_headers()
                 self.wfile.write(html)
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在页面加载中断开连接")
+
+        def _send_text(self, status: int, text: str, *, content_type: str) -> None:
+            self.close_connection = True
+            body = text.encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
+
+        # --- /metrics --------------------------------------------------
+
+        def _handle_metrics(self) -> None:
+            """Prometheus 指标：未开启 404；未授权 401（Basic auth）。"""
+            if not settings.metrics:
+                self._send_json(404, {"error": "not found"}, cacheable=False)
+                return
+            if not self._metrics_authorized():
+                self._send_json(
+                    401,
+                    {"error": "未授权"},
+                    extra_headers={"WWW-Authenticate": 'Basic realm="frpsctl"'},
+                    cacheable=False,
+                )
+                return
+            from .metrics import render_cached
+
+            self._send_text(
+                200,
+                render_cached(ctx),
+                content_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+
+        def _metrics_authorized(self) -> bool:
+            """有效会话 Cookie 或 Basic auth（用户名任意、口令 = 管理台口令）。"""
+            if self._session() is not None:
+                return True
+            from .metrics import check_basic_auth
+
+            return check_basic_auth(
+                ctx.auth,
+                self.headers.get("Authorization", ""),
+                # 与登录**同一来源解析**（trusted_proxy 下用 XFF 最后一跳）：
+                # 否则两条限速桶互不相干，爆破通道在反代部署下重新分裂
+                # （v0.3.0 最终 review N1）。
+                source=self._login_source(),
+            )
+
+        def handle_error(self, request, client_address) -> None:  # noqa: ANN001, ARG002
+            """连接类异常静默（v0.3.0 review）。
+
+            浏览器正常关闭 keep-alive 连接时异常发生在 `rfile.readline`，默认
+            实现会把整段 traceback 打进 stderr/journald——那些不是错误，只是
+            客户端走了。其余异常仍走默认（保留诊断）。
+            """
+            import sys as _sys
+
+            exc = _sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            super().handle_error(request, client_address)
 
         def _note(self, message: str) -> None:
             import sys
@@ -289,6 +491,45 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 super().log_message(*args)  # type: ignore[arg-type]
 
     return Handler
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """有界并发的 HTTP 服务：worker 用尽时直接 503 并断开。
+
+    这是 README"已知边界"里"管理台不限制并发连接数"的收口：单机管理工具
+    不该在慢 dashboard 下无限堆线程。503 是**明确的失败**，比无限排队
+    （浏览器一直转圈、内存持续上涨）更容易被理解和处理。
+    """
+
+    daemon_threads = True
+
+    def __init__(self, *args: object, max_workers: int = 32, **kwargs: object) -> None:
+        self._workers = threading.BoundedSemaphore(max(1, max_workers))
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address) -> None:  # noqa: ANN001
+        if not self._workers.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:  # noqa: ANN001
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._workers.release()
 
 
 class WebServer:
@@ -312,8 +553,11 @@ class WebServer:
     def start(self) -> None:
         """绑定并开始服务。绑定失败（端口占用）原样抛 `OSError`。"""
         handler = _make_handler(self.ctx, self.settings, self._static or STATIC_INDEX)
-        self._httpd = ThreadingHTTPServer((self.settings.host, self.settings.port), handler)
-        self._httpd.daemon_threads = True
+        self._httpd = _BoundedThreadingHTTPServer(
+            (self.settings.host, self.settings.port),
+            handler,
+            max_workers=self.settings.max_workers,
+        )
         # 未 accept 的连接队列上限（backlog）。管理台不面向高并发，设一个小值
         # 让过载时的行为可预期（多出的连接被内核拒绝，而不是无限排队）。
         # 注意这是**唯一**的并发护栏：请求线程数没有上限（单机管理工具，
@@ -325,7 +569,12 @@ class WebServer:
         self._thread.start()
 
     def serve_forever(self) -> None:
-        """前台阻塞运行（CLI 用）。SIGTERM（systemd stop）→ 优雅退出。"""
+        """前台阻塞运行（CLI 用）。SIGTERM（systemd stop）→ 优雅退出。
+
+        `start()` 已经在后台线程服务；本方法只负责安装信号处理器并**等待**
+        ——此前这里对同一个 httpd 再调一次 `serve_forever()`，两个 select
+        循环并存（结构隐患，v0.3.0 review 修正）。
+        """
         if self._httpd is None:
             self.start()
         assert self._httpd is not None
@@ -333,7 +582,11 @@ class WebServer:
         previous = signal.getsignal(signal.SIGTERM)
         try:
             signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
-            self._httpd.serve_forever()
+            while True:
+                thread = self._thread
+                if thread is None or not thread.is_alive():
+                    break
+                thread.join(timeout=0.5)
         finally:
             signal.signal(signal.SIGTERM, previous)
             self.stop()

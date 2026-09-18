@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>frpsctl 管理台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%234f8cff'/%3E%3Cpath%20d='M10%2022V10h9v3.2h-5.4v1.6h4.6v3.1h-4.6V22z'%20fill='white'/%3E%3C/svg%3E">
-<script>
+<script nonce="__CSP_NONCE__">
   /* 主题必须在首帧前落定（放 head）：否则暗色用户会看到一次亮色闪烁。 */
   try {
     var saved = localStorage.getItem("frpsctl_web_theme");
@@ -14,7 +14,7 @@
     if (light) document.documentElement.classList.add("light");
   } catch (e) { /* 隐私模式：跟随默认（暗色） */ }
 </script>
-<style>
+<style nonce="__CSP_NONCE__">
   :root {
     --bg: #0f1115; --panel: #171a21; --panel2: #1d222c; --border: #262b36;
     --text: #e6e9ef; --muted: #8b93a7; --accent: #4f8cff; --accent2: #7aa2ff;
@@ -152,6 +152,17 @@
   .diffline.add { background: var(--diff-add-bg); color: var(--ok); }
   .diffline.del { background: var(--diff-del-bg); color: var(--err); }
   .diffline.hunk { color: var(--accent2); }
+  /* 工具类：CSP nonce 化后不允许内联 style 属性（style-src 无 unsafe-inline） */
+  .mt-0 { margin-top: 0; } .mt-10 { margin-top: 10px; } .mt-12 { margin-top: 12px; }
+  .mt-16 { margin-top: 16px; } .mb-0 { margin-bottom: 0; } .mb-8 { margin-bottom: 8px; }
+  .flex-1 { flex: 1; } .w-auto { width: auto; } .w-340 { max-width: 340px; }
+  .span-all { grid-column: 1 / -1; }
+  .small { font-size: 12.5px; } .sub-note { font-size: 12px; font-weight: 400; }
+  .note-12 { font-size: 12px; margin-bottom: 0; }
+  .row-end { justify-content: flex-end; }
+  .right-cluster { float: right; display: flex; gap: 8px; align-items: center; }
+  .pre-wrap { white-space: pre-wrap; }
+  .small-row { font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
   /* 图表颜色走 CSS（SVG 的 fill/stroke 由样式表控制）：主题切换即时生效，
      JS 不必知道任何颜色。 */
   .bar-in { fill: var(--accent); }
@@ -177,11 +188,11 @@
     <h1>frpsctl 管理台</h1>
     <p>输入启动时显示的管理口令（或口令文件里的值）。</p>
     <input id="password" type="password" placeholder="口令" autocomplete="current-password">
-    <div class="row" style="margin-top:12px">
-      <button class="primary" id="login-btn" style="flex:1">登录</button>
+    <div class="row mt-12">
+      <button class="primary flex-1" id="login-btn">登录</button>
     </div>
-    <p class="muted" id="login-error" style="margin-top:10px"></p>
-    <p class="muted" style="font-size:12px;margin-bottom:0">连续登录失败会被暂时限制（限速与口令错误的提示相同）。</p>
+    <p class="muted mt-10" id="login-error"></p>
+    <p class="muted note-12">连续登录失败会被暂时限制（限速与口令错误的提示相同）。</p>
   </div>
 </div>
 
@@ -199,8 +210,8 @@
     <button id="menu-toggle" title="展开菜单">菜单</button>
     <div class="actions">
       <button id="refresh-btn" title="立即刷新">刷新</button>
-      <label class="muted" style="font-size:12.5px;display:flex;gap:6px;align-items:center">
-        <input type="checkbox" id="autopoll" checked style="width:auto"> 自动刷新
+      <label class="muted small-row">
+        <input type="checkbox" id="autopoll" checked class="w-auto"> 自动刷新
       </label>
       <button id="theme-toggle" title="切换明暗主题">亮色</button>
       <button id="act-start">启动</button>
@@ -220,15 +231,15 @@
         <h2>控制面健康</h2>
         <div class="kv" id="kv-health"></div>
       </section>
-      <section class="card" style="grid-column: 1 / -1">
+      <section class="card span-all">
         <h2>系统体检（只读，与 CLI `doctor` 同一实现）</h2>
-        <div class="row" style="margin-bottom:8px">
+        <div class="row mb-8">
           <button id="doctor-btn">运行体检</button>
-          <span class="muted" id="doctor-summary" style="font-size:12.5px"></span>
+          <span class="muted small" id="doctor-summary"></span>
         </div>
         <div id="doctor-findings" class="muted">尚未运行。体检以 Web 服务进程的权限执行：端口可绑定性、文件可达性等结果可能与 root 下的 CLI 不同。</div>
       </section>
-      <section class="card" style="grid-column: 1 / -1">
+      <section class="card span-all">
         <h2>概览</h2>
         <div class="stats" id="stats"></div>
       </section>
@@ -242,27 +253,27 @@
         <div class="chart-wrap" id="chart-live"></div>
         <p class="chart-note" id="live-hint">页面打开期间每 5 秒采样一次（累计值差分），存本地浏览器。</p>
       </section>
-      <section class="card" style="grid-column: 1 / -1">
+      <section class="card span-all">
         <h2>客户端</h2>
         <div class="tablewrap"><div id="clients-table" class="muted">加载中…</div></div>
       </section>
-      <section class="card" style="grid-column: 1 / -1">
-        <h2>代理 <span class="muted" style="font-size:12px;font-weight:400">（点击某行查看该代理的 7 天曲线）</span></h2>
-        <div class="row" style="justify-content:flex-end;margin-bottom:8px">
+      <section class="card span-all">
+        <h2>代理 <span class="muted sub-note">（点击某行查看该代理的 7 天曲线）</span></h2>
+        <div class="row row-end mb-8">
           <button id="prune-btn">清理离线记录</button>
         </div>
         <div class="tablewrap"><div id="proxies-table" class="muted">加载中…</div></div>
       </section>
-      <section class="card" style="grid-column: 1 / -1">
-        <h2>日志 <span class="muted" id="log-path" style="font-weight:400;font-size:12px"></span>
-          <span style="float:right;display:flex;gap:8px;align-items:center">
+      <section class="card span-all">
+        <h2>日志 <span class="muted sub-note" id="log-path"></span>
+          <span class="right-cluster">
             <select id="log-lines" title="显示行数">
               <option value="100">100 行</option>
               <option value="200" selected>200 行</option>
               <option value="500">500 行</option>
               <option value="2000">2000 行</option>
             </select>
-            <span class="muted" id="log-follow" style="font-weight:400;font-size:12px">跟随中</span>
+            <span class="muted sub-note" id="log-follow">跟随中</span>
           </span>
         </h2>
         <pre id="logs">加载中…</pre>
@@ -272,12 +283,12 @@
     <div id="view-config" class="hidden">
       <section class="card">
         <h2>配置编辑</h2>
-        <p class="muted" style="margin-top:0">
+        <p class="muted mt-0">
           修改任意字段后点"预览变更"查看 diff，确认后应用到实例（会重启服务）。
           敏感值（token / 口令）不回显：留空表示不改，填入新值才会覆盖；行尾"删除"会让该键回落默认值。
         </p>
-        <div class="row" style="margin-bottom:8px">
-          <input id="cfg-search" placeholder="过滤键名（如 tls / webServer；只影响显示）" autocomplete="off" style="max-width:340px">
+        <div class="row mb-8">
+          <input id="cfg-search" placeholder="过滤键名（如 tls / webServer；只影响显示）" autocomplete="off" class="w-340">
         </div>
         <div id="config-form"></div>
         <div class="addrow">
@@ -285,39 +296,41 @@
           <input id="add-value" placeholder='值（如 7001 或 "text"）' autocomplete="off">
           <button id="add-btn">添加</button>
         </div>
-        <div class="row" style="margin-top:16px">
+        <div class="row mt-16">
           <button class="primary" id="cfg-preview">预览变更</button>
           <button id="cfg-reset">重新加载（丢弃修改）</button>
-          <span class="muted" id="cfg-count" style="font-size:12.5px"></span>
+          <span class="muted small" id="cfg-count"></span>
         </div>
       </section>
       <section class="card hidden" id="cfg-preview-card">
         <h2>变更预览（打码后的 diff）</h2>
         <pre class="diffbox" id="cfg-diff"></pre>
-        <div class="row" style="margin-top:12px">
+        <div class="row mt-12">
           <button class="danger" id="cfg-apply">确认应用（重启服务）</button>
           <button id="cfg-cancel">取消</button>
         </div>
       </section>
       <section class="card">
         <h2>历史与回滚</h2>
-        <p class="muted" style="margin-top:0;font-size:12.5px">回滚前建议先"查看差异"——回滚会重启服务。</p>
+        <p class="muted mt-0 small">回滚前建议先"查看差异"——回滚会重启服务。</p>
         <div class="tablewrap"><div id="history-table" class="muted">加载中…</div></div>
       </section>
     </div>
 
     <div id="view-audit" class="hidden">
       <section class="card">
-        <h2>插件审计 <span class="muted" id="audit-path" style="font-weight:400;font-size:12px"></span></h2>
-        <div class="row" style="margin-bottom:8px">
-          <button class="primary" id="audit-refresh">刷新审计</button>
-          <span class="muted" style="font-size:12.5px">只读视图：打开本页或点刷新时读取一次（不自动轮询）</span>
+        <h2>审计 <span class="muted sub-note" id="audit-path"></span></h2>
+        <div class="row mb-8">
+          <button class="primary" id="audit-scope-plugin">插件审计</button>
+          <button id="audit-scope-web">Web 操作</button>
+          <button id="audit-refresh">刷新</button>
+          <span class="muted small">只读视图：打开本页或点刷新时读取一次（不自动轮询）</span>
         </div>
         <div class="stats" id="audit-stats"></div>
-        <p class="muted" id="audit-note" style="font-size:12.5px;white-space:pre-wrap;margin-bottom:0"></p>
+        <p class="muted small pre-wrap mb-0" id="audit-note"></p>
       </section>
       <section class="card">
-        <h2>最近记录 <span class="muted" style="font-weight:400;font-size:12px">（新 → 旧）</span></h2>
+        <h2>最近记录 <span class="muted sub-note">（新 → 旧）</span></h2>
         <div class="tablewrap"><div id="audit-table" class="muted">打开本视图时加载…</div></div>
       </section>
     </div>
@@ -325,7 +338,7 @@
 </div>
 <div id="toast"></div>
 
-<script>
+<script nonce="__CSP_NONCE__">
 "use strict";
 const $ = (id) => document.getElementById(id);
 let CSRF = null;           // 只存内存（不落 localStorage）
@@ -605,13 +618,13 @@ function tableOf(headers, rows) {
   return table;
 }
 function renderClients(items, total) {
-  const rows = items.map((c) => el("tr", {}, [
-    el("td", { text: c.key || "-" }),
-    el("td", { text: c.user || "-" }),
-    el("td", { text: c.hostname || "-" }),
-    el("td", { text: c.clientIP || "-" }),
+  const rows = clientRows(items).map((c) => el("tr", {}, [
+    el("td", { text: c.name }),
+    el("td", { text: c.user }),
+    el("td", { text: c.hostname }),
+    el("td", { text: c.ip }),
     el("td", {}, [el("span", { class: c.online ? "tag online" : "tag", text: c.online ? "online" : "offline" })]),
-    el("td", { text: c.version || "-" }),
+    el("td", { text: c.version }),
   ]));
   const box = $("clients-table");
   box.replaceChildren(tableOf(["name", "user", "hostname", "ip", "状态", "版本"], rows));
@@ -627,15 +640,15 @@ function detailCell(name) {
 }
 function renderProxies(items) {
   const rows = [];
-  for (const p of items) {
+  for (const p of proxyRows(items)) {
     rows.push(el("tr", { class: "clickable", onclick: () => toggleProxy(p.name) }, [
-      el("td", { text: p.name || "-" }),
-      el("td", { text: p.user || "-" }),
-      el("td", { text: p.type || "-" }),
-      el("td", { class: "num", text: p.remote_port ? String(p.remote_port) : "-" }),
-      el("td", {}, [el("span", { class: p.phase === "online" ? "tag online" : "tag", text: p.phase || "-" })]),
-      el("td", { class: "num", text: String(p.cur_conns ?? 0) }),
-      el("td", { class: "num", text: `${humanBytes(p.today_traffic_in)} / ${humanBytes(p.today_traffic_out)}` }),
+      el("td", { text: p.name }),
+      el("td", { text: p.user }),
+      el("td", { text: p.type }),
+      el("td", { class: "num", text: p.port }),
+      el("td", {}, [el("span", { class: p.online ? "tag online" : "tag", text: p.phase })]),
+      el("td", { class: "num", text: p.conns }),
+      el("td", { class: "num", text: p.traffic }),
     ]));
     if (expandedProxies.has(p.name)) {
       rows.push(el("tr", { class: "detail" }, [
@@ -650,6 +663,7 @@ function renderProxies(items) {
   }
 }
 function toggleProxy(name) {
+  if (!name || name === "-") return;  // 无名代理没有可查的明细
   if (expandedProxies.has(name)) {
     expandedProxies.delete(name);
     renderProxies(proxiesCache);
@@ -1117,7 +1131,7 @@ async function runDoctor() {
     }
     for (const f of data.findings) {
       const cls = f.severity === "ERROR" ? "err" : (f.severity === "WARN" ? "warn" : "");
-      const card = el("div", { class: "banner " + cls, style: "margin-bottom:8px" });
+      const card = el("div", { class: "banner " + cls + " mb-8" });
       card.appendChild(el("div", { text: `[${f.severity}] ${f.check}：${f.message}` }));
       if (f.hint) card.appendChild(el("div", { class: "muted", text: "↳ " + f.hint }));
       box.appendChild(card);
@@ -1131,21 +1145,14 @@ async function runDoctor() {
 }
 $("doctor-btn").addEventListener("click", runDoctor);
 
-/* ---------- 插件审计（只读；打开视图或手动刷新时读一次） ---------- */
+/* ---------- 审计（插件审计 / Web 操作，只读；打开或刷新时读一次） ---------- */
 let auditLoaded = false;
-async function loadAudit() {
-  auditLoaded = true;
-  $("audit-table").textContent = "加载中…";
-  try {
-    renderAudit(await api("/api/audit"));
-  } catch (err) {
-    $("audit-table").textContent = "审计读取失败：" + err.message;
-  }
-}
-function renderAudit(data) {
+let auditScope = "plugin";
+
+/* 纯逻辑（node 守卫可测；不含任何 DOM 访问）：列表行变换 + 审计渲染变换 */
+function pluginAuditStatsItems(data) {
   const stats = data.stats || {};
-  $("audit-path").textContent = data.path ? "· " + data.path : "";
-  $("audit-stats").replaceChildren(...[
+  return [
     ["记录", stats.total ?? "-"],
     ["允许", stats.allow ?? "-"],
     ["拒绝", stats.deny ?? "-"],
@@ -1153,11 +1160,10 @@ function renderAudit(data) {
     ["坏行", data.bad_lines ?? 0],
     ["均耗时(ms)", stats.elapsed_count ? Number(stats.elapsed_avg_ms).toFixed(1) : "-"],
     ["峰耗时(ms)", stats.elapsed_count ? Number(stats.elapsed_max_ms).toFixed(1) : "-"],
-  ].map(([label, num]) => el("div", { class: "stat" }, [
-    el("span", { class: "num", text: String(num) }),
-    el("span", { class: "label", text: label }),
-  ])));
-
+  ];
+}
+function pluginAuditNotes(data) {
+  const stats = data.stats || {};
   const notes = [];
   if (!data.available) notes.push("策略不可用：" + (data.reason || ""));
   else if (!data.enabled) notes.push("审计已关闭（策略 audit.enabled = false）");
@@ -1172,8 +1178,110 @@ function renderAudit(data) {
   const byOp = stats.by_op || {};
   const byOpText = Object.entries(byOp).map(([op, n]) => `${op}=${n}`).join("　");
   if (byOpText) notes.push("按操作：" + byOpText);
-  $("audit-note").textContent = notes.join("\n");
+  return notes;
+}
+function webAuditStatsItems(data) {
+  const stats = data.stats || {};
+  return [
+    ["操作", stats.total ?? "-"],
+    ["成功", stats.ok ?? "-"],
+    ["失败", stats.error ?? "-"],
+    // 坏行口径：stats 里是全量扫描（与 CLI 一致），顶层只是尾部 50 行
+    ["坏行", stats.bad_lines ?? data.bad_lines ?? 0],
+  ];
+}
+function webAuditNotes(data) {
+  const stats = data.stats || {};
+  const notes = [];
+  if (!data.available) notes.push("尚无 Web 操作记录：" + (data.reason || ""));
+  notes.push("审计文件：" + (data.path || ""));
+  if (stats.first_at) notes.push("时间范围：" + new Date(stats.first_at * 1000).toLocaleString() + " → " + new Date((stats.last_at || stats.first_at) * 1000).toLocaleString());
+  const byAction = stats.by_action || {};
+  const actionText = Object.entries(byAction).map(([a, n]) => `${a}=${n}`).join("　");
+  if (actionText) notes.push("按动作：" + actionText);
+  const bySource = stats.by_source || {};
+  const sourceText = Object.entries(bySource)
+    .sort((a, b) => b[1] - a[1])
+    .map(([s, n]) => `${s || "(未知)"}=${n}`)
+    .join("　");
+  if (sourceText) notes.push("按来源：" + sourceText);
+  return notes;
+}
+function clientRows(items) {
+  return (items || []).map((c) => ({
+    name: c.key || "-",
+    user: c.user || "-",
+    hostname: c.hostname || "-",
+    ip: c.clientIP || "-",
+    online: Boolean(c.online),
+    version: c.version || "-",
+  }));
+}
+function proxyRows(items) {
+  return (items || []).map((p) => ({
+    name: p.name || "-",
+    user: p.user || "-",
+    type: p.type || "-",
+    port: p.remote_port ? String(p.remote_port) : "-",
+    online: p.phase === "online",
+    phase: p.phase || "-",
+    conns: String(p.cur_conns ?? 0),
+    traffic: `${humanBytes(p.today_traffic_in)} / ${humanBytes(p.today_traffic_out)}`,
+  }));
+}
+function webAuditRows(records) {
+  return (records || []).slice().reverse().map((r) => ({
+    at: r.at || "-",
+    ok: r.result === "ok",
+    action: r.action || "-",
+    target: r.target || "-",
+    source: r.source || "-",
+    detail: Object.entries(r.params || {}).map(([k, v]) => `${k}=${v}`).join(" "),
+  }));
+}
 
+async function loadAudit(scope = auditScope) {
+  auditScope = scope;
+  auditLoaded = true;
+  $("audit-scope-plugin").classList.toggle("primary", scope === "plugin");
+  $("audit-scope-web").classList.toggle("primary", scope === "web");
+  $("audit-table").textContent = "加载中…";
+  try {
+    const query = scope === "web" ? "?scope=web" : "";
+    renderAudit(await api("/api/audit" + query));
+  } catch (err) {
+    $("audit-table").textContent = "审计读取失败：" + err.message;
+  }
+}
+function renderAudit(data) {
+  const statsBox = $("audit-stats");
+  const box = $("audit-table");
+  if (data.scope === "web") {
+    $("audit-path").textContent = data.path ? "· " + data.path : "";
+    statsBox.replaceChildren(...webAuditStatsItems(data).map(([label, num]) => el("div", { class: "stat" }, [
+      el("span", { class: "num", text: String(num) }),
+      el("span", { class: "label", text: label }),
+    ])));
+    $("audit-note").textContent = webAuditNotes(data).join("\n");
+    const rows = webAuditRows(data.tail).map((r) => el("tr", {}, [
+      el("td", { text: r.at }),
+      el("td", {}, [el("span", { class: r.ok ? "tag online" : "tag", text: r.ok ? "成功" : "失败" })]),
+      el("td", { text: r.action }),
+      el("td", { text: r.target }),
+      el("td", { text: r.source }),
+      el("td", { text: r.detail }),
+    ]));
+    box.replaceChildren(tableOf(["时间", "结果", "动作", "目标", "来源", "参数"], rows));
+    if (!rows.length) box.replaceChildren(el("div", { class: "muted", text: "没有记录" }));
+    if (data.bad_lines) box.appendChild(el("div", { class: "muted", text: `（${data.bad_lines} 行无法解析）` }));
+    return;
+  }
+  $("audit-path").textContent = data.path ? "· " + data.path : "";
+  statsBox.replaceChildren(...pluginAuditStatsItems(data).map(([label, num]) => el("div", { class: "stat" }, [
+    el("span", { class: "num", text: String(num) }),
+    el("span", { class: "label", text: label }),
+  ])));
+  $("audit-note").textContent = pluginAuditNotes(data).join("\n");
   const rows = (data.tail || []).slice().reverse().map((r) => el("tr", {}, [
     el("td", { text: r.at || "-" }),
     el("td", {}, [el("span", { class: r.decision === "allow" ? "tag online" : "tag", text: r.decision === "allow" ? "允许" : "拒绝" })]),
@@ -1183,11 +1291,12 @@ function renderAudit(data) {
     el("td", { class: "num", text: r.remote_port ? String(r.remote_port) : "-" }),
     el("td", { text: r.reason || "" }),
   ]));
-  const box = $("audit-table");
   box.replaceChildren(tableOf(["时间", "判定", "操作", "用户", "代理", "端口", "理由"], rows));
   if (!rows.length) box.replaceChildren(el("div", { class: "muted", text: "没有记录" }));
   if (data.bad_lines) box.appendChild(el("div", { class: "muted", text: `（${data.bad_lines} 行无法解析）` }));
 }
+$("audit-scope-plugin").addEventListener("click", () => loadAudit("plugin"));
+$("audit-scope-web").addEventListener("click", () => loadAudit("web"));
 $("audit-refresh").addEventListener("click", () => loadAudit());
 
 /* ---------- 未保存修改的离页提示 ---------- */

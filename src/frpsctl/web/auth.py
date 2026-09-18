@@ -43,6 +43,22 @@ MAX_TRACKED_SOURCES = 1024
 #: 默认会话有效期（8 小时）。
 DEFAULT_SESSION_TTL = 8 * 3600.0
 
+
+def _secure_equal(left: str, right: str) -> bool:
+    """常量时间字符串比较。
+
+    ⚠️ 必须先 `encode`：`hmac.compare_digest` 对含非 ASCII 字符的 **str** 会
+    直接抛 `TypeError`（v0.3.0 review 实测：中文口令会让登录线程断开、管理台
+    完全不可用）。用 `surrogatepass` 而不是默认策略——HTTP JSON 里可以构造
+    lone surrogate（编码点 U+D800 单独出现），默认 encode 会抛
+    `UnicodeEncodeError`，同样让线程断开（v0.3.0 最终 review N2）。畸形
+    输入与任何真实口令都不等。
+    """
+    return hmac.compare_digest(
+        left.encode("utf-8", "surrogatepass"),
+        right.encode("utf-8", "surrogatepass"),
+    )
+
 #: 会话表上限。与失败来源表（`MAX_TRACKED_SOURCES`）同一条护栏纪律：持有口令
 #: 的调用方可以不断登录开新会话，而惰性清理只在过期或再次登录时发生——没有
 #: 上限意味着"一直登录"能把内存持续推高。超过上限时驱逐**最早到期**的会话
@@ -108,7 +124,7 @@ class AuthManager:
             fails = self._failures.get(source, [])
             if len(fails) >= MAX_FAILURES:
                 return None
-            if not hmac.compare_digest(password, self._password):
+            if not _secure_equal(password, self._password):
                 fails.append(now)
                 self._failures[source] = fails
                 # 追加后立刻收敛到上限：任意时刻来源表都保持有界（若只在下次
@@ -130,6 +146,37 @@ class AuthManager:
             self._sessions.pop(token, None)
 
     # --- 校验 -----------------------------------------------------------
+
+    def check_password(self, password: str) -> bool:
+        """常量时间口令比较（`/metrics` 的 Basic auth 用）。
+
+        只比较、不建会话（不在会话表里堆积条目）。**失败计数由调用方负责**
+        （`is_throttled` / `note_failure`）——`/metrics` 与登录共用同一张
+        失败来源表，否则同一口令会有第二条无限次猜测通道（v0.3.0 review）。
+        """
+        return _secure_equal(password, self._password)
+
+    def is_throttled(self, source: str) -> bool:
+        """来源是否处于失败冷却中（与登录共用同一张失败表）。"""
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            return len(self._failures.get(source, [])) >= MAX_FAILURES
+
+    def note_failure(self, source: str) -> None:
+        """记一次失败（`/metrics` 的 Basic auth 失败走这里，纳入同一限速）。
+
+        先 `_prune` 再做窗口外的清理：否则单来源在窗口内被持续轰炸时，它的
+        list 会无界增长（v0.3.0 最终 review N5）。
+        """
+        now = self._clock()
+        with self._lock:
+            self._prune(now)
+            fails = self._failures.get(source, [])
+            fails = [stamp for stamp in fails if now - stamp < FAILURE_WINDOW]
+            fails.append(now)
+            self._failures[source] = fails
+            self._cap_sources()
 
     def check_session(self, token: str | None) -> Session | None:
         """会话是否有效；过期即删除（惰性清理）。"""

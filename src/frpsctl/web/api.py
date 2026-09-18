@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 from urllib.parse import unquote
 
+from .. import report as report_mod
 from ..core import auditlog
 from ..core import config as cfg
 from ..core import doctor as doc
@@ -46,6 +47,7 @@ from ..core.lifecycle import HealthReport, Lifecycle, State
 from ..core.lock import instance_lock
 from ..core.logs import resolve_log_target, tail_lines
 from ..core.transaction import apply_sets, rollback_to, snapshot_diff
+from ..core import web_audit
 from ..errors import (
     AdminUnreachable,
     ConfigError,
@@ -54,6 +56,7 @@ from ..errors import (
     UsageError,
 )
 from .auth import AuthManager
+from .cache import TTLCache
 
 __all__ = ["WebContext", "dispatch", "http_status_for"]
 
@@ -66,8 +69,16 @@ MAX_PENDING_PREVIEWS = 32
 #: 日志接口一次最多返回的行数（防止把大日志一次性拉爆浏览器）。
 MAX_LOG_LINES = 2000
 
-#: 趋势汇总的服务端缓存时间（秒）。浏览器每 5 秒轮询，而趋势是逐日粒度——
-#: 30 秒内重复查询 dashboard 只是把 50 个 HTTP 往返重复一遍。
+#: 各只读端点的服务端缓存时间（秒）。浏览器每 5 秒轮询，而 dashboard 查询
+#: （clients/proxies 各一次全量翻页、traffic 最多 50+ 次并发查询）与日志文件
+#: 读取都没有必要按秒重放；写操作会显式失效（见 action_payload / config_apply）。
+#:
+#: ⚠️ TTL 必须**大于等于**轮询间隔才有意义（v0.3.0 量化验证实测：2 秒 TTL 在
+#: 5 秒轮询下命中率≈0，等于没有缓存）。列表取 6 秒：5 秒轮询几乎每轮命中上
+#: 一轮，而"改完立刻可见"由写失效保证——TTL 只影响外部变化的可见延迟（≤6s）。
+CACHE_TTL_LISTS = 6.0
+CACHE_TTL_LOGS = 3.0
+#: 趋势是逐日粒度：30 秒内重复查询只是把 50 个 HTTP 往返重复一遍。
 TRAFFIC_CACHE_TTL = 30.0
 
 #: 审计视图返回的记录条数（尾部）。
@@ -86,6 +97,33 @@ class _Preview:
     unsets: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RequestInfo:
+    """一次变更请求的来源信息（用于 Web 操作审计；只读请求不携带）。"""
+
+    source: str = ""
+    session_id: str = ""
+
+
+def _audit(ctx: WebContext, info: RequestInfo | None, *, action: str, target: str = "",
+           params: dict[str, Any] | None = None, result: str = "ok") -> None:
+    """记一条 Web 操作审计；落盘失败**不阻断动作**，但必须可见（stderr）。"""
+    ok = web_audit.record(
+        ctx.inst,
+        action=action,
+        target=target,
+        params=params,
+        result=result,
+        source=info.source if info else "",
+        session_id=info.session_id if info else "",
+    )
+    if not ok:
+        import sys
+
+        sys.stderr.write("[web] ⚠ Web 操作审计写入失败（动作本身已执行）：检查实例目录权限与磁盘空间\n")
+        sys.stderr.flush()
+
+
 @dataclass
 class WebContext:
     """一个 Web 服务进程的共享上下文（可注入 clock 供测试控制 TTL）。"""
@@ -95,9 +133,23 @@ class WebContext:
     clock: Callable[[], float] = time.monotonic
     previews: dict[str, _Preview] = field(default_factory=dict)
     preview_lock: threading.Lock = field(default_factory=threading.Lock)
-    #: 趋势汇总缓存（`(写入时刻, payload)`）。clock 可注入，测试用假时钟推进即可。
-    traffic_cache: tuple[float, dict] | None = None
-    traffic_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: 只读端点的响应缓存（traffic/lists/logs）。经 lambda 取 clock：测试
+    #: monkeypatch `ctx.clock` 后缓存同样读到假时钟，无需重建上下文。
+    cache: TTLCache = field(init=False)
+    #: 进程级复用的 Lifecycle：owner 探测有实例级 2s TTL，5 秒轮询不必
+    #: 每轮 fork 两个 systemctl（见 `Lifecycle.resolve_owner`）。
+    _lifecycle_instance: object | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        self.cache = TTLCache(lambda: self.clock())
+        self._lifecycle_instance = None
+
+    def lifecycle(self) -> Lifecycle:
+        """本 Web 进程共享的 `Lifecycle` 实例（懒创建）。"""
+        if self._lifecycle_instance is None:
+            self._lifecycle_instance = Lifecycle(self.inst)
+        assert isinstance(self._lifecycle_instance, Lifecycle)
+        return self._lifecycle_instance
 
     def prune_previews(self) -> None:
         """清理过期预览；超过上限时丢弃最旧的（防内存堆积）。"""
@@ -125,6 +177,7 @@ def dispatch(
     query: dict[str, str],
     body: dict[str, Any],
     authenticated: bool,
+    request_info: RequestInfo | None = None,
 ) -> tuple[int, dict]:
     """把一次 API 调用分发给对应 handler，并统一映射异常。
 
@@ -132,7 +185,15 @@ def dispatch(
     这里只按路径分发（`POST /api/login` 是唯一免认证的入口）。
     """
     try:
-        return _route(ctx, method=method, path=path, query=query, body=body, authenticated=authenticated)
+        return _route(
+            ctx,
+            method=method,
+            path=path,
+            query=query,
+            body=body,
+            authenticated=authenticated,
+            request_info=request_info,
+        )
     except FrpsctlError as exc:
         return http_status_for(exc), {
             "error": exc.message,
@@ -144,26 +205,31 @@ def dispatch(
         return 500, {"error": f"服务内部错误：{type(exc).__name__}", "hint": "查看 web 服务日志"}
 
 
+#: `ExitCode` → HTTP 状态码的**单点映射**（表驱动；改动即契约变化）。
+#: 与 CLI 退出码同源：脚本与前端都据此分支，新增退出码时忘记补映射会落到 500
+#: （默认分支），而不是被无声地按某个旧码归类。
+_HTTP_STATUS_BY_EXIT: dict[ExitCode, int] = {
+    ExitCode.OK: 200,
+    ExitCode.UNCLASSIFIED: 500,
+    ExitCode.USAGE: 400,
+    ExitCode.CONFIG_INVALID: 400,
+    ExitCode.BINARY: 400,
+    ExitCode.NOT_RUNNING: 409,
+    ExitCode.ALREADY_RUNNING: 409,
+    ExitCode.ADMIN_UNREACHABLE: 502,
+    ExitCode.PERMISSION: 403,
+    ExitCode.ROLLED_BACK: 502,
+    ExitCode.STARTUP_FAILED: 502,
+    ExitCode.OWNERSHIP_CONFLICT: 409,
+    ExitCode.UNHEALTHY: 502,
+}
+
+
 def http_status_for(exc: FrpsctlError) -> int:
     """`FrpsctlError` → HTTP 状态码（语义对齐，脚本与前端都据此分支）。"""
     if isinstance(exc, AdminUnreachable):
-        return 502  # 上游 dashboard 不可达/未鉴权
-    code = exc.exit_code
-    if code in (ExitCode.USAGE, ExitCode.CONFIG_INVALID, ExitCode.BINARY):
-        return 400
-    if code in (
-        ExitCode.NOT_RUNNING,
-        ExitCode.ALREADY_RUNNING,
-        ExitCode.OWNERSHIP_CONFLICT,
-    ):
-        return 409
-    if code == ExitCode.PERMISSION:
-        return 403
-    if code in (ExitCode.UNHEALTHY, ExitCode.ROLLED_BACK, ExitCode.STARTUP_FAILED):
-        return 502
-    if code == ExitCode.ADMIN_UNREACHABLE:
-        return 502
-    return 500
+        return 502  # 上游 dashboard 不可达/未鉴权（与 exit code 7 同义）
+    return _HTTP_STATUS_BY_EXIT.get(exc.exit_code, 500)
 
 
 def _route(
@@ -174,6 +240,7 @@ def _route(
     query: dict[str, str],
     body: dict[str, Any],
     authenticated: bool,
+    request_info: RequestInfo | None = None,
 ) -> tuple[int, dict]:
     if method == "POST" and path == "/api/login":
         # 登录/登出由 server 层直接处理（涉及 Set-Cookie 的 HTTP 细节），
@@ -196,7 +263,7 @@ def _route(
         if path == "/api/doctor":
             return 200, doctor_payload(ctx)
         if path == "/api/audit":
-            return 200, audit_payload(ctx)
+            return 200, audit_payload(ctx, query.get("scope", "plugin"))
         if path == "/api/config":
             return 200, config_payload(ctx)
         if path == "/api/config/history":
@@ -210,11 +277,11 @@ def _route(
 
     if method == "POST":
         if path.startswith("/api/actions/"):
-            return 200, action_payload(ctx, path.rsplit("/", 1)[-1], body)
+            return 200, action_payload(ctx, path.rsplit("/", 1)[-1], body, request_info=request_info)
         if path == "/api/config/preview":
             return 200, config_preview(ctx, body)
         if path == "/api/config/apply":
-            return 200, config_apply(ctx, body)
+            return 200, config_apply(ctx, body, request_info=request_info)
         return 404, {"error": f"未知接口：POST {path}"}
 
     return 405, {"error": f"不支持的请求方法：{method}"}
@@ -236,41 +303,14 @@ def _admin(ctx: WebContext) -> AdminClient:
 
 
 def _health(report: HealthReport | None) -> dict | None:
-    if report is None:
-        return None
-    return {
-        "l1_process": report.l1_process.value,
-        "l2_control": report.l2_control.value,
-        "l3_plugin": report.l3_plugin.value,
-        "detail": report.detail,
-        "gate": report.gate,
-        # L3 失败不改变任何 gate，但必须显著提示（插件 fail-closed：客户端将
-        # 无法登录）——CLI 一直有这个告警，Web 此前丢了它。
-        "plugin_warning": report.plugin_warning,
-    }
+    """三层健康形状（0.3.0 起与 CLI 共用 `frpsctl.report.health_payload`）。"""
+    return report_mod.health_payload(report)
 
 
 def status_payload(ctx: WebContext) -> dict:
     """进程状态 + dashboard 统计（统计不可得时为 None，不影响状态本身）。"""
-    report = Lifecycle(ctx.inst).status()
-    payload: dict[str, Any] = {
-        "instance": report.instance,
-        "owner": report.owner.value,
-        "state": report.state.value,
-        "state_corrupted": report.state_corrupted,
-        "pid": report.pid,
-        "uptime_seconds": report.uptime_seconds,
-        "binary_version": report.binary_version,
-        "disk_version": report.disk_version,
-        "listen": None
-        if report.listen is None
-        else {"addr": report.listen.addr, "port": report.listen.port},
-        "systemd_unit": report.systemd_unit,
-        "systemd_main_pid": report.systemd_main_pid,
-        "health": _health(report.health),
-        "version_hint": report.version_hint,
-        "dashboard": None,
-    }
+    report = ctx.lifecycle().status()
+    dashboard: dict[str, Any] | None = None
     if report.state in (State.RUNNING, State.SYSTEMD_ACTIVE):
         try:
             admin = _admin(ctx)
@@ -279,7 +319,7 @@ def status_payload(ctx: WebContext) -> dict:
         except FrpsctlError:
             pass  # 统计拿不到不影响状态展示
         else:
-            payload["dashboard"] = {
+            dashboard = {
                 "clients": info.client_counts,
                 "proxy_type_counts": info.proxy_type_counts,
                 "proxy_total": info.proxy_total,
@@ -289,25 +329,37 @@ def status_payload(ctx: WebContext) -> dict:
                 "tls_force": info.tls_force,
                 "version": info.version,
             }
-    return payload
+    # 与 CLI `status --json` 同一份形状（差异仅在 include_paths=False：
+    # 页面不需要 binary/config 的本机路径），公共部分由 report 单点生成。
+    return report_mod.status_payload(report, dashboard=dashboard, include_paths=False)
 
 
 def clients_payload(ctx: WebContext) -> dict:
+    cached = ctx.cache.get("clients", CACHE_TTL_LISTS)
+    if cached is not None:
+        return cached
     admin = _admin(ctx)
     with admin:
         page = admin.page_clients()
-    return {"clients": page.items, "total": page.total, "truncated": page.truncated}
+    payload = {"clients": page.items, "total": page.total, "truncated": page.truncated}
+    ctx.cache.put("clients", payload)
+    return payload
 
 
 def proxies_payload(ctx: WebContext) -> dict:
+    cached = ctx.cache.get("proxies", CACHE_TTL_LISTS)
+    if cached is not None:
+        return cached
     admin = _admin(ctx)
     with admin:
         page = admin.page_proxies()
-    return {
+    payload = {
         "proxies": [asdict(item) for item in page.items],
         "total": page.total,
         "truncated": page.truncated,
     }
+    ctx.cache.put("proxies", payload)
+    return payload
 
 
 def traffic_payload(ctx: WebContext) -> dict:
@@ -324,11 +376,9 @@ def traffic_payload(ctx: WebContext) -> dict:
     `truncated` / `total` 如实汇报截断（CLI `traffic` 超限会告警"仅统计前 N 个"，
     Web 同样不能静默）。
     """
-    now = ctx.clock()
-    with ctx.traffic_lock:
-        cached = ctx.traffic_cache
-    if cached is not None and now - cached[0] <= TRAFFIC_CACHE_TTL:
-        return cached[1]
+    cached = ctx.cache.get("traffic", TRAFFIC_CACHE_TTL)
+    if cached is not None:
+        return cached
 
     admin = _admin(ctx)
     with admin:
@@ -344,8 +394,7 @@ def traffic_payload(ctx: WebContext) -> dict:
         "truncated": truncated,
         "limit": TRAFFIC_MAX_PROXIES,
     }
-    with ctx.traffic_lock:
-        ctx.traffic_cache = (now, payload)
+    ctx.cache.put("traffic", payload)
     return payload
 
 
@@ -372,37 +421,65 @@ def traffic_one_payload(ctx: WebContext, name: str) -> dict:
 
 
 def doctor_payload(ctx: WebContext) -> dict:
-    """只读体检（与 CLI `doctor` 同一实现）。
+    """只读体检（与 CLI `doctor` 同一实现、同一形状）。
 
     ⚠️ 体检以 **Web 服务进程的身份**运行：端口可绑定性、二进制可执行性这类
     检查的结果可能与 root 下的 CLI 结果不同——前端会注明这一点。
     """
-    report = doc.run_doctor(ctx.inst)
+    return report_mod.doctor_payload(doc.run_doctor(ctx.inst))
+
+
+def _web_audit_payload(ctx: WebContext) -> dict:
+    """Web 操作审计视图（0.3.0）：路径 + 统计 + 尾部记录。"""
+    path = web_audit.resolve_path(ctx.inst)
+    if not path.exists():
+        return {
+            "scope": "web",
+            "path": str(path),
+            "available": False,
+            "reason": "尚无 Web 操作记录（变更类操作与登录会写入这里）",
+            "stats": None,
+            "tail": [],
+            "bad_lines": 0,
+        }
+    summary = web_audit.summarize(path)
+    tail = auditlog.read_tail(path, AUDIT_TAIL_LINES)
     return {
-        "instance": report.instance,
-        "ok": report.ok,
-        "counts": report.counts,
-        "findings": [
-            {
-                "check": finding.check,
-                "severity": finding.severity.value,
-                "message": finding.message,
-                "hint": finding.hint,
-            }
-            for finding in report.sorted_findings()
-        ],
+        "scope": "web",
+        "path": str(path),
+        "available": True,
+        "reason": "",
+        "stats": {
+            "total": summary.total,
+            "ok": summary.ok,
+            "error": summary.error,
+            # 全量扫描的坏行（与 CLI `web audit stats` 同口径；顶层 bad_lines
+            # 是尾部 50 行的口径，v0.3.0 review 消除两个同名不同义的字段）
+            "bad_lines": summary.bad_lines,
+            "first_at": summary.first_at,
+            "last_at": summary.last_at,
+            "by_action": summary.by_action,
+            "by_source": summary.by_source,
+        },
+        "tail": tail.records,
+        "bad_lines": tail.bad_lines,
     }
 
 
-def audit_payload(ctx: WebContext) -> dict:
-    """插件审计视图：配置位置 + 统计 + 尾部记录。
+def audit_payload(ctx: WebContext, scope: str = "plugin") -> dict:
+    """审计视图：`scope=plugin`（默认，兼容）或 `scope=web`（操作审计）。
 
     策略文件缺失/不合法时也返回 200（`available=false` + reason）——审计视图
     的职责是"展示现状"，不是替 `plugin check` 做严格校验；一条 400 只会让页面
-    失去"为什么看不到审计"的解释。
+    失去"为什么看不到审计"的解释。非法 scope 同样是 400（不猜测调用意图）。
     """
+    if scope == "web":
+        return _web_audit_payload(ctx)
+    if scope != "plugin":
+        raise UsageError(f"未知的审计范围：{scope!r}", hint="可用：plugin / web")
     view = auditlog.load_view(ctx.inst)
     payload: dict[str, Any] = {
+        "scope": "plugin",
         "policy_path": str(view.policy_path),
         "available": view.available,
         "enabled": view.enabled,
@@ -415,19 +492,7 @@ def audit_payload(ctx: WebContext) -> dict:
     if view.available and view.enabled and view.path is not None:
         summary = auditlog.summarize(view.path)
         tail = auditlog.read_tail(view.path, AUDIT_TAIL_LINES)
-        payload["stats"] = {
-            "total": summary.total,
-            "allow": summary.allow,
-            "deny": summary.deny,
-            "suppressed_total": summary.suppressed_total,
-            "first_at": summary.first_at,
-            "last_at": summary.last_at,
-            "by_user": summary.by_user,
-            "by_op": summary.by_op,
-            "elapsed_avg_ms": summary.elapsed_avg_ms,
-            "elapsed_max_ms": summary.elapsed_max_ms,
-            "elapsed_count": summary.elapsed_count,
-        }
+        payload["stats"] = report_mod.audit_summary_payload(summary)
         payload["tail"] = tail.records
         payload["bad_lines"] = tail.bad_lines
     return payload
@@ -511,8 +576,14 @@ def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
     except ValueError:
         lines = 200
     lines = max(1, min(lines, MAX_LOG_LINES))
+    cache_key = f"logs:{lines}"
+    cached = ctx.cache.get(cache_key, CACHE_TTL_LOGS)
+    if cached is not None:
+        return cached
     target = resolve_log_target(ctx.inst)
-    return {"path": str(target), "lines": tail_lines(target, lines)}
+    payload = {"path": str(target), "lines": tail_lines(target, lines)}
+    ctx.cache.put(cache_key, payload)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -520,19 +591,56 @@ def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def action_payload(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
-    lc = Lifecycle(ctx.inst)
+def action_payload(
+    ctx: WebContext,
+    action: str,
+    body: dict[str, Any],
+    *,
+    request_info: RequestInfo | None = None,
+) -> dict:
+    """执行一次变更动作，并写 Web 操作审计（成功与失败都留痕）。"""
+    # 变更类操作：只读缓存（traffic/lists/logs）在动作前清空，保证界面刷新
+    # 立刻看到新状态，而不是等 TTL 过期。
+    ctx.cache.invalidate()
+    try:
+        payload = _perform_action(ctx, action, body)
+    except Exception as exc:
+        _audit(
+            ctx,
+            request_info,
+            action=action,
+            params=_audit_params(body),
+            result=f"error:{type(exc).__name__}",
+        )
+        raise
+    _audit(ctx, request_info, action=action, params=_audit_params(body))
+    return payload
+
+
+def _audit_params(body: dict[str, Any]) -> dict[str, Any]:
+    """审计参数只保留标量（防未来动作塞入大对象/敏感结构）。"""
+    out: dict[str, Any] = {}
+    for key, value in body.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[str(key)] = value
+        else:
+            out[str(key)] = f"<{type(value).__name__}>"
+    return out
+
+
+def _perform_action(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
+    lc = ctx.lifecycle()
     health_timeout = _bounded_float(body.get("health_timeout"), 10.0)
 
     if action == "start":
         report = lc.start(health_timeout=health_timeout)
-        return {"pid": report.pid, "healthy": report.healthy, "health": _health(report.health)}
+        return report_mod.start_payload(report)
     if action == "stop":
         lc.stop(timeout=_bounded_float(body.get("timeout"), 10.0))
         return {"stopped": True}
     if action == "restart":
         report = lc.restart(health_timeout=health_timeout)
-        return {"pid": report.pid, "healthy": report.healthy, "health": _health(report.health)}
+        return report_mod.start_payload(report)
     if action == "prune":
         # frp 没有强制下线在线代理的 API（DELETE /api/proxies 实为清理离线
         # 记录）——UI 的"清理离线记录"按钮走这里。返回清理条数（清理前后
@@ -644,24 +752,43 @@ def config_preview(ctx: WebContext, body: dict[str, Any]) -> dict:
     }
 
 
-def config_apply(ctx: WebContext, body: dict[str, Any]) -> dict:
+def config_apply(
+    ctx: WebContext,
+    body: dict[str, Any],
+    *,
+    request_info: RequestInfo | None = None,
+) -> dict:
     """按预览应用（CAS）：预览之后文件被改过 → 拒绝而不是覆盖。"""
     preview_id = str(body.get("preview_id") or "")
+    ctx.cache.invalidate()
     ctx.prune_previews()
     with ctx.preview_lock:
         preview = ctx.previews.pop(preview_id, None)
     if preview is None:
         raise ConfigError("预览已过期或不存在", hint="请重新提交变更并预览")
 
-    outcome = apply_sets(
-        ctx.inst,
-        changes=preview.changes,
-        unsets=preview.unsets,
-        expected_current=preview.expected_current,
-        lifecycle=Lifecycle(ctx.inst),
-        restart=True,
-        health_timeout=10.0,
-    )
+    keys = [key for key, _ in preview.changes] + [f"-{key}" for key in preview.unsets]
+    label = ", ".join(keys) or "(空变更)"
+    try:
+        outcome = apply_sets(
+            ctx.inst,
+            changes=preview.changes,
+            unsets=preview.unsets,
+            expected_current=preview.expected_current,
+            lifecycle=ctx.lifecycle(),
+            restart=True,
+            health_timeout=10.0,
+        )
+    except Exception as exc:
+        _audit(
+            ctx,
+            request_info,
+            action="config-apply",
+            target=label,
+            result=f"error:{type(exc).__name__}",
+        )
+        raise
+    _audit(ctx, request_info, action="config-apply", target=label, result="ok")
     return {
         "applied": outcome.applied,
         "restarted": outcome.restarted,
