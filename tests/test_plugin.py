@@ -599,7 +599,7 @@ ops = ["Login", "NewProxy"]
             text=True,
         )
         try:
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 try:
                     with socket.create_connection(("127.0.0.1", bind_port), timeout=0.3):
@@ -638,7 +638,10 @@ remotePort = {proxy_port}
             text=True,
         )
         try:
-            out, _ = proc.communicate(timeout=8)
+            # 20 秒而不是 8 秒：v0.3.0 验收在全量运行（高负载）下抓到过 flaky——
+            # frpc 还没来得及完成第一次登录尝试就被 kill，被拒用例因此拿到
+            # 空白输出。被拒路径正常在 1-2 秒内退出，20 秒只是给慢机器兜底。
+            out, _ = proc.communicate(timeout=20)
             return proc.returncode, out
         except subprocess.TimeoutExpired:
             # 登录成功的话 frpc 会一直跑（正常），此时杀掉并返回已捕获输出

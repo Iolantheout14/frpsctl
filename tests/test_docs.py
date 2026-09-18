@@ -178,3 +178,17 @@ class TestApiDocConsistency:
             if token not in exact and not any(_prefix_matches(prefix_route, token) for prefix_route in prefix)
         )
         assert not ghosts, f"§18.2 引用了不存在的 API 路由：{ghosts}"
+
+
+class TestCodeDerivedConsistency:
+    """代码派生对账（0.3.0）：命令 / 退出码 / 环境变量与 README 同源检查。
+
+    实现在 `frpsctl/docs.py`（本地可 `python -m frpsctl.docs check`）；
+    这里接进 CI，新增命令/退出码/环境变量时忘记更新 README 会立刻变红。
+    """
+
+    def test_readme_matches_code(self) -> None:
+        from frpsctl.docs import check_all
+
+        problems = check_all(README.read_text("utf-8"))
+        assert not problems, "文档对账失败：\n" + "\n".join(problems)

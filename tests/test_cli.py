@@ -176,7 +176,7 @@ class TestJsonOutput:
                 raise KeyboardInterrupt
             real_sleep(0)
 
-        monkeypatch.setattr("frpsctl.cli.time.sleep", fake_sleep)
+        monkeypatch.setattr("frpsctl.cli.commands.lifecycle.time.sleep", fake_sleep)
         result = runner.invoke(app, ["status", "--watch", "--json"])
         assert result.exit_code == 0, result.output
 
@@ -196,7 +196,7 @@ class TestJsonOutput:
         def fake_sleep(seconds):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr("frpsctl.cli.time.sleep", fake_sleep)
+        monkeypatch.setattr("frpsctl.cli.commands.lifecycle.time.sleep", fake_sleep)
         result = runner.invoke(app, ["status", "--watch"])
         assert result.exit_code == 0, result.output
         assert "\033[2J" not in result.stdout, "非终端输出混入了清屏转义码"
@@ -662,7 +662,7 @@ class TestClientsAndProxiesCommands:
 
     def test_clients_renders_rows(self, cli_env, monkeypatch) -> None:
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _FakeAdminClient)
         result = runner.invoke(app, ["clients"])
         assert result.exit_code == 0, result.output
         assert "alice" in result.stdout
@@ -672,7 +672,7 @@ class TestClientsAndProxiesCommands:
         import json
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _FakeAdminClient)
         result = runner.invoke(app, ["clients", "--json"])
         payload = json.loads(result.stdout)
         assert payload["clients"][0]["user"] == "alice"
@@ -681,7 +681,7 @@ class TestClientsAndProxiesCommands:
         import json
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", _FakeAdminClient)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _FakeAdminClient)
         result = runner.invoke(app, ["proxies"])
         assert result.exit_code == 0, result.output
         assert "alice.web" in result.stdout
@@ -811,7 +811,7 @@ class TestPruneCommand:
                 self.clear_offline_proxies()
                 return PruneOutcome(before=3, cleared=3)
 
-        monkeypatch.setattr("frpsctl.cli.AdminClient", lambda *_a, **_k: _Admin())
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", lambda *_a, **_k: _Admin())
         result = runner.invoke(app, ["prune"])
         assert result.exit_code == 0, result.output
         assert calls == ["cleared"]
@@ -861,7 +861,7 @@ class TestTrafficCommand:
 
     def test_aggregates_all_proxies_and_tolerates_failures(self, cli_env, monkeypatch) -> None:
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", self._TrafficAdmin)
         result = runner.invoke(app, ["traffic"])
         assert result.exit_code == 0, result.output
         assert "2026-09-16" in result.stdout
@@ -873,7 +873,7 @@ class TestTrafficCommand:
         import json
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", self._TrafficAdmin)
         result = runner.invoke(app, ["traffic", "--json"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.stdout)
@@ -899,7 +899,7 @@ class TestTrafficCommand:
                 return PageResult(items=items, total=len(items))
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", _Many)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _Many)
         result = runner.invoke(app, ["traffic", "--json"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.stdout)
@@ -914,7 +914,7 @@ class TestTrafficCommand:
         import json
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", self._TrafficAdmin)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", self._TrafficAdmin)
         result = runner.invoke(app, ["traffic", "alice.web", "--json"])
         assert result.exit_code == 0, result.output
         payload = json.loads(result.stdout)
@@ -928,7 +928,7 @@ class TestTrafficCommand:
                 return []
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.AdminClient", _Empty)
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _Empty)
         result = runner.invoke(app, ["traffic", "ghost"])
         assert result.exit_code == 0, result.output
         assert "没有" in result.stdout and "ghost" in result.stdout
@@ -967,7 +967,7 @@ class TestPluginUserCommands:
             observed.append(lock_mod.is_locked(lock_path))
             return real_save(path, raw)
 
-        monkeypatch.setattr("frpsctl.cli._save_policy_raw", spy)
+        monkeypatch.setattr("frpsctl.cli.runtime._save_policy_raw", spy)
         result = runner.invoke(app, ["plugin", "user", "set", "bob", "--ports", "7000"])
         assert result.exit_code == 0, result.output
         assert observed == [True], "策略写回发生在实例锁之外（并发覆盖的根因）"
@@ -1786,13 +1786,17 @@ class TestServiceStatusEnabled:
     """
 
     def _patch(self, monkeypatch, *, active: bool, enabled: bool, pid: int | None) -> None:
-        for cls in ("Systemd", "PluginService", "WebService"):
-            monkeypatch.setattr(f"frpsctl.cli.{cls}.is_active", lambda _self, _v=active: _v)
-            monkeypatch.setattr(f"frpsctl.cli.{cls}.is_enabled", lambda _self, _v=enabled: _v)
-            monkeypatch.setattr(f"frpsctl.cli.{cls}.main_pid", lambda _self, _p=pid: _p)
-            monkeypatch.setattr(
-                f"frpsctl.cli.{cls}.unit_name", property(lambda _self: "demo.service")
-            )
+        # 0.3.0 拆包后每个服务类在各自命令模块（patch 目标随实现位置走）
+        targets = {
+            "Systemd": "frpsctl.cli.commands.service.Systemd",
+            "PluginService": "frpsctl.cli.commands.plugin.PluginService",
+            "WebService": "frpsctl.cli.commands.web.WebService",
+        }
+        for _cls, target in targets.items():
+            monkeypatch.setattr(f"{target}.is_active", lambda _self, _v=active: _v)
+            monkeypatch.setattr(f"{target}.is_enabled", lambda _self, _v=enabled: _v)
+            monkeypatch.setattr(f"{target}.main_pid", lambda _self, _p=pid: _p)
+            monkeypatch.setattr(f"{target}.unit_name", property(lambda _self: "demo.service"))
 
     def test_all_three_report_enabled(self, cli_env, monkeypatch) -> None:
         import json
@@ -2014,7 +2018,7 @@ class TestWebPasswordSet:
 
     def test_generated_password_written_0600_and_shown_once(self, cli_env, monkeypatch) -> None:
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.WebService.is_active", lambda _self: False)
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.is_active", lambda _self: False)
         result = runner.invoke(app, ["web", "password", "set"])
         assert result.exit_code == 0, result.output
         assert "仅显示这一次" in result.stdout
@@ -2029,7 +2033,7 @@ class TestWebPasswordSet:
         import json
 
         runner.invoke(app, ["init", "--no-input"])
-        monkeypatch.setattr("frpsctl.cli.WebService.is_active", lambda _self: True)
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.is_active", lambda _self: True)
         monkeypatch.setattr("sys.stdin", io.StringIO("hunter2-secret\n"))
         result = runner.invoke(app, ["web", "password", "set", "--stdin", "--json"])
         assert result.exit_code == 0, result.output
@@ -2060,8 +2064,8 @@ class TestInstallOptionPassthrough:
             calls.update(kwargs)
             return _Result()
 
-        monkeypatch.setattr("frpsctl.cli.release.install", fake_install)
-        monkeypatch.setattr("frpsctl.cli.release.resolve_mirrors", lambda _mirrors: ("https://m",))
+        monkeypatch.setattr("frpsctl.cli.commands.install.release.install", fake_install)
+        monkeypatch.setattr("frpsctl.cli.commands.install.release.resolve_mirrors", lambda _mirrors: ("https://m",))
         result = runner.invoke(
             app,
             [
@@ -2092,8 +2096,8 @@ class TestInstallOptionPassthrough:
             switched = True
             switched_frpc = False
 
-        monkeypatch.setattr("frpsctl.cli.release.install", lambda **_kw: _Result())
-        monkeypatch.setattr("frpsctl.cli.release.resolve_mirrors", lambda _mirrors: ())
+        monkeypatch.setattr("frpsctl.cli.commands.install.release.install", lambda **_kw: _Result())
+        monkeypatch.setattr("frpsctl.cli.commands.install.release.resolve_mirrors", lambda _mirrors: ())
         result = runner.invoke(app, ["install", "--json"])
         payload = json.loads(result.stdout)
         assert set(payload) == {"version", "binary", "downloaded", "switched", "switched_frpc", "active"}
@@ -2151,10 +2155,11 @@ class TestInstanceCompletion:
         def boom(*args, **kwargs):
             raise OSError("disk on fire")
 
-        # patch cli 模块的**绑定**：`from ..core.instance import list_instances`
-        # 复制了引用，patch frpsctl.core.instance.list_instances 不会影响调用点
-        # （正是这个错误让失效的注入掩盖了环境依赖）。
-        monkeypatch.setattr("frpsctl.cli.list_instances", boom)
+        # patch **源头模块**：补全回调在函数内 `from ..core.instance import
+        # list_instances`，每次调用都从源头取，patch 源头因此永远生效
+        # （0.3.0 拆包时从"patch cli 模块绑定"改到源头——后者会随实现位置
+        # 迁移而失效，from-import 复制引用时还会静默失灵）。
+        monkeypatch.setattr("frpsctl.core.instance.list_instances", boom)
         assert _complete_instance(None, [], "") == []
 
     def test_completion_on_empty_root_returns_empty(self, tmp_path, monkeypatch) -> None:
@@ -2181,7 +2186,7 @@ class TestServiceLifecycleCommands:
         calls: list[str] = []
         for name in ("start", "stop", "restart"):
             monkeypatch.setattr(
-                f"frpsctl.cli.PluginService.{name}",
+                f"frpsctl.cli.commands.plugin.PluginService.{name}",
                 lambda _self, _n=name: calls.append(_n),
             )
         for cmd, key in (("start", "started"), ("stop", "stopped"), ("restart", "restarted")):
@@ -2196,7 +2201,7 @@ class TestServiceLifecycleCommands:
         calls: list[str] = []
         for name in ("start", "stop", "restart"):
             monkeypatch.setattr(
-                f"frpsctl.cli.WebService.{name}",
+                f"frpsctl.cli.commands.web.WebService.{name}",
                 lambda _self, _n=name: calls.append(_n),
             )
         for cmd, key in (("start", "started"), ("stop", "stopped"), ("restart", "restarted")):
@@ -2210,14 +2215,14 @@ class TestServiceInstallAccessLogPassthrough:
     def test_install_passes_access_log_to_unit_renderer(self, cli_env, monkeypatch) -> None:
         runner.invoke(app, ["init", "--no-input"])
         runner.invoke(app, ["plugin", "init"])
-        monkeypatch.setattr("frpsctl.cli._frpsctl_executable", lambda: Path("/usr/local/bin/frpsctl"))
+        monkeypatch.setattr("frpsctl.cli.runtime._frpsctl_executable", lambda: Path("/usr/local/bin/frpsctl"))
         calls: dict = {}
 
         def fake_install(_self, **kwargs):
             calls.update(kwargs)
             return Path("/etc/systemd/system/fake@.service")
 
-        monkeypatch.setattr("frpsctl.cli.PluginService.install_template", fake_install)
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.PluginService.install_template", fake_install)
         result = runner.invoke(app, ["plugin", "service", "install", "--access-log"])
         assert result.exit_code == 0, result.output
         assert calls["access_log"] is True
@@ -2228,7 +2233,395 @@ class TestServiceInstallAccessLogPassthrough:
             calls.update(kwargs)
             return Path("/etc/systemd/system/fake-web@.service"), ""
 
-        monkeypatch.setattr("frpsctl.cli.WebService.install_template", fake_web_install)
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.install_template", fake_web_install)
         result = runner.invoke(app, ["web", "service", "install", "--access-log"])
         assert result.exit_code == 0, result.output
         assert calls["access_log"] is True
+
+
+class TestServiceInstallUninstallCommand:
+    """frps 本体 `service install/uninstall` 的 CLI 侧（此前只有 core 单测）。
+
+    单元层验证的是 `Systemd.install_template` 的体检与渲染；CLI 侧的输出、
+    JSON 键与委托路径没有守卫——而 0.3.0 的内核拆分正好会动这些入口。
+    """
+
+    def test_service_install_reports_unit_and_owner(self, cli_env, monkeypatch) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        captured: dict = {}
+
+        def fake_install(_self, **kwargs):
+            captured.update(kwargs)
+            return Path("/etc/systemd/system/frps@.service")
+
+        monkeypatch.setattr("frpsctl.cli.commands.service.Systemd.install_template", fake_install)
+        result = runner.invoke(app, ["service", "install", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["unit"] == "frps@default.service"
+        assert payload["template"] == "/etc/systemd/system/frps@.service"
+        assert payload["owner"] == "systemd"
+        assert captured["user"] == "frps"
+        assert captured["log_dir"] == Path("/var/log/frps")
+
+    def test_service_uninstall_reports_removed(self, cli_env, monkeypatch) -> None:
+        import json
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.Systemd.uninstall", lambda _self: calls.append("uninstall")
+        )
+        result = runner.invoke(app, ["service", "uninstall", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {"unit": "frps@default.service", "removed": True}
+        assert calls == ["uninstall"]
+
+
+class TestPluginWebServiceUninstallCommand:
+    def test_plugin_service_uninstall(self, cli_env, monkeypatch) -> None:
+        import json
+
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.PluginService.uninstall", lambda _self: None)
+        result = runner.invoke(app, ["plugin", "service", "uninstall", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {
+            "unit": "frpsctl-plugin@default.service",
+            "removed": True,
+        }
+
+    def test_web_service_uninstall_keeps_password_note(self, cli_env, monkeypatch) -> None:
+        import json
+
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.uninstall", lambda _self: None)
+        result = runner.invoke(app, ["web", "service", "uninstall", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == {
+            "unit": "frpsctl-web@default.service",
+            "removed": True,
+        }
+        # 人读模式必须提示口令文件保留（它是数据不是 unit）
+        text = runner.invoke(app, ["web", "service", "uninstall"])
+        assert "口令文件保留" in text.output
+
+
+class TestInitForce:
+    def test_force_overwrites_and_snapshots_previous(self, cli_env) -> None:
+        import json
+
+        first = runner.invoke(app, ["init", "--no-input"])
+        assert first.exit_code == 0, first.output
+        config = cli_env / "instances" / "default" / "frps.toml"
+        before = config.read_text("utf-8")
+
+        second = runner.invoke(app, ["init", "--no-input", "--force"])
+        assert second.exit_code == 0, second.output
+        after = config.read_text("utf-8")
+        assert after != before  # 重新生成了 token 与口令
+
+        entries = sorted((cli_env / "instances" / "default" / "config-history").glob("[0-9]*"))
+        assert len(entries) == 1, entries
+        meta = json.loads((entries[0] / "meta.json").read_text("utf-8"))
+        assert meta["action"] == "init --force"
+        assert (entries[0] / "frps.toml").read_text("utf-8") == before
+
+
+class TestUninstallAllInstances:
+    def test_all_removes_every_instance_and_shared_bin(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        assert runner.invoke(app, ["init", "--no-input", "--bind-port", "17011"]).exit_code == 0
+        web = runner.invoke(
+            app, ["--instance", "web", "init", "--no-input", "--bind-port", "17012"]
+        )
+        assert web.exit_code == 0, web.output
+        result = runner.invoke(app, ["uninstall", "--all", "--yes"])
+        assert result.exit_code == 0, result.output
+        assert not (cli_env / "instances" / "default").exists()
+        assert not (cli_env / "instances" / "web").exists()
+        assert not (cli_env / "data" / "bin").exists()
+        assert "default" in result.output and "web" in result.output
+
+
+class TestBinaryVersionGate:
+    """§8.4：`--binary` 入口同样要过 §3.6 的版本门槛（install 之外的入口）。
+
+    文档明确要求"两条入口都做检查"，而此前只有 install（下载路径）有测试；
+    `--binary` 指到低版本时必须在 start/verify 处退出码 4 拒绝。
+    """
+
+    def test_start_rejects_below_minimum(self, cli_env) -> None:
+        fake = install_fake_binary(cli_env, version="0.69.1")
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["--binary", str(fake.path), "start", "--health-timeout", "1"])
+        assert result.exit_code == 4, result.output
+        assert "0.70.0" in result.output
+
+    def test_verify_rejects_below_minimum(self, cli_env) -> None:
+        fake = install_fake_binary(cli_env, version="0.69.1")
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["--binary", str(fake.path), "verify"])
+        assert result.exit_code == 4, result.output
+        assert "0.70.0" in result.output
+
+
+class TestConfigRollbackCli:
+    """`config rollback` 成功路径的 CLI 契约（此前只测了参数错误）。"""
+
+    def test_rollback_restores_previous_value(self, cli_env) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        set_result = runner.invoke(app, ["config", "set", "maxPortsPerClient", "30"])
+        assert set_result.exit_code == 0, set_result.output
+        config = cli_env / "instances" / "default" / "frps.toml"
+        assert "maxPortsPerClient = 30" in config.read_text("utf-8")
+
+        result = runner.invoke(app, ["config", "rollback", "1", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["target"].startswith("(snapshot ")
+        assert "maxPortsPerClient" in payload["diff"]
+        assert "maxPortsPerClient = 20" in config.read_text("utf-8")
+
+
+class TestWebAuditCommands:
+    """`web audit tail|stats`：文件缺失可行动、读写形状与插件审计对齐。"""
+
+    def test_missing_file_is_actionable_error(self, cli_env) -> None:
+        result = runner.invoke(app, ["web", "audit", "tail"])
+        assert result.exit_code == 3, result.output
+        assert "web-audit.jsonl" in result.output
+
+    def test_tail_and_stats_read_records(self, cli_env) -> None:
+        import json as _json
+
+        from frpsctl.core import web_audit
+        from frpsctl.core.instance import Instance
+
+        runner.invoke(app, ["init", "--no-input"])
+        inst = Instance(
+            name="default",
+            instances_root=cli_env / "instances",
+            data_home=cli_env / "data",
+        )
+        web_audit.record(inst, action="start", source="127.0.0.1", session_id="abcd1234efgh")
+        web_audit.record(inst, action="config-apply", target="bindPort", result="ok")
+
+        tail = runner.invoke(app, ["web", "audit", "tail", "--json"])
+        assert tail.exit_code == 0, tail.output
+        payload = _json.loads(tail.stdout)
+        assert [r["action"] for r in payload["records"]] == ["start", "config-apply"]
+
+        stats = runner.invoke(app, ["web", "audit", "stats", "--json", "--since", "24h"])
+        assert stats.exit_code == 0, stats.output
+        summary = _json.loads(stats.stdout)
+        assert summary["total"] == 2 and summary["ok"] == 2
+        assert summary["by_action"]["start"] == 1
+
+    def test_human_output_renders_actions(self, cli_env) -> None:
+        from frpsctl.core import web_audit
+        from frpsctl.core.instance import Instance
+
+        runner.invoke(app, ["init", "--no-input"])
+        inst = Instance(
+            name="default",
+            instances_root=cli_env / "instances",
+            data_home=cli_env / "data",
+        )
+        web_audit.record(inst, action="stop", result="error:NotRunning", source="127.0.0.1")
+        result = runner.invoke(app, ["web", "audit", "stats"])
+        assert result.exit_code == 0, result.output
+        assert "失败 1" in result.output
+
+
+class TestConfigApplyCommand:
+    """`config apply`：多键一次事务（与 Web 配置表单同语义）。"""
+
+    def test_requires_at_least_one_change(self, cli_env) -> None:
+        result = runner.invoke(app, ["config", "apply"])
+        assert result.exit_code == 2, result.output
+        assert "--set" in result.output
+
+    def test_bad_set_syntax_is_usage_error(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(app, ["config", "apply", "--set", "bindPort"])
+        assert result.exit_code == 2, result.output
+        assert "键=值" in result.output
+
+    def test_multi_key_apply_once(self, cli_env) -> None:
+        import json
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        result = runner.invoke(
+            app,
+            [
+                "config", "apply",
+                "--set", "maxPortsPerClient=30",
+                "--set", "bindPort=17000",
+                "--unset", "log.maxDays",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["keys"] == ["maxPortsPerClient", "bindPort", "-log.maxDays"]
+        assert payload["applied"] is True
+        assert payload["restarted"] is False  # 实例未运行
+        config = cli_env / "instances" / "default" / "frps.toml"
+        text = config.read_text("utf-8")
+        assert "maxPortsPerClient = 30" in text
+        assert "maxDays" not in text
+
+    def test_dry_run_writes_nothing(self, cli_env) -> None:
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        before = config.read_text("utf-8")
+        result = runner.invoke(
+            app, ["config", "apply", "--set", "maxPortsPerClient=31", "--dry-run"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "dry-run" in result.output
+        assert config.read_text("utf-8") == before
+        history = cli_env / "instances" / "default" / "config-history"
+        assert not list(history.glob("[0-9]*")) if history.exists() else True
+
+
+class TestAuditMaxMbConfig:
+    def test_audit_max_days_is_editable(self, cli_env) -> None:
+        import json as _json
+
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        result = runner.invoke(app, ["plugin", "config", "set", "audit.max_days", "3"])
+        assert result.exit_code == 0, result.output
+        policy = cli_env / "instances" / "default" / "plugin-policy.json"
+        assert _json.loads(policy.read_text("utf-8"))["audit"]["max_days"] == 3.0
+
+    def test_audit_max_mb_is_editable(self, cli_env) -> None:
+        import json as _json
+
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        result = runner.invoke(app, ["plugin", "config", "set", "audit.max_mb", "5"])
+        assert result.exit_code == 0, result.output
+        policy = cli_env / "instances" / "default" / "plugin-policy.json"
+        assert _json.loads(policy.read_text("utf-8"))["audit"]["max_mb"] == 5.0
+        listed = runner.invoke(app, ["plugin", "config", "list", "--json"])
+        settings = _json.loads(listed.stdout)["settings"]
+        assert settings["audit.max_mb"] == 5.0
+
+
+class TestCapabilitiesCommand:
+    """`capabilities`：能力清单与代码同源（命令树/退出码/环境变量）。"""
+
+    def test_json_shape(self, cli_env) -> None:
+        import json
+
+        result = runner.invoke(app, ["capabilities", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["version"]
+        assert payload["frps_minimum"] == "0.70.0"
+        assert "config set" in payload["commands"]
+        assert payload["exit_codes"]["PERMISSION"] == 8
+        assert "FRPSCTL_ROOT" in payload["env_vars"]
+
+    def test_commands_match_contract_snapshot(self, cli_env) -> None:
+        """能力清单与契约快照同源：漏一条命令这里就红。"""
+        import json
+        from pathlib import Path as _Path
+
+        snapshot = json.loads(
+            (_Path(__file__).parent / "snapshots" / "cli_commands.json").read_text("utf-8")
+        )
+        result = runner.invoke(app, ["capabilities", "--json"])
+        commands = set(json.loads(result.stdout)["commands"])
+        assert commands == set(snapshot) - {"(root)"}
+
+    def test_human_output_lists_sections(self, cli_env) -> None:
+        result = runner.invoke(app, ["capabilities"])
+        assert result.exit_code == 0, result.output
+        assert "退出码" in result.output and "环境变量" in result.output
+
+
+class TestRegressionReviewCliFixes:
+    """v0.3.0 回归 review 的 CLI 侧修复守卫。"""
+
+    def test_config_set_noop_masks_secret(self, cli_env) -> None:
+        """M7：noop 分支不得把敏感值明文打到 stdout（§10 硬约束 2）。"""
+        import re
+
+        install_fake_binary(cli_env)
+        runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
+        config = cli_env / "instances" / "default" / "frps.toml"
+        password = re.search(r'password = "([^"]+)"', config.read_text("utf-8")).group(1)
+        result = runner.invoke(app, ["config", "set", "webServer.password", password])
+        assert result.exit_code == 0, result.output
+        assert "无需变更" in result.output
+        assert password not in result.output, "敏感值明文出现在 noop 输出里"
+
+    def test_legacy_policy_shows_numeric_audit_defaults(self, cli_env) -> None:
+        """M3：老策略缺 `audit.max_mb`/`max_days` 时不得显示成布尔 true。"""
+        import json as _json
+
+        runner.invoke(app, ["init", "--no-input"])
+        policy = cli_env / "instances" / "default" / "plugin-policy.json"
+        policy.write_text(_json.dumps({"users": {}, "audit": {"enabled": True}}), "utf-8")
+        result = runner.invoke(app, ["plugin", "config", "list", "--json"])
+        assert result.exit_code == 0, result.output
+        settings = _json.loads(result.stdout)["settings"]
+        assert settings["audit.max_mb"] == 10.0
+        assert settings["audit.max_days"] == 7.0
+        assert settings["audit.enabled"] is True
+
+    def test_watch_reuses_lifecycle_instance(self, cli_env, monkeypatch) -> None:
+        """L4：`status --watch` 复用同一 Lifecycle——owner 探测缓存才有意义。"""
+        from frpsctl.cli import commands as _commands  # noqa: F401
+        from frpsctl.cli.commands import lifecycle as lifecycle_mod
+
+        runner.invoke(app, ["init", "--no-input"])
+        created: list[object] = []
+
+        class _FakeLc:
+            def status(self):
+                from frpsctl.core.lifecycle import Owner, State, StatusReport
+
+                return StatusReport(instance="default", owner=Owner.NONE, state=State.STOPPED)
+
+        fake = _FakeLc()
+        created.append(fake)
+
+        def fake_lifecycle(_app_ctx):
+            return fake
+
+        monkeypatch.setattr(lifecycle_mod.runtime, "_lifecycle", fake_lifecycle)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.lifecycle.runtime._lifecycle", fake_lifecycle, raising=False
+        )
+        # 直接调内部函数：传入 lc 时不应调用 runtime._lifecycle 工厂
+        calls = {"n": 0}
+
+        def counting_factory(_app_ctx):
+            calls["n"] += 1
+            return fake
+
+        monkeypatch.setattr(lifecycle_mod.runtime, "_lifecycle", counting_factory)
+        from frpsctl.cli import _ctx as _ctx_compat  # noqa: F401 - shim 存在性
+        from frpsctl.cli.context import build_context
+
+        ctx = build_context(
+            instance=None,
+            root=cli_env / "instances",
+            config=None,
+            binary=None,
+            json_output=False,
+            yes=True,
+            verbose=False,
+        )
+        lifecycle_mod._print_status(ctx, lc=fake)
+        assert calls["n"] == 0, "传入 lc 时不应再新建 Lifecycle"

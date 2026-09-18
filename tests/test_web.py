@@ -1023,21 +1023,25 @@ class TestLogsParameterBounds:
 
         client = Client(web)
         client.login()
-        conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
-        try:
-            conn.request("GET", "/api/../frps.toml", headers={"Cookie": client.cookie})
-            resp = conn.getresponse()
-            body = resp.read()
-            assert resp.status in (401, 404), resp.status
-            assert b"test-token" not in body
+        # 服务端每响应关闭连接（v0.3.0：worker 槽位按请求占用）——每个请求
+        # 各开一条连接，这也正是浏览器的行为。
+        def _raw(path: str, *, cookie: str | None) -> tuple[int, bytes]:
+            conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
+            try:
+                headers = {"Cookie": cookie} if cookie else {}
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            finally:
+                conn.close()
 
-            conn.request("GET", "/../frps.toml")
-            resp = conn.getresponse()
-            body = resp.read()
-            assert resp.status == 404, resp.status
-            assert b"test-token" not in body
-        finally:
-            conn.close()
+        status, body = _raw("/api/../frps.toml", cookie=client.cookie)
+        assert status in (401, 404), status
+        assert b"test-token" not in body
+
+        status, body = _raw("/../frps.toml", cookie=None)
+        assert status == 404, status
+        assert b"test-token" not in body
 
 
 class TestActionSuccessPaths:
@@ -1078,3 +1082,452 @@ class TestActionSuccessPaths:
         assert payload["diff"]
         # 回滚不泄露机密（diff 打码；快照里带 test-token）
         assert "test-token" not in payload["diff"]
+
+
+class TestConditionalRequests:
+    """ETag/304：只读 GET 允许条件请求，写/错误/会话响应绝不缓存。"""
+
+    def test_etag_roundtrip_and_304(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, _payload, headers = client.call("/api/status")
+        assert status == 200, headers
+        etag = headers.get("ETag")
+        assert etag, headers
+        assert headers.get("Cache-Control") == "no-cache"
+
+        status2, _payload2, headers2 = client.call(
+            "/api/status", headers={"If-None-Match": etag}
+        )
+        assert status2 == 304, (status2, headers2)
+        # 304 仍必须带 ETag 与缓存策略（RFC 9110）
+        assert headers2.get("ETag") == etag
+        assert headers2.get("Cache-Control") == "no-cache"
+
+        status3, _payload3, _ = client.call(
+            "/api/status", headers={"If-None-Match": '"bogus"'}
+        )
+        assert status3 == 200, "ETag 不匹配时必须重新发送完整响应"
+
+    def test_unauthenticated_errors_are_not_cacheable(self, web) -> None:
+        client = Client(web)  # 未登录
+        status, _payload, headers = client.call("/api/status")
+        assert status == 401
+        assert "ETag" not in headers
+        assert headers.get("Cache-Control") == "no-store"
+
+    def test_post_responses_are_not_cacheable(self, web) -> None:
+        client = Client(web)
+        client.login()
+        # dashboard 未启用（port=0）：动作会失败，但"不缓存"与状态无关
+        _status, _payload, headers = client.call("/api/actions/prune", method="POST", body={})
+        assert "ETag" not in headers
+        assert headers.get("Cache-Control") == "no-store"
+
+    def test_session_payload_is_not_cached(self, web) -> None:
+        """`/api/session` 下发 CSRF——绝不进任何缓存。"""
+        client = Client(web)
+        client.login()
+        status, payload, headers = client.call("/api/session")
+        assert status == 200 and payload["csrf"]
+        assert "ETag" not in headers
+        assert headers.get("Cache-Control") == "no-store"
+
+
+class TestResponseCacheInvalidation:
+    """服务端只读缓存：重复请求不打 dashboard；写操作前显式失效。"""
+
+    def test_clients_cache_served_once_and_invalidated(self, web, monkeypatch) -> None:
+        from frpsctl.core.admin import PageResult
+
+        calls = {"n": 0}
+
+        class _FakeAdmin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def page_clients(self, **_kwargs):
+                calls["n"] += 1
+                return PageResult(items=[{"key": "c1"}], total=1)
+
+        monkeypatch.setattr("frpsctl.web.api._admin", lambda _ctx: _FakeAdmin())
+        client = Client(web)
+        client.login()
+        assert client.call("/api/clients")[0] == 200
+        assert client.call("/api/clients")[0] == 200
+        assert calls["n"] == 1, "第二次请求没有走服务端缓存"
+
+        web.ctx.cache.invalidate()
+        assert client.call("/api/clients")[0] == 200
+        assert calls["n"] == 2, "失效后没有重新查询"
+
+    def test_action_invalidates_before_doing_work(self, web) -> None:
+        """action_payload 在做任何事**之前**清缓存：动作失败也不留旧数据。"""
+        web.ctx.cache.put("clients", {"stale": True})
+        client = Client(web)
+        client.login()
+        client.call("/api/actions/prune", method="POST", body={})  # 502（dashboard 未启用）
+        assert web.ctx.cache.get("clients", 999) is None
+
+    def test_logs_cache_key_includes_line_count(self, web, monkeypatch) -> None:
+        from frpsctl.web import api as api_mod
+
+        calls = {"n": 0}
+        real_tail = api_mod.tail_lines
+
+        def counting(path, lines):
+            calls["n"] += 1
+            return real_tail(path, lines)
+
+        monkeypatch.setattr(api_mod, "tail_lines", counting)
+        (web.ctx.inst.dir / "frps.log").write_text("a\nb\n", "utf-8")
+        client = Client(web)
+        client.login()
+        assert client.call("/api/logs?lines=100")[0] == 200
+        assert client.call("/api/logs?lines=100")[0] == 200
+        assert calls["n"] == 1, "同参数第二次请求没有走缓存"
+        assert client.call("/api/logs?lines=200")[0] == 200
+        assert calls["n"] == 2, "不同行数是不同的缓存键"
+
+
+class TestWebOperationAudit:
+    """Web 操作审计：动作与登录留痕、来源/会话指纹、读接口 scope。"""
+
+    @pytest.fixture(autouse=True)
+    def _reset_login_limiter(self):
+        """失败登录审计限速是模块级状态：每个用例前后都要清（测试隔离）。"""
+        from frpsctl.web import server as web_server
+
+        web_server._login_fail_limiter._last.clear()
+        yield
+        web_server._login_fail_limiter._last.clear()
+
+    def _summary(self, web):
+        from frpsctl.core import web_audit
+
+        return web_audit.summarize(web_audit.resolve_path(web.ctx.inst))
+
+    def test_action_success_and_failure_are_recorded(self, web, monkeypatch) -> None:
+        from frpsctl.core.admin import PruneOutcome
+
+        client = Client(web)
+        client.login()
+
+        # 失败：dashboard 未启用（port=0）→ 502，但审计必须已记录 error
+        # （登录事件也在审计里，因此按动作计数而不是 total）
+        client.call("/api/actions/prune", method="POST", body={})
+        summary = self._summary(web)
+        assert summary.by_action.get("prune") == 1
+        assert summary.error == 1
+
+        class _Admin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def prune_offline_proxies(self):
+                return PruneOutcome(before=2, cleared=2)
+
+        monkeypatch.setattr("frpsctl.web.api._admin", lambda _ctx: _Admin())
+        status, _payload, _ = client.call("/api/actions/prune", method="POST", body={})
+        assert status == 200
+        summary = self._summary(web)
+        assert summary.by_action.get("prune") == 2, "成功动作没有留痕"
+        assert summary.error == 1, "此前那次失败的记录不应消失"
+
+    def test_login_events_are_recorded_with_fingerprint(self, web) -> None:
+        from frpsctl.core import auditlog, web_audit
+
+        client = Client(web)
+        client.login()
+        bad = Client(web)
+        bad.login("wrong")
+
+        path = web_audit.resolve_path(web.ctx.inst)
+        records = auditlog.read_tail(path, 10).records
+        actions = {r["action"] for r in records}
+        assert actions == {"login"}
+        results = sorted(r["result"] for r in records)
+        assert results == ["error", "ok"]
+        ok_record = next(r for r in records if r["result"] == "ok")
+        assert len(ok_record["session_id"]) == 12, "会话只存指纹（不落 token）"
+
+    def test_login_failure_audit_is_rate_limited(self, web) -> None:
+        """同来源 60 秒内的重复失败只记一条（防审计文件被爆破刷爆）。"""
+        from frpsctl.web import server as web_server
+
+        web_server._login_fail_limiter._last.clear()
+        for _ in range(4):
+            Client(web).login("wrong")
+        summary = self._summary(web)
+        assert summary.error == 1, f"失败登录被逐条记录：{summary}"
+
+    def test_audit_scope_web_payload(self, web) -> None:
+        client = Client(web)
+        client.login()
+        client.call("/api/actions/prune", method="POST", body={})
+        status, payload, _ = client.call("/api/audit?scope=web")
+        assert status == 200, payload
+        assert payload["scope"] == "web"
+        assert payload["available"] is True
+        assert payload["stats"]["error"] == 1
+        # 登录 + 失败 prune 各一条；tail 与 stats 同口径（此前是恒真的弱断言）
+        assert payload["stats"]["total"] == 2
+        assert {r["action"] for r in payload["tail"]} == {"login", "prune"}
+        assert len(payload["tail"]) == 2
+
+    def test_audit_scope_web_without_file(self, web) -> None:
+        client = Client(web)
+        client.login()
+        # 删掉审计文件（登录已写）→ available=false 且给理由
+        from frpsctl.core import web_audit
+
+        web_audit.resolve_path(web.ctx.inst).unlink()
+        status, payload, _ = client.call("/api/audit?scope=web")
+        assert status == 200
+        assert payload["available"] is False and payload["reason"]
+
+    def test_audit_invalid_scope_is_400(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit?scope=bogus")
+        assert status == 400 and "审计范围" in payload["error"]
+
+
+class TestCspNonce:
+    """CSP nonce 化：每请求 nonce、无 unsafe-inline、无内联 style 属性。"""
+
+    def test_index_injects_per_request_nonce(self, web) -> None:
+        import re
+
+        base = f"http://127.0.0.1:{web.address[1]}"
+        with urllib.request.urlopen(base + "/", timeout=5) as resp:  # noqa: S310
+            html = resp.read().decode("utf-8")
+            csp = resp.headers["Content-Security-Policy"]
+
+        assert "unsafe-inline" not in csp, csp
+        match = re.search(r"script-src 'nonce-([^']+)'", csp)
+        assert match, csp
+        nonce = match.group(1)
+        assert f'style-src \'nonce-{nonce}\'' in csp
+        # 两个 <script> + 一个 <style> 都必须带同一个 nonce
+        assert html.count(f'nonce="{nonce}"') == 3
+        assert "__CSP_NONCE__" not in html
+        # 无内联 style 属性（CSP 去掉 unsafe-inline 的前提）
+        assert not re.search(r"\sstyle=\"", html), "还有内联 style 属性"
+
+        # 每次请求的 nonce 不同（防重放/固定）
+        with urllib.request.urlopen(base + "/", timeout=5) as resp2:  # noqa: S310
+            csp2 = resp2.headers["Content-Security-Policy"]
+        assert nonce not in csp2
+
+
+class TestMetricsEndpoint:
+    def _server(self, web_ctx, **kwargs):
+        server = WebServer(web_ctx, WebSettings(bind="127.0.0.1:0", **kwargs))
+        server.start()
+        return server
+
+    def test_disabled_by_default_404(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/metrics")
+        assert status == 404, payload
+
+    def test_basic_failures_are_throttled(self, web_ctx) -> None:
+        """H1：Basic auth 失败与登录共用限速——错误口令试满后，正确口令
+        也必须被拒（否则 /metrics 是绕开限速的爆破通道）。"""
+        import base64
+
+        server = self._server(web_ctx, metrics=True)
+        try:
+            base = f"http://127.0.0.1:{server.address[1]}"
+            bad = base64.b64encode(b"prom:wrong").decode()
+            good = base64.b64encode(b"prom:secret-password").decode()
+
+            def _call(token: str) -> int:
+                req = urllib.request.Request(  # noqa: S310
+                    base + "/metrics", headers={"Authorization": f"Basic {token}"}
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    return exc.code
+
+            for _ in range(5):
+                assert _call(bad) == 401
+            assert _call(good) == 401, "正确口令在限速窗口内也必须被拒"
+            assert _call(bad) == 401
+        finally:
+            server.stop()
+
+    def test_enabled_requires_basic_auth(self, web_ctx) -> None:
+        server = self._server(web_ctx, metrics=True)
+        try:
+            self._assert_basic_auth(server)
+        finally:
+            server.stop()
+
+    def _assert_basic_auth(self, server) -> None:
+        import base64
+
+        base = f"http://127.0.0.1:{server.address[1]}"
+
+        try:
+            urllib.request.urlopen(base + "/metrics", timeout=5)  # noqa: S310
+            raise AssertionError("无凭据不应 200")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+            assert exc.headers["WWW-Authenticate"].startswith("Basic")
+
+        token = base64.b64encode(b"prometheus:secret-password").decode()
+        req = urllib.request.Request(  # noqa: S310
+            base + "/metrics", headers={"Authorization": f"Basic {token}"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            text = resp.read().decode("utf-8")
+        assert 'frpsctl_up{instance="test"} 1' in text  # 实例名来自 conftest fixture
+        assert "frpsctl_instance_state{" in text
+        assert "# TYPE frpsctl_dashboard_clients gauge" not in text  # 未运行：无 dashboard 段
+
+        bad = base64.b64encode(b"prometheus:wrong").decode()
+        req_bad = urllib.request.Request(  # noqa: S310
+            base + "/metrics", headers={"Authorization": f"Basic {bad}"}
+        )
+        try:
+            urllib.request.urlopen(req_bad, timeout=5)  # noqa: S310
+            raise AssertionError("错误口令不应 200")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+
+        # 已登录会话同样可访问
+        client = Client(server)
+        assert client.login()[0] == 200
+        req_cookie = urllib.request.Request(  # noqa: S310
+            base + "/metrics", headers={"Cookie": client.cookie or ""}
+        )
+        with urllib.request.urlopen(req_cookie, timeout=5) as resp:  # noqa: S310
+            assert b"frpsctl_up" in resp.read()
+
+
+class TestBoundedConcurrency:
+    """请求线程有界：worker 用尽时立即 503（不无限排队）。"""
+
+    def test_exhausted_workers_get_503(self, web_ctx) -> None:
+        from frpsctl.web.server import _BoundedThreadingHTTPServer
+
+        server = _BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), _NullHandler, max_workers=1
+        )
+        try:
+
+            class _FakeSock:
+                def __init__(self) -> None:
+                    self.sent = b""
+                    self.closed = False
+
+                def sendall(self, data: bytes) -> None:
+                    self.sent += data
+
+                def shutdown(self, _how: int) -> None:  # noqa: ARG002
+                    pass
+
+                def close(self) -> None:
+                    self.closed = True
+
+            assert server._workers.acquire(blocking=False), "测试自占 worker"
+            sock = _FakeSock()
+            server.process_request(sock, ("127.0.0.1", 1))
+            assert b"503 Service Unavailable" in sock.sent
+            assert sock.closed, "超限连接必须被关闭"
+        finally:
+            server._workers.release()
+            server.server_close()
+
+
+class _NullHandler:
+    """占位 handler（`_BoundedThreadingHTTPServer` 只要求可被引用）。"""
+
+
+class TestFinalReviewGuards:
+    """v0.3.0 最终 review 的守卫（连接声明 / TTL 契约 / metrics 来源 / 去重）。"""
+
+    def test_responses_declare_connection_close(self, web) -> None:
+        """N9：每响应关闭连接必须**显式声明** `Connection: close`（HTTP/1.1
+        客户端据此不误复用）——防重构把 close_connection 改回去。"""
+        import http.client
+
+        client = Client(web)
+        client.login()
+        conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
+        try:
+            conn.request("GET", "/api/status", headers={"Cookie": client.cookie})
+            resp = conn.getresponse()
+            resp.read()
+            values = [v for k, v in resp.getheaders() if k.lower() == "connection"]
+            assert values == ["close"], values
+        finally:
+            conn.close()
+
+    def test_send_error_path_has_single_connection_header(self, web) -> None:
+        """N4：stdlib 的 `send_error`（如 501 未知方法）不重复发 Connection。"""
+        import http.client
+
+        client = Client(web)
+        client.login()
+        conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
+        try:
+            conn.request("PATCH", "/api/status", headers={"Cookie": client.cookie})
+            resp = conn.getresponse()
+            resp.read()
+            values = [v for k, v in resp.getheaders() if k.lower() == "connection"]
+            assert len(values) <= 1, f"Connection 头重复：{values}"
+        finally:
+            conn.close()
+
+    def test_cache_ttls_cover_polling_interval(self) -> None:
+        """N9：列表 TTL 必须 ≥ 浏览器轮询间隔（5s）——2 秒 TTL 等于没有缓存
+        （v0.3.0 量化验证的教训），防重构改回。"""
+        from frpsctl.web import api as api_mod
+
+        assert api_mod.CACHE_TTL_LISTS >= 5.0
+        assert api_mod.TRAFFIC_CACHE_TTL == 30.0
+        assert api_mod.CACHE_TTL_LOGS > 0
+
+    def test_metrics_source_matches_login_source_with_trusted_proxy(self, web_ctx) -> None:
+        """N1：trusted_proxy 下 `/metrics` 的失败限速必须按同一来源（XFF 最后
+        一跳）——否则两条限速桶互不相干，爆破通道重新分裂。"""
+        import base64
+
+        server = WebServer(
+            web_ctx, WebSettings(bind="127.0.0.1:0", metrics=True, trusted_proxy=True)
+        )
+        server.start()
+        try:
+            base = f"http://127.0.0.1:{server.address[1]}"
+            bad = base64.b64encode(b"prom:wrong").decode()
+            good = base64.b64encode(b"prom:secret-password").decode()
+
+            def _call(token: str, forwarded: str) -> int:
+                req = urllib.request.Request(  # noqa: S310
+                    base + "/metrics",
+                    headers={"Authorization": f"Basic {token}", "X-Forwarded-For": forwarded},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    return exc.code
+
+            for _ in range(5):
+                assert _call(bad, "203.0.113.7") == 401
+            assert _call(good, "203.0.113.7") == 401, "同一 XFF 来源应被限速"
+            assert _call(good, "203.0.113.8") == 200, "不同来源不应被连带限速"
+        finally:
+            server.stop()

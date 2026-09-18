@@ -1,0 +1,2398 @@
+{
+  "(root)": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "admin_password",
+        "opts": [
+          "--admin-password"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "binary",
+        "opts": [
+          "--binary"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "config",
+        "opts": [
+          "--config"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "install_completion",
+        "opts": [
+          "--install-completion"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "instance",
+        "opts": [
+          "--instance",
+          "-i"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "root",
+        "opts": [
+          "--root"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "show_completion",
+        "opts": [
+          "--show-completion"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "verbose",
+        "opts": [
+          "--verbose",
+          "-v"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "version",
+        "opts": [
+          "--version"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "yes",
+        "opts": [
+          "--yes",
+          "-y"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "capabilities": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "clients": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config apply": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "dry_run",
+        "opts": [
+          "--dry-run"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "no_restart",
+        "opts": [
+          "--no-restart"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "<tuple>:()",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": true,
+        "name": "sets",
+        "opts": [
+          "--set"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "<tuple>:()",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": true,
+        "name": "unsets",
+        "opts": [
+          "--unset"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config diff": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 1,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "steps",
+        "opts": [
+          "--steps"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config edit": {
+    "params": [
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "yes",
+        "opts": [
+          "--yes",
+          "-y"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config get": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "key",
+        "opts": [
+          "key"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "reveal",
+        "opts": [
+          "--reveal"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config list": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "prefix",
+        "opts": [
+          "--prefix"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "tree",
+        "opts": [
+          "--tree"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config rollback": {
+    "params": [
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 1,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "steps",
+        "opts": [
+          "steps"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config set": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "dry_run",
+        "opts": [
+          "--dry-run"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "key",
+        "opts": [
+          "key"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "no_restart",
+        "opts": [
+          "--no-restart"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "prompt",
+        "opts": [
+          "--prompt"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "read_stdin",
+        "opts": [
+          "--stdin"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "value",
+        "opts": [
+          "value"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "config unset": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "dry_run",
+        "opts": [
+          "--dry-run"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "key",
+        "opts": [
+          "key"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "no_restart",
+        "opts": [
+          "--no-restart"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "doctor": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "init": {
+    "params": [
+      {
+        "default": "",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "allow_ports",
+        "opts": [
+          "--allow-ports"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 7000,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind_port",
+        "opts": [
+          "--bind-port"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 7500,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "dashboard_port",
+        "opts": [
+          "--dashboard-port"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "no_input",
+        "opts": [
+          "--no-input"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "install": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "insecure",
+        "opts": [
+          "--insecure"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": true,
+        "name": "mirror",
+        "opts": [
+          "--mirror"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "only_download",
+        "opts": [
+          "--only-download"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "0.71.0",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "version",
+        "opts": [
+          "--version"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "with_frpc",
+        "opts": [
+          "--with-frpc"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "instances": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health",
+        "opts": [
+          "--health"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "log": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "follow",
+        "opts": [
+          "--follow",
+          "-f"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 100,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "lines",
+        "opts": [
+          "--lines",
+          "-n"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin audit stats": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "since",
+        "opts": [
+          "--since"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin audit tail": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "follow",
+        "opts": [
+          "--follow",
+          "-f"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 50,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "lines",
+        "opts": [
+          "--lines",
+          "-n"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin check": {
+    "params": [
+      {
+        "default": "127.0.0.1:8080",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin config list": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin config set": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "key",
+        "opts": [
+          "key"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "prompt",
+        "opts": [
+          "--prompt"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "read_stdin",
+        "opts": [
+          "--stdin"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "value",
+        "opts": [
+          "value"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin init": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin serve": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "127.0.0.1:8080",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "/handler",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "path",
+        "opts": [
+          "--path"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service install": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "127.0.0.1:8080",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "group",
+        "opts": [
+          "--group"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "/handler",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "handler_path",
+        "opts": [
+          "--path"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "frps",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "user",
+        "opts": [
+          "--user"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service restart": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service start": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service status": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service stop": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin service uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin user list": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin user remove": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "name",
+        "opts": [
+          "name"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin user set": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "max_proxies",
+        "opts": [
+          "--max-proxies"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "name",
+        "opts": [
+          "name"
+        ],
+        "required": true,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "names",
+        "opts": [
+          "--names"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "no_random_port",
+        "opts": [
+          "--no-random-port"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "note",
+        "opts": [
+          "--note"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "ports",
+        "opts": [
+          "--ports"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "random_port",
+        "opts": [
+          "--random-port"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "types",
+        "opts": [
+          "--types"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "proxies": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "ptype",
+        "opts": [
+          "--type"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "prune": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "restart": {
+    "params": [
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "timeout",
+        "opts": [
+          "--timeout"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "service install": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "group",
+        "opts": [
+          "--group"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "<PosixPath>:/var/log/frps",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "log_dir",
+        "opts": [
+          "--log-dir"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "frps",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "user",
+        "opts": [
+          "--user"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "service logs": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "follow",
+        "opts": [
+          "--follow",
+          "-f"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 100,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "lines",
+        "opts": [
+          "--lines",
+          "-n"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "service status": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "service uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "start": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "foreground",
+        "opts": [
+          "--foreground"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "health_timeout",
+        "opts": [
+          "--health-timeout"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "status": {
+    "params": [
+      {
+        "default": 2.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "interval",
+        "opts": [
+          "--interval"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "watch",
+        "opts": [
+          "--watch"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "stop": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 10.0,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "timeout",
+        "opts": [
+          "--timeout"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "traffic": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "name",
+        "opts": [
+          "name"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "all_instances",
+        "opts": [
+          "--all"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "keep_bin",
+        "opts": [
+          "--keep-bin"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "keep_data",
+        "opts": [
+          "--keep-data"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "verify": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "file",
+        "opts": [
+          "--file"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web audit stats": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "since",
+        "opts": [
+          "--since"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web audit tail": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "follow",
+        "opts": [
+          "--follow",
+          "-f"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": 50,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "lines",
+        "opts": [
+          "--lines",
+          "-n"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web password set": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "prompt",
+        "opts": [
+          "--prompt"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "read_stdin",
+        "opts": [
+          "--stdin"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web password show": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web serve": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "allow_non_loopback",
+        "opts": [
+          "--allow-non-loopback"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "127.0.0.1:8787",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "metrics",
+        "opts": [
+          "--metrics"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password",
+        "opts": [
+          "--password"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password_file",
+        "opts": [
+          "--password-file"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "trusted_proxy",
+        "opts": [
+          "--trusted-proxy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service install": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "allow_non_loopback",
+        "opts": [
+          "--allow-non-loopback"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "127.0.0.1:8787",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "force",
+        "opts": [
+          "--force"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "group",
+        "opts": [
+          "--group"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "metrics",
+        "opts": [
+          "--metrics"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "trusted_proxy",
+        "opts": [
+          "--trusted-proxy"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": "frps",
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "user",
+        "opts": [
+          "--user"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service restart": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service start": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service status": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service stop": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web service uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  }
+}

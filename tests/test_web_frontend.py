@@ -43,11 +43,11 @@ def _index_html() -> str:
 
 
 def _script_blocks(html: str) -> list[str]:
-    return re.findall(r"<script>(.*?)</script>", html, re.S)
+    return re.findall(r"<script[^>]*>(.*?)</script>", html, re.S)
 
 
 def _style_block(html: str) -> str:
-    match = re.search(r"<style>(.*?)</style>", html, re.S)
+    match = re.search(r"<style[^>]*>(.*?)</style>", html, re.S)
     assert match is not None, "找不到 <style> 块"
     return match.group(1)
 
@@ -153,7 +153,8 @@ class TestFrontendPureFunctionsRuntime:
         return match.group(0)
 
     def _run(self, tmp_path: Path, source: str, checks: list[str]) -> None:
-        assert shutil.which("node") is not None, "需要 node"
+        if shutil.which("node") is None:
+            pytest.skip("需要 node 做动态执行守卫")
         js = source + "\n" + "\n".join(checks) + "\nconsole.log('ok');\n"
         target = tmp_path / "check.js"
         target.write_text(js, "utf-8")
@@ -202,3 +203,74 @@ class TestFrontendPureFunctionsRuntime:
             "if (humanDuration(null) !== '-') process.exit(1);",
         ]
         self._run(tmp_path, source, checks)
+
+    def test_web_audit_transforms(self, tmp_path: Path) -> None:
+        """Web 操作审计的三个纯函数（统计项 / 备注 / 行变换）。"""
+        script = "\n".join(_script_blocks(_index_html()))
+        source = "\n".join(
+            self._extract(script, name)
+            for name in ("webAuditStatsItems", "webAuditNotes", "webAuditRows")
+        )
+        checks = [
+            # 坏行取 stats.bad_lines（全量口径）；stats 缺失时回退顶层（尾部口径）
+            "const a = webAuditStatsItems("
+            "{ stats: { total: 7, ok: 6, error: 1, bad_lines: 5 }, bad_lines: 2 });",
+            "const wantA = [['操作', 7], ['成功', 6], ['失败', 1], ['坏行', 5]];",
+            "if (JSON.stringify(a) !== JSON.stringify(wantA)) process.exit(1);",
+            "const b = webAuditStatsItems({ bad_lines: 3 });",
+            "if (b[3][1] !== 3) process.exit(1);",
+            "const notes = webAuditNotes({ available: false, reason: 'x', path: '/p', stats: {} });",
+            "if (!notes.some((n) => n.includes('尚无 Web 操作记录'))) process.exit(1);",
+            "if (!notes.some((n) => n.includes('/p'))) process.exit(1);",
+            "const rows = webAuditRows([",
+            "{ at: 't1', result: 'ok', action: 'start', target: 'a', source: 's', params: { k: 1 } },",
+            "{ at: 't2', result: 'error:X', action: 'stop' }]);",
+            "if (rows.length !== 2) process.exit(1);",
+            "if (rows[0].at !== 't2' || rows[0].ok !== false) process.exit(1);  // 新在前",
+            "if (rows[1].detail !== 'k=1' || rows[1].ok !== true) process.exit(1);",
+        ]
+        self._run(tmp_path, source, checks)
+
+    def test_client_and_proxy_row_transforms(self, tmp_path: Path) -> None:
+        """列表行变换（0.3.0 从 renderClients/renderProxies 抽出的纯函数）。"""
+        script = "\n".join(_script_blocks(_index_html()))
+        source = "\n".join(
+            self._extract(script, name)
+            for name in ("humanBytes", "clientRows", "proxyRows")
+        )
+        checks = [
+            "const c = clientRows([{ key: 'k', user: 'u', hostname: 'h',",
+            "clientIP: '1.2.3.4', online: true, version: '0.71.0' }]);",
+            "if (c.length !== 1 || c[0].name !== 'k' || c[0].online !== true) process.exit(1);",
+            "if (clientRows([{ online: 0 }])[0].online !== false) process.exit(1);  // 非布尔归一化",
+            "const p = proxyRows([{ name: 'n', type: 'tcp', remote_port: 6000,",
+            "phase: 'online', cur_conns: 3, today_traffic_in: 2048, today_traffic_out: 0 }]);",
+            "if (p[0].port !== '6000' || p[0].online !== true) process.exit(1);",
+            "if (p[0].traffic !== '2.0 KiB / 0 B') {",
+            "  console.error(p[0].traffic); process.exit(1); }",
+            "if (proxyRows([{ name: 'x' }])[0].port !== '-') process.exit(1);",
+        ]
+        self._run(tmp_path, source, checks)
+
+
+class TestCspReadiness:
+    """CSP nonce 化的静态前提（server 测试验证注入行为，这里守源头文件）。"""
+
+    def test_no_inline_style_attributes(self) -> None:
+        import re
+
+        html = STATIC_INDEX.read_text("utf-8")
+        hits = re.findall(r'\sstyle="[^"]*"', html)
+        assert not hits, f"还有内联 style 属性（CSP 无 unsafe-inline）：{hits[:3]}"
+
+    def test_nonce_placeholders_present(self) -> None:
+        html = STATIC_INDEX.read_text("utf-8")
+        # 两个 script + 一个 style
+        assert html.count("__CSP_NONCE__") == 3, "nonce 占位符数量不对"
+
+    def test_no_js_style_attribute_assignments(self) -> None:
+        import re
+
+        html = STATIC_INDEX.read_text("utf-8")
+        hits = re.findall(r'style:\s*"', html)
+        assert not hits, f"JS 里还有 style 属性赋值：{hits[:3]}"

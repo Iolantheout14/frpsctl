@@ -1425,3 +1425,219 @@ class TestWatchStreamFlush:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+
+
+class TestLogFollowStreamFlush:
+    """`log -f` 必须**实时**输出（stdout 缓冲/轮转重开的回归守卫）。
+
+    v0.2.6 的同类守卫覆盖了 `plugin audit tail -f` 与 `status --watch`；
+    `log -f` 是更早的实现却只有非跟随路径的测试——0.3.0 前补齐。
+    """
+
+    def test_follow_emits_without_waiting_for_process_exit(self, tmp_path) -> None:
+        import select
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        log_file = tmp_path / "instances" / "default" / "frps.log"
+        log_file.write_text("", "utf-8")
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "frpsctl", "log", "-f", "-n", "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            time.sleep(1.0)  # 等它进入跟随循环
+            with open(log_file, "a", encoding="utf-8") as handle:
+                handle.write("hello-follow\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            ready, _, _ = select.select([proc.stdout], [], [], 3.0)
+            assert ready, "log -f 输出没有实时到达（stdout 缓冲未 flush？）"
+            assert "hello-follow" in proc.stdout.readline()
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+class TestPluginServeE2E:
+    """`plugin serve` 前台服务的端到端：healthz → SIGTERM 优雅退出。
+
+    插件是登录单点、fail-closed——它此前只有"参数校验"级测试（非回环拒绝、
+    password-file 错误），"服务真的能起来、且被 systemd stop 时优雅退出"
+    没有端到端守卫。
+    """
+
+    def test_healthz_and_sigterm(self, tmp_path) -> None:
+        import signal
+        import subprocess
+        import sys
+        import urllib.request
+
+        from .conftest import wait_port
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        env.pop("FRPSCTL_PLUGIN_POLICY", None)
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "plugin", "init"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+
+        port = free_port()
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "frpsctl", "plugin", "serve",
+                "--bind", f"127.0.0.1:{port}",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            assert wait_port("127.0.0.1", port, timeout=10), "插件服务没有监听"
+            with urllib.request.urlopen(  # noqa: S310 - 测试内固定回环地址
+                f"http://127.0.0.1:{port}/healthz", timeout=5
+            ) as resp:
+                assert resp.status == 200
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=15) == 0, "SIGTERM 未优雅退出"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+class TestWebAuditFollowWaitsForFile:
+    """`web audit tail -f` 与 plugin 版一致：文件不存在时等待出现（N7）。"""
+
+    def test_follow_waits_until_file_appears(self, tmp_path) -> None:
+        import json
+        import select
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        audit = tmp_path / "instances" / "default" / "web-audit.jsonl"
+        assert not audit.exists()
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "frpsctl", "web", "audit", "tail", "-f", "-n", "1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            deadline = time.monotonic() + 25
+            got = ""
+            seq = 0
+            while time.monotonic() < deadline and "Probe" not in got:
+                seq += 1
+                with open(audit, "a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps({"at": "2026-09-18T10:00:00", "at_unix": float(seq),
+                                    "action": f"Probe{seq}", "result": "ok"}) + "\n"
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                if ready:
+                    got = proc.stdout.readline()
+            assert "Probe" in got, f"文件出现后跟随输出没有实时到达（最后：{got!r}）"
+            assert proc.poll() is None, "跟随进程不应退出"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+class TestAuditFollowWaitsForFile:
+    """`plugin audit tail -f` 在审计文件尚不存在时必须**等待**而不是崩溃。
+
+    v0.3.0 review：审计启用但还没有任何记录时，旧实现直接 FileNotFoundError
+    → 未分类错误 1；`web audit tail` 已提前拦截，这里让两者一致且真正能跟随。
+    """
+
+    def test_follow_waits_until_file_appears(self, tmp_path) -> None:
+        import json
+        import select
+        import subprocess
+        import sys
+        import time
+
+        env = dict(os.environ)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        env.pop("FRPSCTL_PLUGIN_POLICY", None)
+        (tmp_path / "data" / "bin").mkdir(parents=True)
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "init", "--no-input"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        assert subprocess.run(
+            [sys.executable, "-m", "frpsctl", "plugin", "init"],
+            capture_output=True, env=env, timeout=60,
+        ).returncode == 0
+        audit = tmp_path / "instances" / "default" / "plugin-audit.jsonl"
+        assert not audit.exists()
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "frpsctl", "plugin", "audit", "tail", "-f", "-n", "1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        try:
+            # 语义说明：`-f` 的跟随从"文件被打开"那一刻开始，出现之前的行算
+            # 历史（与 tail -f 的语义一致，用非 -f 模式查看）。因此测试用
+            # **持续追加探测行**：只要进程进入跟随循环，后续任一探测行必然
+            # 被实时读到——不依赖进程启动耗时（v0.3.0 验收：固定 sleep 在
+            # 高负载下会假失败）。
+            deadline = time.monotonic() + 25
+            got = ""
+            seq = 0
+            while time.monotonic() < deadline and "Probe" not in got:
+                seq += 1
+                with open(audit, "a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps({"at": "2026-09-18T10:00:00", "at_unix": float(seq),
+                                    "op": f"Probe{seq}", "user": "u", "decision": "allow"}) + "\n"
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                if ready:
+                    got = proc.stdout.readline()
+            assert "Probe" in got, f"文件出现后跟随输出没有实时到达（最后：{got!r}）"
+            assert proc.poll() is None, "跟随进程不应退出"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)

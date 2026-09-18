@@ -3178,3 +3178,370 @@ class TestAuditSummaryElapsed:
 
         summary = summarize(tmp_path / "missing.jsonl")
         assert (summary.elapsed_count, summary.elapsed_avg_ms, summary.elapsed_max_ms) == (0, 0.0, 0.0)
+
+
+class TestWebAuditCore:
+    """`core/web_audit.py`：JSONL 写入、统计、指纹与失败降级。"""
+
+    def test_record_and_summarize(self, inst) -> None:
+        import time as _time
+
+        from frpsctl.core import web_audit
+
+        assert web_audit.record(inst, action="start", source="127.0.0.1", session_id="abc") is True
+        assert (
+            web_audit.record(inst, action="stop", result="error:NotRunning", source="10.0.0.9")
+            is True
+        )
+        path = web_audit.resolve_path(inst)
+        assert path.exists()
+
+        summary = web_audit.summarize(path)
+        assert summary.total == 2
+        assert summary.ok == 1 and summary.error == 1
+        assert summary.by_action == {"start": 1, "stop": 1}
+        assert summary.by_source["127.0.0.1"] == 1
+        assert summary.first_at is not None and summary.last_at is not None
+
+        assert web_audit.summarize(path, since=_time.time() + 10).total == 0
+
+    def test_summarize_tolerates_bad_lines(self, inst) -> None:
+        from frpsctl.core import web_audit
+
+        path = web_audit.resolve_path(inst)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"action": "start", "result": "ok", "at_unix": 1.0}\nnot-json\n', "utf-8")
+        summary = web_audit.summarize(path)
+        assert summary.total == 1 and summary.bad_lines == 1
+
+    def test_session_fingerprint_is_stable_and_short(self) -> None:
+        from frpsctl.core import web_audit
+
+        first = web_audit.session_fingerprint("token-abc")
+        assert first == web_audit.session_fingerprint("token-abc")
+        assert len(first) == 12
+        assert web_audit.session_fingerprint(None) == ""
+
+    def test_record_never_raises_on_unwritable_path(self, inst, monkeypatch) -> None:
+        """审计落盘失败 → 返回 False，绝不抛异常（管理台可用性优先）。"""
+        from pathlib import Path as _Path
+
+        from frpsctl.core import web_audit
+
+        monkeypatch.setattr(
+            web_audit, "resolve_path", lambda _inst: _Path("/proc/1/no-such-dir/web-audit.jsonl")
+        )
+        assert web_audit.record(inst, action="start") is False
+
+
+class TestOwnerDetectionCache:
+    """owner 探测缓存：TTL 内复用、state.json 戳变化必失效。"""
+
+    def test_detection_is_cached_within_ttl(self, inst, monkeypatch) -> None:
+        from frpsctl.core.lifecycle import Lifecycle
+
+        import frpsctl.core.systemd as systemd_mod
+
+        calls = {"n": 0}
+
+        class _Fake:
+            def __init__(self, _inst) -> None:
+                pass
+
+            def is_active(self) -> bool:
+                calls["n"] += 1
+                return False
+
+        monkeypatch.setattr(systemd_mod, "Systemd", _Fake)
+        lc = Lifecycle(inst)
+        lc.resolve_owner()
+        lc.resolve_owner()
+        assert calls["n"] == 1, "TTL 内第二次探测没有走缓存"
+
+    def test_state_stamp_change_invalidates_cache(self, inst) -> None:
+        """start 写 state / stop 删 state 后，缓存不能把旧 owner 藏起来。"""
+        from frpsctl.core.lifecycle import Lifecycle, Owner
+
+        lc = Lifecycle(inst)
+        assert lc.resolve_owner() is Owner.NONE
+        inst.write_state({"pid": 1, "start_time": 1, "binary": "", "config": ""})
+        assert lc.resolve_owner() is Owner.DIRECT, "state.json 出现后仍命中 NONE 缓存"
+        inst.clear_state()
+        assert lc.resolve_owner() is Owner.NONE, "state.json 删除后仍命中 DIRECT 缓存"
+
+
+class TestAuditRotation:
+    """审计轮转：写侧改名保留、读侧跨文件、禁用/失败安全。"""
+
+    def test_rotate_and_read_across_files(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "plugin-audit.jsonl"
+        line = '{"at_unix": %s, "user": "u%s", "decision": "allow", "op": "Login"}\n'
+        path.write_text((line % (1, "a")) * 5, "utf-8")
+        assert auditlog.rotate_if_needed(path, max_bytes=10) is True
+        path.write_text((line % (2, "b")) * 5, "utf-8")
+        assert auditlog.rotate_if_needed(path, max_bytes=10) is True
+        path.write_text((line % (3, "c")) * 5, "utf-8")
+
+        names = [item.name for item in auditlog.rotated_paths(path)]
+        assert names == ["plugin-audit.jsonl", "plugin-audit.jsonl.1", "plugin-audit.jsonl.2"]
+
+        summary = auditlog.summarize(path)
+        assert summary.total == 15, "统计没有跨轮转文件"
+        tail = auditlog.read_tail(path, 7)
+        assert len(tail.records) == 7
+        assert tail.records[-1]["at_unix"] == 3, "尾部结果必须按时间升序"
+        assert tail.records[0]["at_unix"] == 2, "不足的行应从 .1 追溯"
+
+    def test_rotation_disabled_is_noop(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "x.jsonl"
+        path.write_text("x" * 100, "utf-8")
+        assert auditlog.rotate_if_needed(path, max_bytes=0) is False
+        assert not (tmp_path / "x.jsonl.1").exists()
+
+    def test_web_audit_rotation_keeps_summary_complete(self, inst, monkeypatch) -> None:
+        """轮转后统计必须等于"落盘可见的行数之和"（保留 2 份，旧批次按设计丢弃）。"""
+        from frpsctl.core import auditlog, web_audit
+
+        monkeypatch.setattr(web_audit, "DEFAULT_WEB_AUDIT_MAX_BYTES", 1000)
+        for _ in range(30):
+            web_audit.record(inst, action="start")
+        path = web_audit.resolve_path(inst)
+        assert (inst.dir / "web-audit.jsonl.1").exists(), "Web 审计没有轮转"
+        on_disk = sum(
+            len(item.read_text("utf-8").strip().splitlines())
+            for item in auditlog.rotated_paths(path)
+        )
+        assert web_audit.summarize(path).total == on_disk
+        assert on_disk < 30, "老批次按设计被轮转丢弃（保留 2 份）"
+
+
+class TestPluginAuditRotation:
+    def test_flush_rotates_when_over_limit(self, tmp_path) -> None:
+        from frpsctl.plugin.audit import AuditLog, AuditRecord
+
+        path = tmp_path / "audit.jsonl"
+        log = AuditLog(path, flush_every=1, max_bytes=200)
+        try:
+            for _ in range(30):
+                log.record(AuditRecord(op="Login", user="u", decision="allow"))
+                log.flush()
+        finally:
+            log.close()
+        assert (tmp_path / "audit.jsonl.1").exists(), "插件审计没有轮转"
+        from frpsctl.core import auditlog
+
+        on_disk = sum(
+            len(item.read_text("utf-8").strip().splitlines())
+            for item in auditlog.rotated_paths(path)
+        )
+        assert auditlog.summarize(path).total == on_disk
+        assert on_disk < 30, "老批次按设计被轮转丢弃（保留 2 份）"
+
+
+class TestOidcConfig:
+    """OIDC 配置支持：完整性校验（schema）与 doctor 提示。"""
+
+    def test_oidc_requires_issuer_and_audience(self) -> None:
+        from frpsctl.core.schema import validate_document
+        from frpsctl.errors import ConfigError
+
+        with pytest.raises(ConfigError, match="auth.oidc.issuer"):
+            validate_document('[auth]\nmethod = "oidc"\n')
+        with pytest.raises(ConfigError, match="auth.oidc.audience"):
+            validate_document('[auth]\nmethod = "oidc"\n[auth.oidc]\nissuer = "https://x"\n')
+        # 完整配置通过（OIDC 协议本身由 frps 实现，本工具只管配置完整性）
+        validate_document(
+            '[auth]\nmethod = "oidc"\n[auth.oidc]\nissuer = "https://x"\naudience = "frps"\n'
+        )
+
+    def test_doctor_reports_missing_oidc_fields(self, inst, write_config) -> None:
+        from frpsctl.core.doctor import Severity, run_doctor
+
+        write_config('[auth]\nmethod = "oidc"\ntoken = "stale"\n')
+        report = run_doctor(inst)
+        oidc = [f for f in report.findings if f.check == "auth.oidc"]
+        assert oidc and oidc[0].severity is Severity.ERROR
+        token = [f for f in report.findings if f.check == "auth.token"]
+        assert token and token[0].severity is Severity.WARN
+
+    def test_doctor_accepts_complete_oidc(self, inst, write_config) -> None:
+        from frpsctl.core.doctor import Severity, run_doctor
+
+        write_config(
+            '[auth]\nmethod = "oidc"\n[auth.oidc]\nissuer = "https://x"\naudience = "frps"\n'
+        )
+        report = run_doctor(inst)
+        oidc = [f for f in report.findings if f.check == "auth.oidc"]
+        assert oidc and oidc[0].severity is Severity.INFO
+
+
+class TestAuditRotationByAge:
+    """按天轮转（与 frp 日志 maxDays 同语义）：超过年龄的审计归档轮换。"""
+
+    def test_rotation_by_age(self, tmp_path) -> None:
+        import os
+        import time as _time
+
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        path.write_text("x\n", "utf-8")
+        old = _time.time() - 8 * 86400
+        os.utime(path, (old, old))
+        assert auditlog.rotate_if_needed(path, max_age_seconds=7 * 86400) is True
+        assert (tmp_path / "a.jsonl.1").exists()
+
+        # 刚写的文件不触发按天轮转
+        path.write_text("y\n", "utf-8")
+        assert auditlog.rotate_if_needed(path, max_age_seconds=7 * 86400) is False
+
+    def test_web_audit_rotation_by_age(self, inst, monkeypatch) -> None:
+        import os
+        import time as _time
+
+        from frpsctl.core import web_audit
+
+        monkeypatch.setattr(web_audit, "DEFAULT_WEB_AUDIT_MAX_AGE_DAYS", 7.0)
+        path = web_audit.resolve_path(inst)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"action": "old"}\n', "utf-8")
+        old = _time.time() - 30 * 86400
+        os.utime(path, (old, old))
+
+        web_audit.record(inst, action="start")
+        assert (inst.dir / "web-audit.jsonl.1").exists(), "Web 审计没有按天轮转"
+        assert '"action": "start"' in path.read_text("utf-8")
+
+    def test_plugin_audit_rotation_by_age(self, tmp_path) -> None:
+        import os
+        import time as _time
+
+        from frpsctl.plugin.audit import AuditLog, AuditRecord
+
+        path = tmp_path / "audit.jsonl"
+        path.write_text("old\n", "utf-8")
+        old = _time.time() - 30 * 86400
+        os.utime(path, (old, old))
+
+        log = AuditLog(path, flush_every=1, max_age_seconds=7 * 86400)
+        try:
+            log.record(AuditRecord(op="Login", user="u", decision="allow"))
+            log.flush()
+        finally:
+            log.close()
+        assert (tmp_path / "audit.jsonl.1").exists(), "插件审计没有按天轮转"
+
+
+class TestRegressionReviewFixes:
+    """v0.3.0 发布前回归 review 的修复守卫（每条对应一个实测问题）。"""
+
+    def test_non_ascii_password_works(self) -> None:
+        """M6：`hmac.compare_digest` 对非 ASCII **str** 抛 TypeError——中文口令
+        会让登录线程断开、管理台完全不可用；比较必须先 encode。"""
+        from frpsctl.web.auth import AuthManager
+
+        auth = AuthManager("密码123")
+        session = auth.login("密码123", source="s")
+        assert session is not None, "非 ASCII 口令无法登录"
+        assert auth.login("密码124", source="s2") is None
+        assert auth.check_password("密码123") is True
+        assert auth.check_password("错误") is False
+
+    def test_metrics_failures_share_login_throttle(self) -> None:
+        """H1：`/metrics` 的 Basic auth 失败必须计入同一张来源限速表——
+        否则它是绕开登录限速的第二条口令爆破通道。"""
+        from frpsctl.web.auth import MAX_FAILURES, AuthManager
+        from frpsctl.web.metrics import check_basic_auth
+
+        auth = AuthManager("right")
+        bad = "Basic " + __import__("base64").b64encode(b"prom:wrong").decode()
+        for _ in range(MAX_FAILURES):
+            assert check_basic_auth(auth, bad, source="10.0.0.9") is False
+        assert auth.is_throttled("10.0.0.9") is True
+        good = "Basic " + __import__("base64").b64encode(b"prom:right").decode()
+        assert check_basic_auth(auth, good, source="10.0.0.9") is False, "限速中的来源不能放行"
+        assert check_basic_auth(auth, good, source="10.0.0.10") is True
+
+    def test_lone_surrogate_password_does_not_crash(self) -> None:
+        """N2：HTTP JSON 可构造 lone surrogate——比较必须用 surrogatepass，
+        否则 UnicodeEncodeError 让登录线程断开（与中文口令同类症状）。
+        用 chr() 构造，避免源码里出现 surrogate 字面量（会让 pytest 收集崩）。"""
+        from frpsctl.web.auth import AuthManager
+
+        auth = AuthManager("密码123")
+        assert auth.login(chr(0xD800), source="s") is None
+        assert auth.check_password(chr(0xD800)) is False
+        assert auth.login("密码123", source="s2") is not None
+
+    def test_doctor_survives_malformed_auth_table(self, inst, write_config) -> None:
+        """N3：`auth` 本身不是表时 doctor 也不能崩（与 oidc 分支同规格）。"""
+        from frpsctl.core.doctor import Severity, run_doctor
+
+        write_config('auth = "oops"\n')
+        report = run_doctor(inst)
+        auth_findings = [f for f in report.findings if f.check == "auth"]
+        assert auth_findings and auth_findings[0].severity is Severity.ERROR
+
+    def test_read_tail_skips_bad_lines_across_rotation(self, tmp_path) -> None:
+        """L1：坏行不应吃掉配额——当前文件全坏时仍要往 `.1` 追溯。"""
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        old_file = tmp_path / "a.jsonl.1"
+        old_file.write_text(
+            "".join(
+                f'{{"at_unix": {i}, "user": "u{i}", "decision": "allow", "op": "Login"}}\n'
+                for i in range(3)
+            ),
+            "utf-8",
+        )
+        path.write_text("not-json\n" * 3, "utf-8")
+        tail = auditlog.read_tail(path, 3)
+        assert len(tail.records) == 3, f"坏行吃掉了配额：{tail}"
+        assert tail.bad_lines == 3
+        assert [r["at_unix"] for r in tail.records] == [0, 1, 2]
+
+    def test_doctor_survives_malformed_oidc(self, inst, write_config) -> None:
+        """M4：`auth.oidc` 是字符串时 doctor 不能崩（应报 ERROR 而非
+        AttributeError → 未分类错误 1，什么都不诊断）。"""
+        from frpsctl.core.doctor import Severity, run_doctor
+
+        write_config('[auth]\nmethod = "oidc"\noidc = "oops"\n')
+        report = run_doctor(inst)
+        oidc = [f for f in report.findings if f.check == "auth.oidc"]
+        assert oidc and oidc[0].severity is Severity.ERROR
+
+    def test_ttl_cache_is_bounded(self) -> None:
+        """M2：缓存必须有上限（输入驱动的表都要有界）。"""
+        from frpsctl.web.cache import DEFAULT_MAX_ENTRIES, TTLCache
+
+        cache = TTLCache()
+        for index in range(DEFAULT_MAX_ENTRIES * 3):
+            cache.put(f"k{index}", index)
+        assert len(cache) == DEFAULT_MAX_ENTRIES
+        assert cache.get("k0", 999) is None, "最旧的条目应先被淘汰"
+        assert cache.get(f"k{DEFAULT_MAX_ENTRIES * 3 - 1}", 999) is not None
+
+    def test_web_audit_concurrent_writes_do_not_lose_records(self, inst) -> None:
+        """M1：并发写（ThreadingHTTPServer）不会因轮转交错丢记录。"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from frpsctl.core import auditlog, web_audit
+
+        total = 400
+
+        def write(_index: int) -> None:
+            web_audit.record(inst, action="start")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write, range(total)))
+        path = web_audit.resolve_path(inst)
+        on_disk = sum(
+            len(item.read_text("utf-8").strip().splitlines())
+            for item in auditlog.rotated_paths(path)
+        )
+        assert on_disk == total, f"并发写入丢失记录：{on_disk}/{total}"
