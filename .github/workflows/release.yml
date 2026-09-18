@@ -53,11 +53,22 @@ jobs:
           names = set(zipfile.ZipFile(wheel).namelist())
           required = {
               "frpsctl/py.typed",
+              # 0.3.0 拆包后的命令层与共享模块（丢任何一个都是运行期 ImportError）
               "frpsctl/cli/__init__.py",
+              "frpsctl/cli/app.py",
+              "frpsctl/cli/runtime.py",
+              "frpsctl/cli/commands/plugin.py",
               "frpsctl/core/lifecycle.py",
               "frpsctl/core/diagnostics.py",
               "frpsctl/core/uninstall.py",
               "frpsctl/core/auditlog.py",
+              "frpsctl/core/web_audit.py",
+              "frpsctl/report.py",
+              "frpsctl/capabilities.py",
+              "frpsctl/env.py",
+              "frpsctl/docs.py",
+              "frpsctl/web/cache.py",
+              "frpsctl/web/metrics.py",
               # 前端是 package data：丢它 = 管理台页面 500，而 CLI 测试全绿
               "frpsctl/web/static/index.html",
           }

@@ -88,6 +88,10 @@ jobs:
           .venv/bin/frpsctl plugin init
           .venv/bin/frpsctl plugin config set reject_log_burst 40
           .venv/bin/frpsctl plugin config list --json | python3 -c "import json,sys; assert json.load(sys.stdin)['settings']['reject_log_burst'] == 40"
+          # v0.3.0：多键一次事务（CLI 与 Web 同语义）
+          .venv/bin/frpsctl config apply --set maxPortsPerClient=25 --set bindPort="$BP"
+          # v0.3.0：能力清单从代码派生，命令数不得缩水
+          .venv/bin/frpsctl capabilities --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d['commands']) >= 55, len(d['commands']); assert d['exit_codes']['PERMISSION'] == 8"
           .venv/bin/frpsctl stop
           .venv/bin/frpsctl status
 
