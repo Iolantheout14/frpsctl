@@ -359,6 +359,8 @@ resolve_owner(instance):
 
 **理由**：内嵌二进制（PyInstaller `--onefile`）会让每次运行都解包约 14 MB 到临时目录，还要额外处理 Apache-2.0 的 LICENSE 随包分发；而"把二进制塞进 wheel"在 Linux 上还会逼出 `manylinux` 平台标签的问题——同一个 wheel 无法同时覆盖 glibc/musl 与 x86_64/aarch64。把 frps 当**外部可替换依赖**，语义更干净，也允许用户使用发行版自带的 frps（§12.1 升级语义）。
 
+> ⚠️ 历史注记："允许发行版自带的 frps"在 §16.2.1 门槛上收（只接受 ≥ 0.70.0）后**不再成立**——发行版通常落后于该门槛。
+
 ### ADR-5：日志只有一个写入者
 
 **决策**：
@@ -535,7 +537,7 @@ class Instance:
 
 | 命令 | 语义 | 关键行为 |
 |------|------|---------|
-| `frpsctl install [--version V] [--force] [--only-download] [--mirror U] [--with-frpc]` | 获取 frps 二进制 | 下载 → **强校验 sha256** → 落盘为 `frps-<version>` → `-v` 复验 → 换软链（§8.6.1）。`< 0.70.0` 直接拒绝 |
+| `frpsctl install [--version V] [--force] [--only-download] [--mirror U（可重复）] [--insecure] [--with-frpc]` | 获取 frps 二进制 | 下载 → **强校验 sha256** → 落盘为 `frps-<version>` → `-v` 复验 → 换软链（§8.6.1）。`< 0.70.0` 直接拒绝 |
 | `frpsctl init [--no-input] [--force] [--bind-port P] [--dashboard-port P] [--allow-ports S]` | 交互式生成配置 | 强制随机口令、`tls.force=true`、引导设置 `allowPorts`；已存在则要求 `--force` 并先备份 |
 | `frpsctl verify [--file P]` | 双保险校验 | pydantic 语义校验 + `frps verify`；用临时副本，不动线上文件 |
 | `frpsctl start [--foreground] [--health-timeout S]` | 启动 | verify → 加锁 → 派生进程 → **早退检测** → 写 state → 健康检查 |
@@ -549,6 +551,7 @@ class Instance:
 | `frpsctl config list [--prefix P] [--tree]` | 列出全部键 | 值自动打码；`--tree` 按表分组缩进 |
 | `frpsctl config edit [--yes]` | `$EDITOR` 编辑 | 保存后走同一闭环（锁内 CAS：编辑期间被并发修改则拒绝草稿） |
 | `frpsctl config diff [--steps N]` | 当前 vs 第 N 新快照 | unified diff（打码） |
+| `frpsctl config apply --set K=V --unset K [--dry-run]` | **多键**一次事务 | 一份快照、一次重启（复用 `apply_sets`）；与 Web 配置表单同语义 |
 | `frpsctl config rollback [N]` | 回滚到 N 份之前 | 同样走闭环；`N ≥ 1` |
 | `frpsctl service install\|uninstall\|status` | frps 的 systemd 集成 | 渲染 `frps@.service` + `daemon-reload` + `enable`（需 root；安装前四项部署体检）；`status` 同时报告 active 与 **enabled**（开机自启） |
 | `frpsctl service logs [-f] [-n N]` | journald 集成 | unit 级日志（启动失败 / OOM / 权限拒绝），与 `log` 互补 |
@@ -557,16 +560,18 @@ class Instance:
 | `frpsctl proxies [--type T] [--json]` | 代理列表 | v2 `/api/v2/proxies`（嵌套 `spec/status` 形状），自动翻页；`--type` 非法值报用法错误(2)（不再静默空表）；人读含启用时长（`lastStartAt`） |
 | `frpsctl traffic [name] [--json]` | 近 7 天流量历史 | 无参 = 全部代理逐日汇总（**并发查询**）；单代理失败记空不拖垮整体（离线 = 404 无数据） |
 | `frpsctl instances [--health] [--json]` | 多实例一行式概览 | 默认只读本地状态；`--health` 额外做三层探测（多实例**并发**，输出顺序稳定） |
+| `frpsctl capabilities [--json]` | 能力清单 | 命令树 / 退出码 / 环境变量 / 版本门槛，**从代码派生**（`frpsctl/capabilities.py`）——脚本与文档生成消费同一份数据 |
 | `frpsctl prune` | 清理离线代理记录 | `DELETE /api/proxies?status=offline`；清理前后各数一次离线记录，**如实返回清理条数**；**不存在**强制下线在线代理的 API（§18.6） |
 | `frpsctl plugin init [--force]` | 生成策略模板 | fail-closed 默认；0600 原子写 |
 | `frpsctl plugin check [--bind B]` | 离线校验策略 | 载入 + 回环校验 + 典型裁决试算 |
 | `frpsctl plugin serve [--bind B] [--path P]` | 插件服务（前台） | 只允许绑回环；SIGTERM 优雅退出并刷审计；生产用 `plugin service install` 守护 |
 | `frpsctl plugin user set\|remove\|list` | 策略用户的结构化编辑 | 只改显式给出的字段；写入前同 `plugin check` 判据复验；未知键保留 |
 | `frpsctl plugin audit tail [-n N] [-f] [--json]` | 审计尾部（只读） | 复用日志的反向读取；`-f` 跟随新记录（轮转自动重开）；`--json` 是一次性导出（与 `-f` 互斥） |
-| `frpsctl plugin audit stats [--since W] [--json]` | 审计统计（只读） | 流式扫描：总量/允许/拒绝/按用户/按操作/限速抑制；`--since` 支持 `24h` / `7d` / ISO / unix |
+| `frpsctl plugin audit stats [--since W] [--json]` | 审计统计（只读） | 流式扫描：总量/允许/拒绝/按用户/按操作/限速抑制/裁决耗时；`--since` 支持 `24h` / `7d` / ISO / unix；**跨轮转文件合并** |
 | `frpsctl plugin config list\|set` | 策略级设置的结构化编辑 | `allow_unknown_user` / `require_client_id` / `reject_log_burst` / `reject_log_window` / `admin_*` / `audit.*`；写入前同 `plugin check` 判据复验；未知字段拒绝 |
 | `frpsctl plugin service install\|uninstall\|start\|stop\|restart\|status` | 插件的 systemd 集成 | `Restart=always`（登录单点）+ 四项体检；`status` 同时报告 **enabled**；`install --access-log` 把逐请求日志写进 journald |
-| `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy] [--access-log]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速；`--access-log` 打开逐请求日志（排查用） |
+| `frpsctl web serve [--bind B] [--password P] [--password-file F] [--allow-non-loopback] [--trusted-proxy] [--access-log] [--metrics]` | Web 管理台（前台，§18） | 默认只绑回环、不允许空口令；`--trusted-proxy` 支持反代后的按来源限速；`--access-log` 打开逐请求日志；`--metrics` 暴露 Prometheus 文本（Basic auth，§23.2） |
+| `frpsctl web audit tail\|stats [--since W]` | Web 操作审计（只读） | 登录与变更动作的留痕（来源 / 会话指纹 / 结果）；`--since` 与插件审计同语义 |
 | `frpsctl web service install\|uninstall\|start\|stop\|restart\|status` | 管理台的 systemd 集成 | 0600 口令文件（明文不进 unit）+ 四项体检；`--trusted-proxy` / `--access-log` 可写入 unit；`status` 同时报告 **enabled** |
 | `frpsctl web password show [--json]` | 读回管理台口令 | 显式索取明文；权限过宽时向 stderr 告警 |
 | `frpsctl web password set [--stdin] [--prompt]` | 设置（轮换）管理台口令 | 不给输入通道时生成随机口令并只显示一次；0600 原子写；systemd 托管需重启生效 |
@@ -1390,7 +1395,9 @@ async def handler(
     return {"reject": False, "unchange": True}
 ```
 
-基于同一协议可以渐进扩展出：按用户分配可用端口段、域名配额、并发连接上限、完整审计日志。全部逻辑留在 Python 生态内。
+基于同一协议可以渐进扩展出：按用户分配可用端口段、域名配额、完整审计日志。全部逻辑留在 Python 生态内。
+
+> ⚠️ 历史注记：本小节原列的"**并发连接上限**"与 §11.2.4 的结论**直接冲突**——该能力明确不做（`NewUserConn` 在关键路径、错误只 info 级、无连接 id），以 §11.2.4 为准。
 
 ---
 
@@ -1401,7 +1408,7 @@ async def handler(
 | 方案 | 结论 |
 |------|------|
 | PyInstaller 内嵌 frps | ❌ 不用：约 14 MB 二进制每次运行都要解包到临时目录；还需处理 Apache-2.0 的 LICENSE 随包分发，并被迫给每个 glibc/musl × x86_64/aarch64 组合单独出包 |
-| PyInstaller 只打 Python 侧 | ⚠️ 可选，收益有限（依赖全是纯 Python）。"没有 Python 的服务器"由 uv 路线覆盖（uv 自带 Python），见 §22 |
+| PyInstaller 只打 Python 侧 | ⚠️ 可选，收益有限（依赖全是纯 Python）。"没有 Python 的服务器"由 uv 路线覆盖（uv 自带 Python），见 §21.4 |
 | **pip / pipx + 按需下载 frps** | ✅ **采用** |
 | **uv 一键 + install.sh 管道直跑** | ✅ v0.2.5 起支持（§21.4）：`curl … \| bash` 自动下载源码；无 Python 时打印 uv 指引 |
 
@@ -1474,7 +1481,7 @@ WantedBy=multi-user.target
 
 ## 13. 测试策略
 
-这类工具最容易出错的不是命令逻辑，而是**边界**：进程身份、并发、配置往返、失败回滚。因此测试分**七层**（单元 / 集成 / CLI / 契约 / 故障注入 / 插件 / 前端与文档，完整定义见 README §开发；下表为其中六类，另加手工冒烟）：
+这类工具最容易出错的不是命令逻辑，而是**边界**：进程身份、并发、配置往返、失败回滚。因此测试分**七层**（单元 / 集成 / CLI / 契约 / 故障注入 / 插件 / 前端与文档，完整定义见 README §开发；下表列出其中六类并补手工冒烟，插件层与前端/文档层见 §11/§18 与 README）：
 
 | 层 | 目标 | 手段 |
 |----|------|------|
@@ -1499,6 +1506,8 @@ WantedBy=multi-user.target
 | C6 | `frps verify -c` 对非法配置退出码为 1，对合法配置打印 `syntax is ok` 且退出码 0 | §3.1 唯一权威判定的契约 |
 | C7 | 真实二进制满足 §3.6：`frps -v` 输出无 `v` 前缀；`frps --help` 含 `--strict_config` 与 `--allow-unsafe`；`/api/v2/system/info` 返回 200。**并断言 0.69.1 及更早版本被 `install` 拒绝** | §3.6 版本门槛的自动化守卫。做法：`frps --help` 抓标志集合 + 起服务探 v2；低版本断言用 `install --version 0.69.1` 的退出码，**不下载二进制时可 `pytest.mark.skip`，但保留为可执行断言** |
 | C8 | 在 `user = "admin"` + 口令为空时，无凭据请求得 **401**，而 `admin:`+空口令得 **200**；只设 `password` 时须用 `:secret` 才能进 | §3.3 的实测边界。它守的是 `check_dangerous_combination()` **只拒绝两者全空**这个判据分工：若哪天 frp 改成"口令非空才启用鉴权"，"有 user + 空口令"会**静默退化成完全不鉴权**，而校验仍会放行——安全缺口就此产生 |
+| C9 | `DELETE /api/proxies` 只接受 `?status=offline`（无参数返回 400），语义是 `ClearOfflineProxies()`——frp **没有**强制下线在线代理的 API | §18.6 的实现期发现。它守住"`prune` 不做 kick"这条纠正：旧 `kick` 命令基于对该端点的误读，从未工作过 |
+| C10 | `GET /api/v2/proxies/{name}/traffic` 对离线/不存在的代理返回 **404（无数据）**，而非错误 | §18.9 新增。CLI `traffic` 与 Web 趋势图都依赖"一个离线代理不拖垮整体" |
 
 C7 是"问题 2 的长期解药"：版本矩阵一旦被 frp 改动，CI 先于用户发现，而不是等某个用户拿着 0.60 报告"启动失败但配置明明合法"。
 
@@ -1550,10 +1559,10 @@ CI 矩阵：Linux（Python 3.11 / 3.12 / 3.13 / 3.14），容器内跑全部七�
 | **M0** 骨架与事实冻结 | 包结构、错误与退出码映射、`tests/test_facts.py`、CI | 0.5 天 |
 | **M1** 生命周期 | `install` / `start` / `stop` / `restart` / `status` / `log`，含锁、身份校验、启动早退检测 | 2 天 |
 | **M2** 配置闭环 | tomlkit 无损补丁、verify 预检、原子写、备份历史、`config` 子命令、自动回滚 | 1.5 天 |
-| **M3** 运维面 | `doctor`（含安全 lint）、`service install`、systemd 委托、`kick` | 1 天 |
+| **M3** 运维面 | `doctor`（含安全 lint）、`service install`、systemd 委托、`kick`（**历史规划**：`kick` 基于对 API 的误读已删除，见 §18.6；当前由 `prune` 取代） | 1 天 |
 | **M4** 硬化与文档 | 契约测试、集成测试、SSH 断开冒烟、README 与手册 | 1 天 |
 | **合计** | 可上生产的 MVP | **约 6 天** |
-| **M5** 插件（独立阶段） | FastAPI 插件服务 + 多用户 / 配额 / 审计 + 进程守护 | 视需求 |
+| **M5** 插件（独立阶段） | FastAPI 插件服务 + 多用户 / 配额 / 审计 + 进程守护（**历史规划**：实现改用标准库 `ThreadingHTTPServer`，FastAPI 只是 §11.3 的示意代码；见 §11.2.2） | 视需求 |
 
 工作量分布说明：命令骨架本身只占约 1 天，**其余成本在进程生命周期边界、配置无损往返、失败回滚与真机验证**——这些正是决定"能不能上生产"的部分。M5 与 MVP 解耦，因为它是独立进程、独立风险面（§11.2）。
 
@@ -1691,8 +1700,8 @@ review 的结论是"异常路径是盲区"，因此补了**故障注入层**（�
 |------|------------------|---------|-----------------|--------|------|
 | `< 0.52` | 不存在 | — | 无 | 无 | 拒绝（配置体系换代） |
 | `0.52.x` | **不存在** | — | 无 | 无 | **拒绝**（无键名护栏） |
-| `0.53.0 – 0.65.x` | 有 | **false** | 无 | 无 | 允许 + WARNING |
-| `0.66.0 – 0.69.x` | 有 | true | 有 | 无 | 允许 + WARNING |
+| `0.53.0 – 0.65.x` | 有 | **false** | 无 | 无 | 允许 + WARNING（**已被 §16.2.1 取代**：门槛上收后一律拒绝） |
+| `0.66.0 – 0.69.x` | 有 | true | 有 | 无 | 允许 + WARNING（**已被 §16.2.1 取代**：门槛上收后一律拒绝） |
 | `>= 0.70.0` | 有 | true | 有 | **有** | 完全支持 |
 
 **三个直接后果**（均已写入设计）：
@@ -1768,7 +1777,7 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 > 本节记录 M5 之前的实现验证；M5 之后的全量回归 review 见 §15.5。
 >
 > ⚠️ 本章各小节里的用例数（226 / 277 / …）是**当时**的快照，用于记录每轮增量；
-> 当前总数以 CHANGELOG 最新条目为准（v0.2.6 起为 632 条）。
+> 当前总数以 CHANGELOG 最新条目为准（v0.3.0 起为 735 条；非契约 705 条）。
 
 本章记录实现过程中**文档被现实修正**的地方，以及只有真机测试才能照出来的问题。
 它的用途是：下次改这块代码的人，不必重新踩一遍。
@@ -1777,7 +1786,7 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 
 | 项 | 状态 |
 |----|------|
-| 代码 | `src/frpsctl/`（core 16 模块 + `plugin/` 6 模块 + CLI 3 模块） |
+| 代码 | `src/frpsctl/`：core 19 模块（含 `web_audit.py`）+ `plugin/` 6 + `web/` 5（api/auth/cache/metrics/server）+ CLI（app/runtime/ui + `commands/` 7 个命令模块）+ 顶层共享（report/capabilities/env/docs）（v0.3.0 现状） |
 | 测试 | **226 个用例**；单元 / 集成 / CLI / 契约 / **故障注入** 五层（§17.6 后，含 4 条真 frpc 契约）。最新一轮的数字（277 条）见 §17.7 |
 | 覆盖率 | **81%**（`pytest --cov`；剩余未覆盖集中在渲染分支与需 root/网络的路径） |
 | 真机验证（M0–M4） | frps **0.71.0** 全链路冒烟通过：`init → verify → start → status → config set（自动重启）→ doctor → config rollback → stop` |
@@ -2499,6 +2508,8 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 | GET | `/api/config/history/{steps}/diff` | 某快照 vs 当前配置的**打码 diff**（回滚前的"看差异"；与 `config diff --steps` 同一实现） |
 | GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`） |
 | GET | `/favicon.ico` | 204（页面内嵌 data URI 图标；这条是给旧工具收尾的） |
+| GET | `/metrics` | Prometheus 文本（v0.3.0；`--metrics` 开启后才存在）：实例状态 / 三层健康 / dashboard 统计；Basic auth（口令 = 管理台口令），5 秒服务端缓存 |
+| GET | `/api/audit?scope=web` | Web 操作审计（v0.3.0）：登录与变更动作的来源 / 会话指纹 / 结果；`scope` 缺省为 `plugin`（兼容），非法值 400 |
 | POST | `/api/config/preview` | 多键变更（`changes`）+ 删除键（`unsets`）→ 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
 | POST | `/api/config/apply` | 按 `preview_id` 应用（含删除）；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
 | POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口（数值参数做范围校验，越界/布尔一律 400） |
@@ -2561,7 +2572,7 @@ Web 端到端测试（真 frps + frpc）第一次调用"下线代理"就暴露�
 | CSP 去 `'unsafe-inline'`（nonce 化） | 暂不做：单文件内联脚本需要服务端渲染时注入 nonce，收益是纵深防御（当前无任何注入点），成本是前端从"静态文件直发"变成"每请求改写"。已记账，等有真实动机再动 |
 | 配置表单的结构化数组编辑器 | 暂不做：`allowPorts` 这类数组目前按 JSON 文本编辑（有 `parse_scalar` 兜底与预览 diff 兜底）；等实际使用中确认痛点再设计 |
 
-### 18.8 发布前回归 review（第八轮）
+### 18.8 发布前回归 review（v0.2.2；"第八轮"是当时的序号，与 §21 的第八轮迭代同名——以版本号为准）
 
 对抗性复现（浏览器刷新场景、TOML datetime、全路由认证扫描、单代理故障注入）
 发现 **4 个真实缺陷**，全部修复并补 **21 条测试**（410 → 431）：
@@ -2971,6 +2982,110 @@ tail` 复用同一实现。
   `web serve` 全链路（真进程 → 登录 → SIGTERM 退出码 0）。
 - 文档一致性守卫同步扩展：README 命令表、§7.2 命令表（含审计/策略编辑/口令
   轮换）、§18.2 API 表（doctor / audit / traffic 明细）。
+
+---
+
+## 23. 第十轮迭代（v0.3.0：内核重构与传输层升级）
+
+v0.2.x 六轮迭代把功能面铺满（61 条命令路径、8 组 API、644 条测试）之后，最大的
+问题不再是"缺什么"，而是**三个巨文件与四处双份实现**。v0.3.0 是一次 minor 级
+内核重构：用户可见契约零变化（命令路径 / 选项 / 退出码 / JSON 字段 / HTTP
+状态码逐项锁定），但为后续所有功能迭代移除结构性阻力。
+
+### 23.1 CLI 内核：拆包 + 装配点 + 表示层单点
+
+| 项 | 之前 | 之后 |
+|----|------|------|
+| 命令实现 | `cli/__init__.py` 单文件 3253 行 | `cli/app.py`（Typer 组装 + 全局回调）+ `cli/runtime.py`（共享依赖装配）+ `cli/commands/{install,lifecycle,config,service,observe,plugin,web}.py`（按域拆分，最大 892 行）|
+| 兼容 | — | `cli/__init__.py` 保留 shim：re-export 全部历史符号（一个版本周期后收敛），旧 import 与旧 patch 目标平滑过渡 |
+| 共享依赖 | 各命令函数内直接构造（`_ctx` / `_lifecycle` / `_admin` / `_policy_path` / `_frpsctl_executable` / 值输入通道 / 跟随工具） | 全部集中 `cli/runtime.py`，命令模块以**模块对象**访问（`runtime._ctx(ctx)`）——测试替换 runtime 符号对所有命令一致生效，不会因 `from` 导入复制引用而静默失效 |
+| 响应形状 | CLI 与 Web 各拼一遍（`_status_payload` / `web.api.status_payload` / 两处 doctor / 两处 health / 两处 start） | `frpsctl/report.py`（与 core/cli/web 平级的纯表示层）：status / start / health / doctor / audit 单点生成；CLI 与 Web 的差异用参数表达（`include_paths` / `dashboard`） |
+| 命令契约 | 无显式守卫 | `tests/test_contract_snapshot.py` + `tests/snapshots/cli_commands.json`：**56 条路径 / 180 个参数**逐字节恒等（重构期间任何漂移立刻红） |
+
+**为什么"模块对象访问"是根治**：`from x import f` 复制引用，`patch("x.f")` 不会
+影响已经拿到引用的调用点——这正是 v0.2.6 测试被 CI 抓到"注入从未生效"的同一
+类缺陷。装配点集中 + 模块对象调用把"测试替换依赖"变成一个稳定契约。
+
+### 23.2 Web 传输层：条件请求 + 分层缓存 + 有界并发
+
+| 项 | 内容 |
+|----|------|
+| ETag/304 | 已认证 GET 带内容 ETag + `Cache-Control: no-cache`（浏览器自动 `If-None-Match`，未变即 304 零 body）；写响应 / 错误 / 登录 / `/api/session` 一律 `no-store` |
+| 服务端缓存 | `web/cache.py` 的 `TTLCache`：traffic 30s / clients·proxies 2s / logs 1s（按行数分键）；**写操作显式失效**（action / config apply 前清空）——浏览器 5 秒轮询在空转时的 dashboard 查询数降为 0 |
+| 有界并发 | `_BoundedThreadingHTTPServer`：worker 上限（默认 32）用尽时 503 + 断开（收口"管理台不限制并发连接数"的旧边界） |
+| CSP nonce | `<script>` / `<style>` 每请求 nonce、去掉 `'unsafe-inline'`、内联 style 属性全部改工具类；追加 `base-uri 'none'; form-action 'none'; frame-ancestors 'none'` |
+| `/metrics` | Prometheus 文本（实例状态 / 三层健康 / dashboard 统计），Basic auth（用户名任意、口令 = 管理台口令），5 秒缓存，默认关闭（`--metrics` 开启，可写入 unit） |
+| 操作审计 | `core/web_audit.py`（JSONL，同步写但失败不阻断）：变更动作与登录留痕（来源 / 会话指纹 / 结果 / 标量参数）；失败登录审计限速（每来源每分钟一条）；读侧 `GET /api/audit?scope=web` 与 `web audit tail|stats`；前端审计视图双 tab |
+
+### 23.3 优化增强
+
+- **owner 探测缓存**：`Lifecycle.resolve_owner` 实例级 2s TTL + `state.json`
+  `(mtime_ns, size)` 戳失效；Web 复用进程级 `Lifecycle`（`WebContext.lifecycle()`）
+  ——watch / 轮询下 systemctl 子进程数大幅下降，而变更动作（start/stop）仍
+  立刻可见（戳变化或显式清缓存）。
+- **`config apply`**：CLI 多键一次事务（`--set` 可重复 / `--unset` / `--dry-run`），
+  复用 `apply_sets`——与 Web 配置表单同语义（一份快照、一次重启）。
+- **审计轮转**：写侧（插件后台线程 / Web 同步写）超过阈值轮转 `path` → `.1`
+  → `.2`；读侧 tail/stats 跨文件合并；策略新增 `audit.max_mb`（0 = 不轮转）。
+- **前端逻辑分层**：审计渲染的数据变换提为纯函数（`pluginAuditStatsItems` /
+  `pluginAuditNotes` / `webAuditStatsItems` / `webAuditNotes` / `webAuditRows`），
+  node 动态断言覆盖扩至 6 个函数。
+- **补全与映射**：`config get/set/unset` 配置键补全、`plugin user remove`
+  用户名补全、`plugin config set` 字段补全（全部零副作用）；`ExitCode → HTTP`
+  改为表驱动单点（新增退出码忘记补映射会落到 500 而非被静默归类）。
+- **`capabilities`**：能力清单从代码派生（命令树 / `ExitCode` / `env.py`），
+  供脚本与文档消费。
+- **OIDC**：`auth.method = "oidc"` 的配置完整性校验（issuer/audience 必填）
+  与 doctor 提示（缺项 ERROR、残留 token WARN）；协议本身仍由 frps 实现。
+- **`--binary` 门槛**：补齐"第二条入口"的测试（§8.4 要求 install 与
+  `--binary` 两条入口都做版本检查）。
+
+### 23.4 代码即文档
+
+- `frpsctl/docs.py`：README 的三张表与代码**双向对账**——命令（`capabilities`
+  派生的每条命令必须能在 README 找到）、退出码（README 表与 `ExitCode` 枚举
+  完全一致）、环境变量（`env.ENV_VARS` 的每个变量必须出现；README 表里出现的
+  每个变量必须有定义）。CI 由 `test_docs.py` 调用；本地可
+  `python -m frpsctl.docs check`。
+- `frpsctl/env.py`：14 个环境变量的单点定义（此前散落在 8 个模块）。
+- 历史漂移修复包（13 处）：测试数字、§13.1 契约清单（补 C9/C10）、§14
+  里程碑回填标注、§16.2 旧矩阵"已被 §16.2.1 取代"标注、§12.1 引用修正、
+  §11.3 与 §11.2.4 的"并发连接上限"矛盾标注、§17.1 模块计数更新、轮次编号
+  注记、ADR-4 历史理由标注、§13 分层表述、README 版本示例等。
+
+### 23.5 量化验证（实测计数，非估算）
+
+| 场景 | 无缓存对照 | 当前实现 | 结果 |
+|------|-----------|---------|------|
+| 浏览器 5 秒轮询 30 秒（clients + proxies + traffic，50 代理） | 318 次 dashboard 请求 | **57 次** | 降幅 **82%**（方案目标 ≥80%） |
+| 同一聚合查询的第二次响应（ETag 命中） | 完整 JSON（含 50+ 代理逐日明细可达数百 KB） | **304，0 字节 body** | 响应体归零 |
+| `resolve_owner` 连续 3 次（TTL 内） | 3 次 systemctl 探测 | **1 次** | 子进程降 2/3 |
+
+**量化验证抓出的设计错误（已修）**：列表缓存最初定 2 秒，而浏览器轮询间隔
+是 5 秒——TTL **小于**轮询间隔时命中率≈0，等于没有缓存（实测确认）。改为
+6 秒后轮询几乎每轮命中，而"改完立刻可见"由写操作显式失效保证。
+
+### 23.6 实施调整（与 §23.1–23.4 计划的差异及理由）
+
+| 计划项 | 实施结果 | 理由 |
+|--------|---------|------|
+| `cli/render.py` 的 Output 对象（可注入 stdout/stderr） | **未做**，保留 `ui.py` | 测试基建已通过替换 `sys.stdout` 完成注入；额外抽象没有第二个使用者，会成为死代码（本项目 0.2.6 刚清理过死代码）。等出现真实的多输出目标需求再引入 |
+| 48 处 `--json` 选项样板由装饰器自动注入 | **未做**，保留手写选项 | Typer 装饰器魔术会改变帮助文本生成路径，风险中而收益只是删重复声明；命令面快照已把选项契约锁死，样板不构成维护风险 |
+| P0-4 文档回路用"生成标记包裹 + 生成器改写" | 改为**双向对账检查**（`docs.py`） | 生成标记会把 README 的富格式（分类、典型触发）压成机器表；对账在保留人工表达的同时同样保证"漂移=CI 红" |
+| P1-3 审计轮转"按天/大小" | 两者都做（按天为缺口，补齐） | `audit.max_days` 与 `audit.max_mb` 两维独立 |
+| P1-4 前端 `buildClientRows` / `buildProxyRows` | 补齐（`clientRows` / `proxyRows` + node 断言） | 漏项，已补 |
+| 验收标准"JSON 形状快照" | 补齐为 `tests/test_report.py` 的**完整键集基线** | 形状由 `report.py` 单点生成——在单点锁键集，CLI 与 Web 同时受保护 |
+
+### 23.7 测试与验收
+
+- **新增 91 条**（644 → 735；非契约 614 → 705）：契约快照（7）、CLI 盲区补齐
+  （service install/uninstall、plugin serve e2e、log -f 实时性、rollback 成功
+  路径、init --force、uninstall --all、`--binary` 门槛）、ETag/304 语义与缓存
+  失效、操作审计（成功/失败/登录/限速/scope）、CSP nonce、/metrics（404/401/
+  200）、有界并发 503、审计轮转与跨文件读取、config apply、补全、capabilities、
+  OIDC、前端纯函数扩展。
+- 重构期间的"零变化"由三张网共同保证：命令面快照（参数逐字节）、既有 644 条
+  行为断言（全部保留）、报告层统一后的字段级断言。
 
 ---
 

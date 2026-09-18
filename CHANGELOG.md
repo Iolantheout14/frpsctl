@@ -3,6 +3,123 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-09-18
+
+**内核重构与传输层升级**。用户可见契约零变化（命令路径 / 选项 / 退出码 /
+JSON 字段 / HTTP 状态码），但为后续所有功能迭代移除结构性阻力：CLI 从
+3253 行单文件拆成命令包、Web 从"每 5 秒全量重算"升级为条件请求 + 分层缓存、
+文档三表（命令 / 退出码 / 环境变量）改为与代码对账。新增 91 条测试
+（644 → 735；非契约 614 → 705）。
+
+### 新增
+
+**CLI**
+
+- `config apply --set K=V（可重复）--unset K（可重复）[--dry-run]`：**多键**
+  变更——一次提交 → 一份快照 → 一次重启（与 Web 配置表单同语义，复用
+  `apply_sets`）。此前 CLI 只能逐键 `config set`，多键就是多次重启。
+- `capabilities [--json]`：能力清单（命令树 / 退出码 / 环境变量 / 版本门槛），
+  **从代码派生**（Typer app、`ExitCode`、`env.ENV_VARS`）——脚本与文档生成
+  消费同一份数据。
+- `web audit tail|stats`：Web 操作审计的只读面（见下）；`--since` 与插件审计
+  同语义。
+- `config get/set/unset <TAB>` 与 `plugin user remove <TAB>` / `plugin config
+  set <TAB>`：动态键名/用户名补全（零副作用，失败即空）。
+- `web serve --metrics` / `web service install --metrics`：Prometheus 文本
+  `/metrics`（实例状态 / 三层健康 / dashboard 统计；Basic auth：用户名任意、
+  口令 = 管理台口令；服务端 5 秒缓存）。
+- OIDC 配置支持：`auth.method = "oidc"` 时校验 `auth.oidc.issuer` /
+  `audience` 完整性（schema 层拒绝缺项）；`doctor` 把缺项报 ERROR、把
+  `method = oidc` 下残留的 `token` 报 WARN。OIDC 协议本身仍由 frps 实现。
+
+**Web 管理台**
+
+- **操作审计**（`core/web_audit.py`）：变更动作（start/stop/restart/prune/
+  rollback/config apply）与登录事件写入实例目录 `web-audit.jsonl`（来源 IP、
+  会话**指纹**、成功/失败、参数标量）；失败登录审计带限速（每来源每分钟一条，
+  防爆破刷爆）；审计视图新增 **Web 操作** tab；写失败绝不阻断动作但会告警。
+- **条件请求（ETag/304）**：已认证 GET 响应带内容 ETag + `Cache-Control:
+  no-cache`，浏览器自动携带 `If-None-Match`——"数据没变"时响应体为 0 字节。
+  写响应 / 错误 / 登录 / 会话响应一律 `no-store`。
+- **服务端 TTL 缓存**（`web/cache.py`，有界）：traffic 30s / clients·proxies
+  6s / logs 3s（按行数分键；TTL 必须 ≥ 轮询间隔才有意义），变更动作与配置
+  应用前**显式失效**——空转轮询不再每轮重放最多 50+ 次 dashboard 查询。
+- **有界并发**：请求 worker 上限（默认 32）用尽时立即 `503` 并断开，不再
+  无限堆线程（收口 README 旧边界"管理台不限制并发连接数"）。
+- **CSP nonce 化**：`<script>` / `<style>` 每请求注入 nonce，CSP 去掉
+  `'unsafe-inline'`（并加 `base-uri`/`form-action`/`frame-ancestors` 限制）；
+  全部内联 style 属性改为工具类——这是纵深防御：注入面本已为零，现在出口
+  也被封死。
+
+**性能 / 可靠性**
+
+- **owner 探测缓存**：`Lifecycle.resolve_owner` 实例级 2s TTL + `state.json`
+  戳失效——`status --watch` 与 Web 轮询不再每轮 fork 两个 `systemctl`
+  （变更动作会显式清缓存，缓存也不可能掩盖刚发生的所有权变化）。
+- **审计轮转**：插件与 Web 审计文件超过**大小**（`audit.max_mb`）或**年龄**
+  （`audit.max_days`，与 frp 日志 maxDays 同语义）自动轮转（`path` → `.1` →
+  `.2`，保留 2 份；两维独立、0 = 禁用），失败安全降级；读取侧（tail/stats）
+  跨轮转文件合并——审计不再无限增长。
+
+**文档 / 工程**
+
+- `frpsctl/docs.py`：命令 / 退出码 / 环境变量三表与 README 的**双向对账**
+  （CI 守卫 + `python -m frpsctl.docs check`）；`env.py` 集中定义 14 个环境
+  变量。新增命令或变量忘记写文档 → CI 红。
+- 命令面**契约快照**（`tests/snapshots/cli_commands.json`，56 路径 / 180
+  参数）：重构期间用"逐字节恒等"锁住命令契约。
+
+### 变更
+
+- CLI 拆包：`cli/__init__.py`（3253 行）→ `cli/app.py`（Typer 组装）+
+  `cli/runtime.py`（共享依赖装配）+ `cli/commands/*`（按域 7 个模块，最大
+  892 行）；`cli/__init__.py` 保留兼容 shim（re-export 全部符号，一个版本
+  周期后收敛）。测试 patch 目标随之迁移（并统一到"patch 源头模块"）。
+- **表示层单点**（`frpsctl/report.py`）：CLI 与 Web 的 status / start /
+  health / doctor / audit 形状由同一份纯函数生成——消除 `_status_payload`
+  与 `web.api.status_payload` 等四处双份实现。`start` 的 health 因此统一
+  带上 `gate` / `plugin_warning`（向后兼容的增字段）。
+- `ExitCode → HTTP` 映射改为表驱动单点（新增退出码忘记补映射会落到 500）。
+- `--binary` 入口的版本门槛补齐测试（§8.4 要求 install 与 `--binary` 两条
+  入口都检查；此前只有下载路径有守卫）。
+- README：命令表 / Web 能力 / 已知边界 / 环境变量与代码对齐；文档漂移
+  修复包（13 处历史遗留）随设计文档更新一并落地。
+
+### 修复
+
+- **发布前回归 review 修复包（v0.3.0 review 实测）**：
+  - `/metrics` 的 Basic auth 失败**计入登录限速表**（此前它是绕开登录
+    限速的第二条口令爆破通道）；
+  - 非 ASCII 口令（中文/emoji）此前会让 `hmac.compare_digest` 抛
+    `TypeError`、登录线程断开——比较统一改为 encode 后常量时间比较；
+  - Web 审计的"轮转 + 追加"加写锁（并发动作下 rename 序列交错会丢归档）；
+  - 响应缓存加**条目上限**（日志按行数分键可被遍历放大内存）；
+  - `doctor` 对畸形 `auth.oidc`（非对象）不再崩溃、报 ERROR；
+  - `plugin config list` 对老策略缺失的 `audit.max_mb`/`audit.max_days`
+    显示数值默认值（此前显示成布尔 `true`）；
+  - `config set` 的 noop 分支对敏感键打码（§10 硬约束 2）；
+  - 每响应关闭连接并显式声明 `Connection: close`（worker 槽位按**请求**
+    占用，少数标签页的 keep-alive 不再可能占满并发额度；空闲读超时 30 → 5
+    秒；`send_error` 路径的重复头已去重）+ 连接类异常不再打 traceback；
+  - `serve_forever` 不再对同一 httpd 二次启动事件循环（start 已在后台服务）；
+  - `plugin/web audit tail -f` 在审计文件尚不存在时等待出现（非跟随模式
+    仍给出可行动错误）；
+  - `read_tail` 的坏行不再吃掉配额（跨轮转追溯按成功记录数）；
+  - `status --watch` 复用同一 Lifecycle（owner 探测缓存真正命中）；
+  - `capabilities` 的 frps 门槛从 `core/version` 派生（不再手写漂移）；
+  - 列表缓存 TTL 修正**（量化验证发现）**：clients/proxies 的 TTL 原定 2 秒，
+  而浏览器轮询间隔 5 秒——TTL 小于轮询间隔时命中率≈0，等于没有缓存。改为
+  6 秒后轮询几乎每轮命中（写操作显式失效保证"改完立刻可见"）。实测：
+  30 秒空转的 dashboard 请求从 318 降到 57（降幅 82%）。
+- 前端逻辑分层：审计渲染与列表行的纯数据变换（`clientRows` / `proxyRows` /
+  审计统计项 / 备注 / 行变换）提为纯函数，node 动态断言从 3 个扩展到 8 个
+  ——"语法正确、逻辑错误"的白屏风险继续收窄。
+- **响应形状基线**：`tests/test_report.py` 对 `report.py` 的全部形状（status
+  两分支 / start / health / doctor / audit）做**完整键集**断言——CLI 与 Web
+  共用同一单点，形状漂移（漏键/改名）在两处同时被抓住。
+- 命令面文档：`capabilities` / `config apply` / `web audit` 等新命令全部进入
+  README 与设计文档 §7.2，由对账守卫防回退。
+
 ## [0.2.6] - 2026-09-17
 
 把 core 已经实现、但用户面看不到的能力**全部呈现**出来（审计 / 体检 / enabled /

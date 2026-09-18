@@ -83,12 +83,12 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 |------|------|
 | 二进制与配置 | `install` / `init` / `verify` |
 | 生命周期 | `start` / `stop` / `restart` / `status` / `log` |
-| 配置子命令 | `config get` / `set` / `unset` / `edit` / `list` / `diff` / `rollback`（`set` 支持 `--dry-run` / `--stdin` / `--prompt`） |
-| 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` |
+| 配置子命令 | `config get` / `set` / `apply`（多键一次事务） / `unset` / `edit` / `list` / `diff` / `rollback`（`set` 支持 `--dry-run` / `--stdin` / `--prompt`） |
+| 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` / `capabilities`（能力清单） |
 | 卸载 | `uninstall`（`--all` / `--keep-data` / `--keep-bin` / `--force`） |
 | systemd 集成 | `service install` / `uninstall` / `status` / `logs` |
 | 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin audit tail|stats`、`plugin config list|set`、`plugin service install|uninstall|start|stop|restart|status` |
-| Web 管理台 | `web serve`、`web service install|uninstall|start|stop|restart|status`、`web password show|set` |
+| Web 管理台 | `web serve`（可选 `--metrics`）、`web service install|uninstall|start|stop|restart|status`、`web password show|set`、`web audit tail|stats` |
 
 **Web 管理台**——浏览器中的同等能力（`web serve` 启动，默认只绑回环）：
 
@@ -97,10 +97,13 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 | 仪表盘 | 实例状态 / 三层健康 / 概览统计 / 近 7 天流量图（按需下钻单代理）/ 会话内实时速率曲线 / 客户端与代理列表（可展开代理曲线）/ 日志（跟随与暂停、行数可选）/ **系统体检**（只读 doctor，按钮触发） |
 | 配置 | 逐字段表单（敏感值打码提示）→ 预览 diff（+绿/−红）→ 应用（一次事务、一次重启）→ 失败自动回滚；可删除键、可新增键 |
 | 历史 | 快照列表，**先看差异再回滚** |
-| 审计 | 插件审计只读视图：统计（允许 / 拒绝 / 限速抑制 / 坏行）+ 按用户与按操作分布 + 最近记录；策略缺失或关闭时说明原因而不报错 |
+| 审计 | **双视图**：插件审计（统计 / 按用户与按操作分布 / 最近记录）与 **Web 操作**（谁在什么时候改配置 / 停服务，登录与变更动作留痕、来源与结果）；策略缺失或关闭时说明原因而不报错 |
 | 配置编辑增强 | 键名搜索过滤；数组/内联表值即时校验；有未保存修改时离页确认 |
 | 进程 | 启动 / 重启 / 停止 / 清理离线记录（返回清理条数；操作期间按钮禁用、状态徽章显示"操作中…"） |
 | 主题 | 明暗双主题：跟随系统（可实时变化）或手动切换 |
+| 传输优化 | 条件请求（ETag/304：数据未变时响应体为 0 字节）+ 服务端分层缓存；变更操作后立即失效 |
+| 并发护栏 | 请求线程有界（默认 32），超限快速 503——慢 dashboard 下不会无限堆线程 |
+| 监控 | `web serve --metrics` 暴露 Prometheus 文本（实例状态 / 健康 / dashboard 统计；Basic auth） |
 
 ### 一条硬边界
 
@@ -191,7 +194,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.2.5
+ ✓ 命令可用：frpsctl 0.3.0
 
 frpsctl 安装完成
 ```
@@ -290,7 +293,7 @@ frpsctl install --with-frpc        # frps + frpc
 ### 验证安装
 
 ```bash
-frpsctl --version                  # frpsctl 0.2.5
+frpsctl --version                  # frpsctl 0.3.0
 frpsctl install                    # 下载 frps 二进制
 frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
@@ -658,6 +661,26 @@ $ frpsctl config set webServer.addr '"0.0.0.0"'   # 这一步会让它变成完�
 反向也成立：**只要口令非空，绑非回环是允许的**（远程看 dashboard 是常见需求，
 此时有 Basic Auth 保护）。拦截的是"无鉴权 + 对外暴露"这个组合本身。
 
+### 教程 3.5：一次改多个键（config apply）
+
+```bash
+frpsctl config apply --set maxPortsPerClient=30 --set bindPort=7001 --unset log.maxDays
+frpsctl config apply --set transport.tls.force=true --dry-run   # 只校验 + 看 diff
+```
+
+与 `config set` 的差别只在"一次改几个键"：所有键（赋值与删除）作用在**同一份
+文档**上，只产生一份快照、一次重启——拆成多条 `config set` 会重启多次，中间
+那次还可能撞上危险组合检查。Web 配置表单走的就是同一条路径。
+
+### 教程 3.6：能力自查（capabilities）
+
+```bash
+frpsctl capabilities --json | jq '.commands | length'   # 56
+frpsctl capabilities                                     # 人读：命令/退出码/环境变量
+```
+
+清单**从代码派生**（命令树、`ExitCode`、`env.py`）——它是什么，这里就有什么。
+
 ### 教程 4：看日志
 
 ```bash
@@ -750,6 +773,18 @@ frpsctl prune               # 清理 dashboard 统计里的离线代理记录
 从未真正工作过，已由 `prune` 取代。
 
 ---
+
+### 教程 8：看谁操作过管理台（web audit）
+
+```bash
+frpsctl web audit stats --since 7d     # 登录与变更动作的统计（按动作/来源）
+frpsctl web audit tail -n 20           # 最近 20 条（谁、从哪来、成没成）
+frpsctl web audit tail -f              # 实时跟随
+```
+
+登录成功与失败、start/stop/restart/prune/rollback/config apply 都会留痕
+（来源 IP + 会话指纹，不落任何凭据）。Web 管理台"审计"页有对应的 **Web 操作**
+标签页。
 
 ## Web 管理台教程
 
@@ -1219,6 +1254,16 @@ esac
 全局选项见 [上文](#全局选项与命令总览)。凭据优先级：
 `--admin-password` > `FRPSCTL_ADMIN_PASSWORD` > 配置文件里的 `webServer.password`。
 
+### Web 管理台的纵深防御（v0.3.0）
+
+| 机制 | 说明 |
+|------|------|
+| CSP nonce | 前端脚本/样式每请求 nonce，无 `'unsafe-inline'`；追加 `base-uri` / `form-action` / `frame-ancestors` 限制 |
+| 条件请求 | 已认证 GET 才参与 ETag/304；写响应、错误、登录与 `/api/session` 一律 `no-store` |
+| 操作审计 | 登录与变更动作写入实例目录 `web-audit.jsonl`（来源 IP + 会话**指纹**，不落 token）；失败登录审计限速，防爆破刷爆 |
+| 并发护栏 | 请求线程有界 + `503`，慢后端不堆积线程 |
+| `/metrics` | 默认关闭；开启后需 Basic auth（口令 = 管理台口令） |
+
 ### 目录布局
 
 ```
@@ -1413,8 +1458,8 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 644 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（614 条）
+.venv/bin/pytest                       # 全部 735 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（705 条）
 .venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 85%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
@@ -1423,7 +1468,7 @@ CI（Linux，Python 3.11/3.12/3.13/3.14）还包含：ruff、覆盖率门禁、�
 契约层、**真 frp 0.70.0 下界契约矩阵**、无二进制降级路径、端到端冒烟与
 Web 管理台冒烟（含配置差异接口）、**前端静态守卫**（逐 `<script>` 块
 `node --check` + 禁 innerHTML/外部资源 + JS 与 HTML 的 id 双向核对）、
-**文档一致性守卫**（README/设计文档/API 表 vs 代码的交叉核对）。
+**文档一致性守卫**（README/设计文档/API 表 vs 代码的交叉核对；命令/退出码/环境变量三表由 `python -m frpsctl.docs check` 与代码双向对账）。
 
 ### 测试分七层
 
@@ -1474,10 +1519,12 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **`max_proxies` 计数需配 `admin_url`** | 不配时只在插件进程内计数（重启归零、多实例各算各的），`plugin check` 会告警 |
 | **frps 没有热重载** | 改配置必然重启，因此 `config set` 的设计目标就是"失败了要能退回去" |
 | **systemd 模式下 pid 文件不参与判定** | 所有权委托 systemctl；`install` 换版本后需 `systemctl restart` |
-| **Web 管理台不限制并发连接数** | 单机管理工具的取舍（请求线程随连接创建，监听 backlog 64）；公网暴露请在前置反代上做限流 |
+| **Web 管理台并发有界** | 请求线程上限默认 32，超限直接 `503`（v0.3.0 起；此前无限排队）。单机工具不面向高并发，公网暴露仍建议前置反代限流 |
 | **`--trusted-proxy` 只信 X-Forwarded-For 的最后一跳** | 前提是前面确实有一层会重写该头的可信代理；直连部署不要开启 |
 | **Web 无 WebSocket/SSE 推送** | 5 秒轮询足够，且省掉长连接的生命周期管理 |
-| **Web 不做 DOM 级前端测试框架** | 引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产；语法与静态纪律由 CI 守卫，UI 分支仍靠人工点验（残余风险已记账） |
+| **Web 不做 DOM 级前端测试框架** | 引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产；语法与静态纪律由 CI 守卫，纯函数由 node 动态断言（v0.3.0 覆盖审计渲染等 6 个），DOM 分支仍靠人工点验（残余风险已记账） |
+| **不实现 OIDC 协议** | `auth.method = "oidc"` 的配置完整性与 doctor 提示已支持（v0.3.0）；OIDC 协议本身由 frps 实现——本工具绝不重新实现 frp 已有能力 |
+| **一个 Web 进程服务一个实例** | 多实例请起多个 `web serve`（`--instance` 区分）；管理台不做实例切换器 |
 | **一个 web 进程服务一个实例** | 多实例请起多个 `web serve`（各自 `--instance`） |
 
 ---
