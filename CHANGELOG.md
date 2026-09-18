@@ -88,13 +88,16 @@ JSON 字段 / HTTP 状态码），但为后续所有功能迭代移除结构性�
 ### 修复
 
 - **发布前回归 review 修复包（v0.3.0 review 实测）**：
-  - `/metrics` 的 Basic auth 失败**计入登录限速表**（此前它是绕开登录
-    限速的第二条口令爆破通道）；
+  - `/metrics` 的 Basic auth 失败**计入登录限速表且与登录共用来源解析**
+    （此前它是绕开登录限速的第二条口令爆破通道；`--trusted-proxy` 部署下
+    两条桶还必须按同一 XFF 最后一跳，否则通道重新分裂）；
   - 非 ASCII 口令（中文/emoji）此前会让 `hmac.compare_digest` 抛
     `TypeError`、登录线程断开——比较统一改为 encode 后常量时间比较；
+    HTTP JSON 可构造的 lone surrogate（U+D800 单独出现）同样不再触发
+    `UnicodeEncodeError`（surrogatepass 编码后比较）；
   - Web 审计的"轮转 + 追加"加写锁（并发动作下 rename 序列交错会丢归档）；
   - 响应缓存加**条目上限**（日志按行数分键可被遍历放大内存）；
-  - `doctor` 对畸形 `auth.oidc`（非对象）不再崩溃、报 ERROR；
+  - `doctor` 对畸形 `auth`（非表）与 `auth.oidc`（非对象）不再崩溃、报 ERROR；
   - `plugin config list` 对老策略缺失的 `audit.max_mb`/`audit.max_days`
     显示数值默认值（此前显示成布尔 `true`）；
   - `config set` 的 noop 分支对敏感键打码（§10 硬约束 2）；
