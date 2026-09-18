@@ -163,6 +163,10 @@ class AuditSettings:
     flush_every: int = 32
     #: 距上次刷盘多少秒后强制刷盘（即使没攒够）。
     flush_interval: float = 2.0
+    #: 审计文件轮转阈值（MB）；0 = 不按大小轮转（不推荐：文件会无限增长）。
+    max_mb: float = 10.0
+    #: 审计文件轮转年龄（天）；0 = 不按天轮转。与 frp 日志的 maxDays 同语义。
+    max_days: float = 7.0
 
     @classmethod
     def parse(cls, raw: dict[str, Any] | None) -> AuditSettings:
@@ -179,6 +183,8 @@ class AuditSettings:
             enabled=_strict_bool(raw, "enabled", True),
             flush_every=_strict_int(raw, "flush_every", 32, minimum=1),
             flush_interval=_strict_float(raw, "flush_interval", 2.0, minimum=0.1),
+            max_mb=_strict_float(raw, "max_mb", 10.0, minimum=0.0),
+            max_days=_strict_float(raw, "max_days", 7.0, minimum=0.0),
         )
 
 

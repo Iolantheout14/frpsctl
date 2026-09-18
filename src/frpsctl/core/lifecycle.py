@@ -66,6 +66,12 @@ STOP_TIMEOUT = 10.0
 #: SIGKILL 之后的等待上限。
 KILL_TIMEOUT = 5.0
 
+#: owner 探测的实例级缓存时间（秒）。systemd 探测是一轮 2 个子进程
+#: （`systemctl cat` + `is-active`）；`status --watch` 与 Web 5 秒轮询下，
+#: 每次探测 5-10ms 的子进程开销累积起来毫无意义——状态变化的秒级滞后
+#: 对展示完全可接受，而发生变更（start/stop/restart）时缓存会被显式清掉。
+OWNER_CACHE_TTL = 2.0
+
 
 class Owner(enum.Enum):
     NONE = "none"
@@ -197,6 +203,10 @@ class Lifecycle:
     def __init__(self, inst: Instance, *, binary: Path | None = None) -> None:
         self.inst = inst
         self._explicit_binary = binary
+        #: `(探测时刻, owner, state.json 戳)`；变更方法会显式清空
+        #: （见 `_invalidate_owner`），戳变化（start 写入 / stop 删除）也会
+        #: 让缓存自动失效——否则"刚 start 完的实例"会在 TTL 内被报成 NONE。
+        self._owner_cache: tuple[float, Owner, tuple[int, int] | None] | None = None
 
     # --- 二进制 --------------------------------------------------------
 
@@ -249,16 +259,49 @@ class Lifecycle:
             config=str(data.get("config") or ""),
         )
 
+    def _invalidate_owner(self) -> None:
+        """让下一次 `resolve_owner` 重新探测（所有变更动作后必须调用）。"""
+        self._owner_cache = None
+
     def resolve_owner(self) -> Owner:
-        """所有权探测（ADR-1）。systemd 优先——unit 存在即由它托管。"""
+        """所有权探测（ADR-1）。systemd 优先——unit 存在即由它托管。
+
+        实例级 TTL 缓存（`OWNER_CACHE_TTL`）：watch/轮询场景下复用同一
+        `Lifecycle` 实例即可显著减少 systemctl 子进程；**本类的变更方法
+        在返回前清缓存**，因此自己刚做过的动作不会被旧答案掩盖。
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        stamp = self._state_stamp()
+        if self._owner_cache is not None:
+            at, cached_owner, cached_stamp = self._owner_cache
+            if now - at <= OWNER_CACHE_TTL and stamp == cached_stamp:
+                return cached_owner
+
         from .systemd import Systemd
 
         systemd = Systemd(self.inst)
         if systemd.is_active():
-            return Owner.SYSTEMD
-        if self.inst.state.exists():
-            return Owner.DIRECT
-        return Owner.NONE
+            owner = Owner.SYSTEMD
+        elif self.inst.state.exists():
+            owner = Owner.DIRECT
+        else:
+            owner = Owner.NONE
+        self._owner_cache = (now, owner, stamp)
+        return owner
+
+    def _state_stamp(self) -> tuple[int, int] | None:
+        """state.json 的 `(mtime_ns, size)`；不存在为 None。
+
+        它是 owner 缓存的**失效依据**：start 写入 / stop 删除 / 陈旧清理都会
+        改变它，缓存因此不可能把"刚刚发生的所有权变化"藏起来。
+        """
+        try:
+            st = self.inst.state.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
 
     def state(self) -> tuple[State, ProcessRef | None]:
         """状态判定表（§8.3）。"""
@@ -363,6 +406,7 @@ class Lifecycle:
         `on_health_tick(elapsed, report)` 是健康等待期的进度回调：`core/` 不打印，
         由 CLI 决定怎么展示（`frpsctl start` 用它渲染逐轮进度）。
         """
+        self._invalidate_owner()
         self.inst.ensure_private()  # 状态与日志马上要落盘，先把目录收紧
         with instance_lock(self.inst.lock):
             if self.resolve_owner() is Owner.SYSTEMD:
@@ -610,6 +654,7 @@ class Lifecycle:
         SIGTERM → 轮询确认退出 → 超时 SIGKILL。身份不符则**拒绝**（退出码 11），
         因为那条路径上唯一能保证的就是"可能杀错进程"。
         """
+        self._invalidate_owner()
         with instance_lock(self.inst.lock):
             if self.resolve_owner() is Owner.SYSTEMD:
                 return self._stop_via_systemd()

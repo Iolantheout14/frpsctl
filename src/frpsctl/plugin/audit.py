@@ -89,10 +89,16 @@ class AuditLog:
         flush_every: int = 32,
         flush_interval: float = 2.0,
         max_buffer: int = 10_000,
+        max_bytes: int = 0,
+        max_age_seconds: float = 0,
         clock=time.monotonic,
     ) -> None:
         self.path = path
         self.enabled = enabled
+        #: 文件超过该大小或该年龄就轮转（`path` → `path.1`，保留 2 份）；
+        #: 0 = 该维度禁用（两个维度独立生效）。
+        self.max_bytes = max(0, max_bytes)
+        self.max_age_seconds = max(0.0, max_age_seconds)
         self.flush_every = max(1, flush_every)
         self.flush_interval = max(0.05, flush_interval)
         # 缓冲上限：磁盘长时间不可用时不至于把内存吃光。**溢出时丢最旧的**，
@@ -174,6 +180,15 @@ class AuditLog:
         # 会让 JSONL 的物理行序与裁决顺序不一致（实测小批插进大批中间），
         # 取证时会误导。不能复用 _lock——那样 record() 会被写盘阻塞。
         with self._io_lock:
+            # 轮转检查必须在写入前、且在同一把 I/O 锁内：并发 flush 不会
+            # 一个在写旧文件、另一个刚把它改名。
+            from ..core.auditlog import rotate_if_needed
+
+            rotate_if_needed(
+                self.path,
+                max_bytes=self.max_bytes,
+                max_age_seconds=self.max_age_seconds,
+            )
             try:
                 with open(self.path, "a", encoding="utf-8") as handle:
                     for item in pending:

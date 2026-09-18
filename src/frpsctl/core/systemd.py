@@ -227,6 +227,7 @@ def render_web_unit(
     allow_non_loopback: bool = False,
     trusted_proxy: bool = False,
     access_log: bool = False,
+    metrics: bool = False,
 ) -> str:
     """渲染 Web 管理台 unit 模板。
 
@@ -242,6 +243,8 @@ def render_web_unit(
         flags.append("--trusted-proxy")
     if access_log:
         flags.append("--access-log")
+    if metrics:
+        flags.append("--metrics")
     return WEB_UNIT_TEMPLATE.format(
         exec_start=exec_start,
         bind=bind,
@@ -914,6 +917,7 @@ class WebService:
         group: str | None = None,
         trusted_proxy: bool = False,
         access_log: bool = False,
+        metrics: bool = False,
     ) -> tuple[Path, str]:
         """安装 `frpsctl-web@.service` 并准备口令文件。**需要 root**。
 
@@ -983,6 +987,7 @@ class WebService:
             allow_non_loopback=not is_loopback(bind),
             trusted_proxy=trusted_proxy,
             access_log=access_log,
+            metrics=metrics,
         )
         self.unit_dir.mkdir(parents=True, exist_ok=True)
         self.template_path.write_text(content, "utf-8")

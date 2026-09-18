@@ -205,6 +205,15 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
             sys.stderr.write(f"[plugin] {message}\n")
             sys.stderr.flush()
 
+        def handle_error(self, request, client_address) -> None:  # noqa: ANN001, ARG002
+            """连接类异常静默：插件 stderr 是运维观察面，连接中断不是错误。"""
+            import sys as _sys
+
+            exc = _sys.exc_info()[1]
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                return
+            super().handle_error(request, client_address)
+
         def log_message(self, *args: object) -> None:
             """屏蔽默认的访问日志（它会把每个请求写两行到 stderr）。"""
             if settings.access_log:
@@ -238,6 +247,8 @@ class PluginServer:
                 enabled=policy.audit.enabled,
                 flush_every=policy.audit.flush_every,
                 flush_interval=policy.audit.flush_interval,
+                max_bytes=int(policy.audit.max_mb * 1024 * 1024),
+                max_age_seconds=policy.audit.max_days * 86400.0,
             )
         )
         self.engine = DecisionEngine(policy, self.audit)
@@ -284,7 +295,13 @@ class PluginServer:
         previous = signal.getsignal(signal.SIGTERM)
         try:
             signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
-            self._httpd.serve_forever()
+            # `start()` 已在后台线程服务：这里只等待（v0.3.0 review 修正——
+            # 此前对同一 httpd 二次 `serve_forever()`，两个 select 循环并存）。
+            while True:
+                thread = self._thread
+                if thread is None or not thread.is_alive():
+                    break
+                thread.join(timeout=0.5)
         finally:
             # 关闭只在这里发生（CLI 不再重复 close）。关完再把 KeyboardInterrupt
             # 放出去，让上层能打印审计摘要——若在这里 `except ...: pass`，上层那条

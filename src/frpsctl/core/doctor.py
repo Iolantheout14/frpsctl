@@ -335,9 +335,58 @@ def _check_hardening(inst: Instance) -> list[Finding]:
             )
         )
 
-    auth = data.get("auth") or {}
+    auth = data.get("auth")
+    if auth is not None and not isinstance(auth, dict):
+        out.append(
+            Finding(
+                "auth",
+                Severity.ERROR,
+                f"auth 必须是对象，实际是 {type(auth).__name__}",
+                "手工修正配置（[auth] 表写法）",
+            )
+        )
+        return out
+    auth = auth or {}
     if auth.get("method", "token") == "oidc":
-        out.append(Finding("auth.method", Severity.INFO, "使用 oidc（frpsctl 不管理其凭据）"))
+        oidc = auth.get("oidc")
+        if oidc is not None and not isinstance(oidc, dict):
+            out.append(
+                Finding(
+                    "auth.oidc",
+                    Severity.ERROR,
+                    f"auth.oidc 必须是对象，实际是 {type(oidc).__name__}",
+                    "修正配置（或用 `frpsctl plugin check` 之外的 `config edit` 手工改）",
+                )
+            )
+            return out
+        oidc = oidc or {}
+        missing = [key for key in ("issuer", "audience") if not oidc.get(key)]
+        if missing:
+            out.append(
+                Finding(
+                    "auth.oidc",
+                    Severity.ERROR,
+                    f"method = oidc 但缺少 {', '.join('auth.oidc.' + key for key in missing)}",
+                    "补全 OIDC 配置或改回 token 鉴权",
+                )
+            )
+        else:
+            out.append(
+                Finding(
+                    "auth.oidc",
+                    Severity.INFO,
+                    f"使用 oidc（issuer={oidc.get('issuer')}；frpsctl 不管理其凭据）",
+                )
+            )
+        if auth.get("token"):
+            out.append(
+                Finding(
+                    "auth.token",
+                    Severity.WARN,
+                    "method = oidc 时 auth.token 不会生效（容易误导）",
+                    "删除 token 或改回 method = token",
+                )
+            )
     return out
 
 

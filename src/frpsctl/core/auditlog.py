@@ -29,8 +29,11 @@ from .instance import Instance
 from .logs import tail_lines
 
 __all__ = [
+    "AUDIT_KEEP",
     "DEFAULT_AUDIT_FILE",
     "DEFAULT_POLICY_FILE",
+    "rotate_if_needed",
+    "rotated_paths",
     "AuditSummary",
     "AuditTail",
     "AuditView",
@@ -59,6 +62,11 @@ MAX_STAT_OPS = 64
 
 #: `(其他)` 归类桶的键名。
 _OTHER = "(其他)"
+
+#: 审计轮转：超过阈值时 `path` → `path.1`（`.1` → `.2`，最旧的删除）。
+#: 保留份数固定为 2——审计是"最近发生了什么"的取证材料，两份历史足够翻查，
+#: 而无限增长的文件会让磁盘与读取都失控（写侧原先完全没有轮转）。
+AUDIT_KEEP = 2
 
 
 def resolve_policy_path(inst: Instance, override: Path | None = None) -> Path:
@@ -95,6 +103,57 @@ def resolve_audit_path(policy_path: Path, raw: object) -> Path | None:
         return None
     candidate = Path(text).expanduser()
     return candidate if candidate.is_absolute() else policy_path.parent / candidate
+
+
+def rotated_paths(path: Path) -> list[Path]:
+    """按**新 → 旧**列出审计文件与它的轮转版本（只含存在的）。"""
+    candidates = [path] + [Path(f"{path}.{index}") for index in range(1, AUDIT_KEEP + 1)]
+    return [item for item in candidates if item.exists()]
+
+
+def rotate_if_needed(
+    path: Path,
+    *,
+    max_bytes: int = 0,
+    max_age_seconds: float = 0,
+    keep: int = AUDIT_KEEP,
+    now: float | None = None,
+) -> bool:
+    """审计文件**超过大小或超过年龄**时轮转；返回是否发生了轮转。
+
+    两个维度各自独立（0 = 该维度禁用）：`max_bytes` 防单文件无限增长，
+    `max_age_seconds` 保证"太久以前的审计"会被归档轮换（与 frp 日志的
+    `maxDays` 同语义）。任何一维触发即轮转。
+
+    轮转失败（权限/磁盘）**不抛异常**——审计写入方（插件后台线程 / Web
+    动作路径）绝不能被轮转问题拖垮；失败时继续向现有文件追加，下次再试。
+    `now` 可注入，测试用假时钟或 `os.utime` 控制。
+    """
+    if max_bytes <= 0 and max_age_seconds <= 0:
+        return False
+    import time as _time
+
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    due_size = max_bytes > 0 and st.st_size >= max_bytes
+    due_age = max_age_seconds > 0 and (
+        (now if now is not None else _time.time()) - st.st_mtime
+    ) >= max_age_seconds
+    if not (due_size or due_age):
+        return False
+    try:
+        for index in range(keep, 0, -1):
+            src = path if index == 1 else Path(f"{path}.{index - 1}")
+            dst = Path(f"{path}.{index}")
+            if dst.exists():
+                dst.unlink()
+            if src.exists():
+                src.replace(dst)
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -164,23 +223,41 @@ def read_tail(path: Path, lines: int) -> AuditTail:
     """读审计文件尾部 `lines` 行并逐行解析（复用 `logs.tail_lines` 的反向读）。
 
     审计文件与日志同规格（追加写、按行 JSON），因此反扫实现共用——一个
-    100MB 的审计文件同样只读最后一个块。
+    100MB 的审计文件同样只读最后一个块。**跨轮转**：当前文件不足时向
+    `.1` / `.2` 追溯（结果按时间升序，与单文件时的行为一致）。
     """
+    # 每个文件各取 `lines` 行（最多 3 个文件，多读一点以保证跨文件凑够
+    # **记录数**——坏行不应吃掉配额，v0.3.0 review 修正），合并后从最新行
+    # 向前解析，凑够 `lines` 条有效记录为止。
+    #
+    # 口径说明：配额按文件计——同一文件尾部若全是坏行，该文件内更早的有效
+    # 记录不会被跨行追溯（跨**文件**才有追溯）；`bad_lines` 只统计扫描窗口
+    # （凑够记录前）内的坏行，是下界。
+    chunks: list[list[str]] = []
+    for item in rotated_paths(path):  # 新 → 旧
+        part = tail_lines(item, lines)
+        if part:
+            chunks.append(part)
+    ordered = [line for chunk in reversed(chunks) for line in chunk]  # 旧 → 新
+
     records: list[dict] = []
     bad = 0
-    for line in tail_lines(path, lines):
+    for line in reversed(ordered):  # 从最新行向前
         text = line.strip()
         if not text:
             continue
         try:
-            item = json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             bad += 1
             continue
-        if isinstance(item, dict):
-            records.append(item)
+        if isinstance(parsed, dict):
+            records.append(parsed)
+            if len(records) >= lines:
+                break
         else:
             bad += 1
+    records.reverse()
     return AuditTail(path=path, records=records, bad_lines=bad)
 
 
@@ -205,85 +282,95 @@ class AuditSummary:
 
 
 def summarize(path: Path, *, since: float | None = None) -> AuditSummary:
-    """流式统计审计文件（只计数，不驻留记录）。
-
-    - `since` 是 unix 时间戳下界（`parse_since` 的输出）；缺 `at_unix` 字段的
-      记录仍计入总量（它们来自更早版本的写入者，忽略等于丢证据）；
-    - `by_user` 有上限（`MAX_STAT_USERS`），超出并入 `(其他)`；
-    - 坏行计入 `bad_lines`——审计文件被截断（进程被 kill）时最后一行必然是
-      半截 JSON，那是常态而非异常。
-    """
-    total = allow = deny = bad = suppressed = 0
-    first_at: float | None = None
-    last_at: float | None = None
-    by_user: dict[str, dict[str, int]] = {}
-    by_op: dict[str, int] = {}
-    elapsed_total = 0.0
-    elapsed_max = 0.0
-    elapsed_count = 0
-
-    try:
-        handle = open(path, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
-    except OSError:
+    """跨轮转文件的全量统计（`path` + `.1` + `.2`）。"""
+    accumulator = _SummaryAccumulator()
+    files = rotated_paths(path)
+    if not files:
         return AuditSummary()
+    for item in files:
+        accumulator.consume_file(item, since=since)
+    return accumulator.build()
 
-    with handle:
-        for line in handle:
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                item = json.loads(text)
-            except json.JSONDecodeError:
-                bad += 1
-                continue
-            if not isinstance(item, dict):
-                bad += 1
-                continue
 
-            at = _as_unix(item.get("at_unix"))
-            if since is not None and at is not None and at < since:
-                continue
-            if at is not None:
-                first_at = at if first_at is None else min(first_at, at)
-                last_at = at if last_at is None else max(last_at, at)
+class _SummaryAccumulator:
+    """流式统计的累加器（跨多个轮转文件共用一份计数状态）。"""
 
-            total += 1
-            if item.get("decision") == "deny":
-                deny += 1
-            else:
-                allow += 1
-            suppressed += int(item.get("suppressed") or 0)
+    def __init__(self) -> None:
+        self.total = self.allow = self.deny = self.bad = self.suppressed = 0
+        self.first_at: float | None = None
+        self.last_at: float | None = None
+        self.by_user: dict[str, dict[str, int]] = {}
+        self.by_op: dict[str, int] = {}
+        self.elapsed_total = 0.0
+        self.elapsed_max = 0.0
+        self.elapsed_count = 0
 
-            user = str(item.get("user") or "")
-            key = user if len(by_user) < MAX_STAT_USERS or user in by_user else _OTHER
-            bucket = by_user.setdefault(key, {"allow": 0, "deny": 0})
-            bucket["deny" if item.get("decision") == "deny" else "allow"] += 1
+    def consume_file(self, path: Path, *, since: float | None) -> None:
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
+        except OSError:
+            return
+        with handle:
+            for line in handle:
+                self._consume_line(line, since=since)
 
-            op = str(item.get("op") or "")
-            op_key = op if len(by_op) < MAX_STAT_OPS or op in by_op else _OTHER
-            by_op[op_key] = by_op.get(op_key, 0) + 1
+    def _consume_line(self, raw: str, *, since: float | None) -> None:
+        text = raw.strip()
+        if not text:
+            return
+        try:
+            item = json.loads(text)
+        except json.JSONDecodeError:
+            self.bad += 1
+            return
+        if not isinstance(item, dict):
+            self.bad += 1
+            return
 
-            elapsed = item.get("elapsed_ms")
-            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
-                elapsed_total += float(elapsed)
-                elapsed_max = max(elapsed_max, float(elapsed))
-                elapsed_count += 1
+        at = _as_unix(item.get("at_unix"))
+        if since is not None and at is not None and at < since:
+            return
+        if at is not None:
+            self.first_at = at if self.first_at is None else min(self.first_at, at)
+            self.last_at = at if self.last_at is None else max(self.last_at, at)
 
-    return AuditSummary(
-        total=total,
-        allow=allow,
-        deny=deny,
-        bad_lines=bad,
-        suppressed_total=suppressed,
-        first_at=first_at,
-        last_at=last_at,
-        by_user=by_user,
-        by_op=by_op,
-        elapsed_avg_ms=(elapsed_total / elapsed_count) if elapsed_count else 0.0,
-        elapsed_max_ms=elapsed_max,
-        elapsed_count=elapsed_count,
-    )
+        self.total += 1
+        if item.get("decision") == "deny":
+            self.deny += 1
+        else:
+            self.allow += 1
+        self.suppressed += int(item.get("suppressed") or 0)
+
+        user = str(item.get("user") or "")
+        key = user if len(self.by_user) < MAX_STAT_USERS or user in self.by_user else _OTHER
+        bucket = self.by_user.setdefault(key, {"allow": 0, "deny": 0})
+        bucket["deny" if item.get("decision") == "deny" else "allow"] += 1
+
+        op = str(item.get("op") or "")
+        op_key = op if len(self.by_op) < MAX_STAT_OPS or op in self.by_op else _OTHER
+        self.by_op[op_key] = self.by_op.get(op_key, 0) + 1
+
+        elapsed = item.get("elapsed_ms")
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+            self.elapsed_total += float(elapsed)
+            self.elapsed_max = max(self.elapsed_max, float(elapsed))
+            self.elapsed_count += 1
+
+    def build(self) -> AuditSummary:
+        return AuditSummary(
+            total=self.total,
+            allow=self.allow,
+            deny=self.deny,
+            bad_lines=self.bad,
+            suppressed_total=self.suppressed,
+            first_at=self.first_at,
+            last_at=self.last_at,
+            by_user=self.by_user,
+            by_op=self.by_op,
+            elapsed_avg_ms=(self.elapsed_total / self.elapsed_count) if self.elapsed_count else 0.0,
+            elapsed_max_ms=self.elapsed_max,
+            elapsed_count=self.elapsed_count,
+        )
 
 
 def _as_unix(value: object) -> float | None:

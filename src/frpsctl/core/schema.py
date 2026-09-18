@@ -83,11 +83,35 @@ class TokenSource(_Base):
     type: Literal["file", "exec"] | None = None
 
 
+class OidcConfig(_Base):
+    """`auth.oidc`（服务端 OIDC 校验）。字段名以官方配置为准。
+
+    frpsctl 只做**配置完整性**校验（见 `AuthConfig` 的 model_validator）与
+    doctor 提示——OIDC 协议本身由 frps 实现，不在本工具范围内（硬边界：
+    绝不重新实现 frp 已有能力）。
+    """
+
+    issuer: str | None = None
+    audience: str | None = None
+    skipExpiryCheck: bool | None = None
+    skipIssuerCheck: bool | None = None
+
+
 class AuthConfig(_Base):
     method: Literal["token", "oidc"] | None = None
     token: str | None = None
     additionalScopes: list[Literal["HeartBeats", "NewWorkConns"]] | None = None
     tokenSource: TokenSource | None = None
+    oidc: OidcConfig | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> AuthConfig:
+        if self.method == "oidc":
+            if self.oidc is None or not self.oidc.issuer:
+                raise ValueError("auth.method = oidc 时必须配置 auth.oidc.issuer")
+            if not self.oidc.audience:
+                raise ValueError("auth.method = oidc 时必须配置 auth.oidc.audience")
+        return self
 
 
 class WebServerTLS(_Base):
