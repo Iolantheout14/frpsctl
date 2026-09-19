@@ -14,6 +14,7 @@ from ...core.systemd import DEFAULT_SERVICE_USER, WebService
 from ...web import WebServer, WebSettings, build_web_context, generate_password
 from ...errors import (
     ConfigError,
+    FrpsctlError,
     UsageError,
 )
 from .. import ui
@@ -293,14 +294,20 @@ def web_password_set(
 
     service = WebService(app_ctx.instance)
     cfg.atomic_write(service.password_file, value + "\n", mode=0o600)
-    active = service.is_active()
+    # 口令**已经写盘**：下面的探测只决定"要不要提示重启"。systemctl 无响应时
+    # 不能让"口令已设置"变成退出码 1（v0.3.1 自检补正）；`None` = 无法探测。
+    try:
+        active: bool | None = service.is_active()
+    except FrpsctlError:
+        active = None
 
     if app_ctx.json:
         payload: dict = {
             "password_file": str(service.password_file),
             "generated": generated,
             "service_active": active,
-            "restart_required": active,
+            # 无法探测时保守建议重启（宁可多重启一次，不要拿着旧口令排查）
+            "restart_required": active is not False,
         }
         if generated:
             payload["password"] = value
@@ -312,7 +319,9 @@ def web_password_set(
         ui.emit(f"新口令（仅显示这一次）：{value}")
     else:
         ui.emit("口令已按输入设置（不回显）")
-    if active:
+    if active is None:
+        ui.warn("⚠ 无法探测管理台是否在运行（systemctl 无响应）：若它正在运行，新口令需重启后生效")
+    elif active:
         ui.emit("⚠ 管理台正在运行：新口令在重启后生效（`systemctl restart frpsctl-web@<实例>`）")
     else:
         ui.emit("管理台未在运行；下次启动时生效。")

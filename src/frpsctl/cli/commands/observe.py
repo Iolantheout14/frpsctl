@@ -226,12 +226,20 @@ def traffic(
         page = admin.page_proxies()
         truncated = page.total > TRAFFIC_MAX_PROXIES
         names = [item.name for item in page.items[:TRAFFIC_MAX_PROXIES]]
-        series = fetch_histories(admin, names)
+        fetched = fetch_histories(admin, names)
 
+    series = fetched.series
     days = aggregate_days(series)
     if app_ctx.json:
         ui.emit_json(
-            {"days": days, "proxies": len(series), "total": page.total, "truncated": truncated}
+            {
+                "days": days,
+                "proxies": len(series),
+                "total": page.total,
+                "truncated": truncated,
+                # v0.3.1：整体预算内未取全时如实标记（与 Web 同字段）
+                "partial": fetched.partial,
+            }
         )
         return
     if not days:
@@ -239,6 +247,8 @@ def traffic(
         return
     if truncated:
         ui.warn(f"⚠ 代理数超过 {TRAFFIC_MAX_PROXIES}，仅统计前 {TRAFFIC_MAX_PROXIES} 个")
+    if fetched.partial:
+        ui.warn("⚠ 部分代理的流量历史未在预算内返回（汇总可能偏低）")
     ui.emit("全部代理的逐日流量（近 7 天）：")
     _render_traffic_rows(days)
     _render_traffic_total(traffic_total(days))

@@ -12,6 +12,7 @@ from ...core.uninstall import execute_uninstall, plan_uninstall
 from ...core.version import RECKONED_VERSION
 from ...errors import (
     ConfigError,
+    FrpsctlError,
     UsageError,
 )
 from .. import ui
@@ -77,7 +78,18 @@ def install(
         ui.emit("")
         ui.emit("注意：换链**不影响正在运行的进程**（Linux 上可执行映像已绑定 inode），")
         ui.emit("      只影响下一次 start。运行 `frpsctl status` 可对比两个版本。")
-        if Systemd(app_ctx.instance).is_active():
+        try:
+            systemd_active = Systemd(app_ctx.instance).is_active()
+        except FrpsctlError:
+            # 二进制已落盘、软链已切——这一行只是**附加提示**。systemd 探测
+            # 失败不能让"安装成功"变成退出码 1（v0.3.1 自检补正）；但降级
+            # 必须可见：提示用户自行确认（review 复查补齐）。
+            systemd_active = False
+            ui.warn(
+                "⚠ 无法探测 systemd 托管状态（systemctl 无响应）："
+                "若该实例由 systemd 托管，需 systemctl restart 使新版本生效"
+            )
+        if systemd_active:
             ui.emit("      该实例由 systemd 托管：unit 的 ExecStart 写的是具体路径，需 systemctl restart。")
     elif result.downloaded:
         # 二进制刚落盘但软链没动：可能是 `--only-download`，也可能是**同版本已在盘上**
