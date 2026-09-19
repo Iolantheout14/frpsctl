@@ -194,7 +194,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.3.0
+ ✓ 命令可用：frpsctl 0.3.1
 
 frpsctl 安装完成
 ```
@@ -293,7 +293,7 @@ frpsctl install --with-frpc        # frps + frpc
 ### 验证安装
 
 ```bash
-frpsctl --version                  # frpsctl 0.3.0
+frpsctl --version                  # frpsctl 0.3.1
 frpsctl install                    # 下载 frps 二进制
 frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
@@ -572,7 +572,9 @@ $ frpsctl traffic alice.alice-ssh  # 单个代理的明细
 ```
 
 离线或已删除的代理在数据源上返回 404 = 无数据（不是错误）；单个代理查询失败
-也不拖垮整体。代理数超过 50 时会明确提示"仅统计前 50 个"（Web 同理）。
+也不拖垮整体。代理数超过 50 时会明确提示"仅统计前 50 个"（Web 同理）；慢
+dashboard 下 6 秒预算内未取全的代理同样会被标记（`partial`），避免把部分
+数据当全量。
 
 ### 教程 3：改配置（核心事务）
 
@@ -675,7 +677,7 @@ frpsctl config apply --set transport.tls.force=true --dry-run   # 只校验 + �
 ### 教程 3.6：能力自查（capabilities）
 
 ```bash
-frpsctl capabilities --json | jq '.commands | length'   # 56
+frpsctl capabilities --json | jq '.commands | length'   # 55（叶子命令）
 frpsctl capabilities                                     # 人读：命令/退出码/环境变量
 ```
 
@@ -1224,6 +1226,9 @@ frpsctl install --version 0.71.0 && frpsctl restart
 | 11 | 进程所有权冲突 | 身份校验不通过；systemd 与 direct 混用；锁被占用 |
 | 12 | 已启动但健康检查未通过 | L1 进程在、L2 控制面不可达（进程仍被托管，见健康分层） |
 
+> 两个**信号惯例**退出码不在业务表内：Ctrl-C（SIGINT）以 **130**（128+2）结束；
+> 管道提前关闭（`frpsctl log | head`）按正常终止处理（退出码 0）。
+
 脚本里应当据此分支：
 
 ```bash
@@ -1458,9 +1463,9 @@ FRPSCTL_TRACEBACK=1 frpsctl status
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-.venv/bin/pytest                       # 全部 735 条（契约层缺二进制时自动 skip）
-.venv/bin/pytest -m "not contract"     # 快速回归（705 条）
-.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 85%）
+.venv/bin/pytest                       # 全部 781 条（契约层缺二进制时自动 skip）
+.venv/bin/pytest -m "not contract"     # 快速回归（751 条）
+.venv/bin/pytest --cov=frpsctl         # 覆盖率（CI 门禁 80%，当前 86%）
 .venv/bin/ruff check src/ tests/       # 静态分析
 ```
 
@@ -1520,12 +1525,14 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **frps 没有热重载** | 改配置必然重启，因此 `config set` 的设计目标就是"失败了要能退回去" |
 | **systemd 模式下 pid 文件不参与判定** | 所有权委托 systemctl；`install` 换版本后需 `systemctl restart` |
 | **Web 管理台并发有界** | 请求线程上限默认 32，超限直接 `503`（v0.3.0 起；此前无限排队）。单机工具不面向高并发，公网暴露仍建议前置反代限流 |
+| **插件服务并发有界（64）** | 超限连接立即 `503`；高并发冲撞下部分连接会由内核按 TCP 语义重置（同为"该操作失败"，**刻意不做等待**以免拖慢 accept——frp 对插件请求没有超时）。插件请求极轻，正常规模远达不到（v0.3.1 起与 Web 共用同一实现，accept 队列 256） |
+| **`/api/status` 有 6 秒服务端缓存** | 页面轮询与外部变化最多滞后一个 TTL；管理台自身的写操作会立即失效缓存，注册登录等即时操作不受影响（v0.3.1） |
+| **趋势汇总有 6 秒整体预算** | 慢 dashboard 下汇总可能只含部分代理，响应带 `partial` 标记（CLI 与 Web 图表均如实提示，不会把部分数据当全量）（v0.3.1） |
 | **`--trusted-proxy` 只信 X-Forwarded-For 的最后一跳** | 前提是前面确实有一层会重写该头的可信代理；直连部署不要开启 |
 | **Web 无 WebSocket/SSE 推送** | 5 秒轮询足够，且省掉长连接的生命周期管理 |
 | **Web 不做 DOM 级前端测试框架** | 引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产；语法与静态纪律由 CI 守卫，纯函数由 node 动态断言（v0.3.0 覆盖审计渲染等 6 个），DOM 分支仍靠人工点验（残余风险已记账） |
 | **不实现 OIDC 协议** | `auth.method = "oidc"` 的配置完整性与 doctor 提示已支持（v0.3.0）；OIDC 协议本身由 frps 实现——本工具绝不重新实现 frp 已有能力 |
-| **一个 Web 进程服务一个实例** | 多实例请起多个 `web serve`（`--instance` 区分）；管理台不做实例切换器 |
-| **一个 web 进程服务一个实例** | 多实例请起多个 `web serve`（各自 `--instance`） |
+| **一个 Web 进程服务一个实例** | 多实例请起多个 `web serve`（各自 `--instance` 区分）；管理台不做实例切换器 |
 
 ---
 

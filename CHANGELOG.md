@@ -3,6 +3,108 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.1] - 2026-09-19
+
+**稳定性与可靠性补强（CLI + Web）**。零新命令、零新 API；唯一契约变化是
+CLI 数值参数**补上限**（收紧，快照同步）。基于全量通读（源码 33 模块 + 三份
+文档逐行）发现的 6 处 P0 缺陷全部根治，并落地 4 项量化性能/资源改进。
+新增 46 条测试（735 → 781；非契约 705 → 751），覆盖率 86.38%。
+
+### 修复
+
+**systemd 异常契约（影响 CLI 全部命令）**
+
+- `subprocess.TimeoutExpired` 此前无人接管：systemd 无响应时 `status` /
+  `start` / `stop` / `doctor` 全部崩为"未分类错误(1)"——违反 `status`
+  "永远能回答现在什么情况"的承诺（与 v0.2.1 修过的 `release._verify_binary`
+  同型缺口）。现在 `_systemctl` 统一收口为契约内异常，调用路径分流：
+  - **查询降级且可见**：`resolve_owner` 改为"按 state.json 判定 + 记录探测
+    错误"，`StatusReport.systemd_probe_error` / `--json` 字段 / CLI 告警 /
+    Web 顶部横幅 / `doctor` WARN 全部如实呈现；探测错误**进 owner 缓存**
+    （否则每轮 status 都重打一次 10 秒超时）。
+  - **变更 fail-closed**：`start` / `stop` / `restart` / `uninstall` 在
+    所有权不可判定时拒绝执行（退出码 11）——降级判定可能把 systemd 托管
+    实例误报成"未运行"，变更路径绝不允许。
+
+**并发与资源**
+
+- **插件服务并发无界**：此前是裸 `ThreadingHTTPServer`（线程数无上限），
+  而管理台 v0.3.0 已有 32 上限——同栈两套行为。提取共享
+  `core/httpserver.py`（`BoundedThreadingHTTPServer`），插件默认 **64**
+  worker、超限立即 503 并断开（对 frp 而言"非 200 = 该操作失败"，fail-closed
+  方向正确；插件请求极轻，正常规模远达不到）。accept 队列 64 → **256**
+  （登录风暴容量余量）；并发压测校准出的语义如实记录：高并发冲撞下部分
+  超限连接会被内核按 TCP 语义重置（**不引入等待**——frp 对插件无超时，
+  拖慢 accept 的代价更大；RST 对 frp 同为操作失败）。
+- **拒绝限速表无界**：`RejectLimiter` 的 `_hits` / `_suppressed` 以客户端
+  自报 `user` 为键、只增不删——持续换名的拒绝风暴可无界增长内存。上限
+  4096，超限驱逐窗口起点最早的条目（与 `web/auth` 失败来源表同一条纪律；
+  驱逐不改变安全语义，请求仍被拒绝）。
+- **失败登录审计限速是模块级单例**：多实例/多用例之间互相串味（测试此前
+  靠"前后手工 clear 模块状态"绕过）。改为 `WebContext.login_audit` 实例
+  持有（语义本就该是"每管理台进程一份"）；哨兵值 `0.0` → `None`（假时钟
+  从 0 起步时首次调用会被误判为冷却中——测试暴露的真实边界缺陷）。
+
+**环境健壮性**
+
+- **ASCII locale 下 stdout 崩溃**：`LC_ALL=C` 且 PEP 538 coercion 失效
+  （`PYTHONCOERCECLOCALE=0` / 容器无 C.UTF-8）时 stdout 是 strict+ascii，
+  `doctor` / `capabilities` / `uninstall` 等输出中文的命令直接
+  `UnicodeEncodeError` → "未分类错误(1)"。入口统一
+  `core.diagnostics.configure_streams()`（UTF-8 + backslashreplace）——
+  任何 locale 下输出都是一致的 UTF-8；`python -m frpsctl.docs` 入口同样处理。
+- **stderr 断开时二次崩溃**：`web` / `plugin` 的 `_note`、`web.api` 的审计
+  告警、`instance.prune_history`、`plugin.audit.close` 的告警写没有保护——
+  管道断开（`2>&1 | head`）时会从辅助路径抛异常。全部补
+  `suppress(OSError)`（与 `cli.ui` 的既有纪律一致）。
+
+**CLI 参数边界**
+
+- **数值参数补上限**（此前只有下界，Web 侧 v0.2.3 早有上限——同一纪律的
+  另一半）：`--health-timeout` / `--timeout` ≤ 600、`--interval` ≤ 3600、
+  `-n/--lines` ≤ 100000；越界归用法错误(2)。`--health-timeout 999999`
+  曾是"等待 11.5 天"，`-n 10^9` 会把整份日志拉进内存。
+- **契约快照纳入 `min`/`max`**：数值范围是命令契约的一部分（这次收紧就该
+  被锁住），并补显式生成入口 `python -m tests.test_contract_snapshot --update`
+  （此前文档写"删除基线并重跑"实际会 FileNotFoundError）。
+
+### 性能 / 资源（实测）
+
+- **`--version` 快路径**：精确匹配单个 `--version` 时在任何重 import 之前
+  输出并退出——实测 DrvFs **1.9s → 0.08s**、真实文件系统（ext4）
+  **1.45s → 0.001s**；`--version --json` 等组合行为不变。
+- **惰性导入**：`core/admin.py` 的 httpx 移入使用点（全项目唯一顶层 httpx）、
+  `PORT_FIELDS` 从 `schema` 迁到 `healthcheck`（`doctor` 不再拉起 pydantic）
+  ——`status` 链路 import 1.75s → **0.78s**（DrvFs），httpx/pydantic 零加载。
+- **`/api/status` 6 秒缓存**：页面 5 秒轮询 × （L2/L3 探针 + `server_info`）
+  的开销收口（TTL 必须 ≥ 轮询间隔——v0.3.0 的量化教训）；写操作经
+  `cache.invalidate()` 立即失效。预计 30 秒空转的探针次数 **6 → 1**。
+- **趋势查询整体预算 6 秒**（`TRAFFIC_DEADLINE`）：慢 dashboard 下单个
+  `/api/traffic` 最坏 ~19s → ≤6s；预算内返回已完成部分并带
+  `partial=true`（CLI `traffic` 与 Web 图表均如实提示，绝不把部分当全量）。
+- **`same_config_active` 批量查询**：多 active unit 从 N 次
+  `systemctl show` 降为 **1 次**（发生在 `start` 的实例锁内）。
+
+### 文档
+
+- **发布前全量回归 review 修复包**（全部 diff 逐行 + 对抗性实测 + 测试有效性
+  反向验证）：`_systemctl` 补齐 `OSError` 收口（systemctl 被删的罕见竞态不再
+  崩 status）；install 的 systemd 探测降级补告警；`--version` 快路径收窄触发
+  条件（宿主程序不再可能被劫持，附守卫测试）；实现注释与实测语义对齐、
+  删除零调用别名。
+- **最后一轮 review 的再收口**：测试层 systemctl 探测改为**无条件**确定性化
+  （此前"仅无 systemd 宿主生效"的条件在真 systemd 机器上失效，偶发超时仍能
+  误伤卸载类断言）；随之现形的两条脆弱测试改为显式语义（`process_gone`
+  判据 / 显式回收僵尸）；并发 burst 测试补齐连接层异常捕获并去掉对调度敏感
+  的"必须出现拒绝"断言（确定性拒绝由占位式测试保证）。
+- README：已知边界重复行修复；`capabilities` 命令数示例 56 → 55（叶子
+  口径）；退出码表补信号惯例（Ctrl-C=130、管道正常退出=0）；已知边界新增
+  status 缓存 / 插件并发 / `partial` 三条；测试与覆盖率数字刷新。
+- 设计方案：§23.2 的 TTL 表与实现对齐（6s/3s，指向 §23.5 量化修正）；
+  新增 §24 第十一轮记录（缺陷清单 / 量化 / 边界记账）。
+- `web/server.py` 模块 docstring 的 CSP 说明修正（仍写着 `'unsafe-inline'`
+  的 v0.2.x 旧文）与 `start()` 并发注释同步。
+
 ## [0.3.0] - 2026-09-18
 
 **内核重构与传输层升级**。用户可见契约零变化（命令路径 / 选项 / 退出码 /

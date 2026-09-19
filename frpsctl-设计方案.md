@@ -1777,7 +1777,7 @@ R12（旧版本传未知标志）、R13（换链后身份校验失配）、R14�
 > 本节记录 M5 之前的实现验证；M5 之后的全量回归 review 见 §15.5。
 >
 > ⚠️ 本章各小节里的用例数（226 / 277 / …）是**当时**的快照，用于记录每轮增量；
-> 当前总数以 CHANGELOG 最新条目为准（v0.3.0 起为 735 条；非契约 705 条）。
+> 当前总数以 CHANGELOG 最新条目为准（v0.3.1 起为 781 条；非契约 751 条）。
 
 本章记录实现过程中**文档被现实修正**的地方，以及只有真机测试才能照出来的问题。
 它的用途是：下次改这块代码的人，不必重新踩一遍。
@@ -3011,7 +3011,7 @@ v0.2.x 六轮迭代把功能面铺满（61 条命令路径、8 组 API、644 条
 | 项 | 内容 |
 |----|------|
 | ETag/304 | 已认证 GET 带内容 ETag + `Cache-Control: no-cache`（浏览器自动 `If-None-Match`，未变即 304 零 body）；写响应 / 错误 / 登录 / `/api/session` 一律 `no-store` |
-| 服务端缓存 | `web/cache.py` 的 `TTLCache`：traffic 30s / clients·proxies 2s / logs 1s（按行数分键）；**写操作显式失效**（action / config apply 前清空）——浏览器 5 秒轮询在空转时的 dashboard 查询数降为 0 |
+| 服务端缓存 | `web/cache.py` 的 `TTLCache`：traffic 30s / clients·proxies **6s** / logs **3s**（按行数分键）；**写操作显式失效**（action / config apply 前清空）——浏览器 5 秒轮询在空转时的 dashboard 查询数降为 0。⚠️ 初版 2s/1s 小于轮询间隔、命中率≈0；**6s/3s 是 §23.5 量化修正后的生效值**（v0.3.1 校对） |
 | 有界并发 | `_BoundedThreadingHTTPServer`：worker 上限（默认 32）用尽时 503 + 断开（收口"管理台不限制并发连接数"的旧边界） |
 | CSP nonce | `<script>` / `<style>` 每请求 nonce、去掉 `'unsafe-inline'`、内联 style 属性全部改工具类；追加 `base-uri 'none'; form-action 'none'; frame-ancestors 'none'` |
 | `/metrics` | Prometheus 文本（实例状态 / 三层健康 / dashboard 统计），Basic auth（用户名任意、口令 = 管理台口令），5 秒缓存，默认关闭（`--metrics` 开启，可写入 unit） |
@@ -3086,6 +3086,128 @@ v0.2.x 六轮迭代把功能面铺满（61 条命令路径、8 组 API、644 条
   OIDC、前端纯函数扩展。
 - 重构期间的"零变化"由三张网共同保证：命令面快照（参数逐字节）、既有 644 条
   行为断言（全部保留）、报告层统一后的字段级断言。
+
+---
+
+## 24. 第十一轮迭代（v0.3.1：稳定性与可靠性补强）
+
+v0.3.0 完成内核重构后，本轮以**全量通读**（src 全部 33 模块逐行；设计方案
+3272 行、README 1538 行、CHANGELOG 594 行、install.sh / workflows / pyproject
+逐行；测试基建与契约层逐行）复核 CLI 与 Web 的稳定性、可靠性。方法延续历次：
+读尽 → 逐条实测 → 修复 → 回归固化。**零新命令、零新 API**；唯一契约变化是
+CLI 数值参数补上限（收紧，快照同步）。
+
+统计：修复 **6 处 P0 级缺陷**（全部有实测或代码级证据）、落地 **4 项性能/资源
+改进**（全部有前后量化）、文档修复 8 处；新增 **46 条测试**（735 → 781；
+非契约 705 → 751），覆盖率 86.38%。
+
+### 24.1 P0 缺陷清单（根治方式）
+
+| # | 缺陷 | 证据（实测/代码） | 根治 |
+|---|------|------------------|------|
+| 1 | **systemctl 超时 = 裸 `TimeoutExpired`**：`status`/`start`/`stop`/`doctor` 崩为未分类错误(1)，违反 status "永远能回答"承诺 | `core/systemd.py` 的 `_systemctl` 无 try；`resolve_owner → is_active` 链上无捕获（与 v0.2.1 修过的 `release._verify_binary` 同型） | `_systemctl` 统一收口为契约内异常；查询路径**降级且可见**（`StatusReport.systemd_probe_error` → JSON 字段 / CLI 告警 / Web 横幅 / doctor WARN；探测错误进 owner 缓存），变更路径（start/stop/restart/uninstall）**fail-closed 拒绝**（11） |
+| 2 | **插件服务并发无界**：裸 `ThreadingHTTPServer`，线程数无上限；同栈的管理台 v0.3.0 已有 32+503 | `plugin/server.py` 与 `web/server.py` 实现不对称（grep 确认插件 0 处信号量） | 提取共享 `core/httpserver.py`（`BoundedThreadingHTTPServer`）；插件默认 64 worker、超限 503 并断开（对 frp 即"该操作失败"，fail-closed 方向正确） |
+| 3 | **`RejectLimiter` 追踪表无界**：`user` 是客户端自报字符串，换名拒绝风暴可无界增长内存 | `plugin/engine.py` 的 `_hits`/`_suppressed` 只增不删；与 auth 失败来源表（有上限）同纪律却漏了 | 上限 4096，驱逐窗口起点最早的条目（`_suppressed` 同步删除）；驱逐不改变安全语义（请求仍被拒绝） |
+| 4 | **ASCII locale 下 stdout 崩溃**：`doctor`/`capabilities` 输出中文即 `UnicodeEncodeError` → 未分类错误(1) | 子进程实测：`PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 LC_ALL=C` 时 `stdout.encoding=ascii` + strict（stderr 靠 backslashreplace 只输出乱码） | 入口 `configure_streams()` 固定 UTF-8 + backslashreplace（`cli` 与 `docs` 两个入口）；"任何 locale 下输出一致" |
+| 5 | **CLI 数值参数无上限**：`--health-timeout 999999` = 等待 11.5 天；`-n 10^9` 全量读日志 | CLI 只有 `min`，而 Web 的 `_bounded_float` 早有 `max`（同一纪律的另一半） | 全部时长/行数参数补上限（600/600/3600/100000）；**契约快照纳入 min/max**（数值范围是命令契约），并补显式生成入口（此前"删基线重跑"实际会 FileNotFoundError） |
+| 6 | **失败登录审计限速是模块级单例**：多实例/多用例串味（测试靠手工 clear 绕过）；哨兵 `0.0` 与假时钟 0 冲突 | `web/server.py` 模块级 `_login_fail_limiter`；测试 fixture 里"前后清 `_last`"即为证据 | 移入 `WebContext.login_audit`（每管理台进程一份）；哨兵改 `None`（测试暴露的真实边界缺陷） |
+
+### 24.2 量化验证（全部为实测，非估算）
+
+| 场景 | 之前 | 之后 | 方法 |
+|------|------|------|------|
+| `frpsctl --version` 冷启动 | 1.9s（DrvFs）/ 1.45s（真实 fs） | **0.08s / 0.001s** | 快路径在任何重 import 前输出；子进程断言 httpx/pydantic/typer 零加载 |
+| `status` 链路 import | 1.75s（DrvFs）/ 1.45s（真实 fs） | **0.78s / 0.58s** | httpx 惰性化（admin 唯一顶层点）+ `PORT_FIELDS` 迁出 schema（doctor 不再拉 pydantic）；子进程断言 httpx/pydantic 零加载 |
+| `/api/status` 30 秒空转（6 轮） | 6 次 L2/L3 探针 + server_info | **3 次**（每两轮一次，陈旧 ≤6s） | 6 秒缓存；假时钟测试锁定真实语义——"TTL ≥ 间隔"≠"只算一次"：命中不续期（续期则数据永不刷新） |
+| 慢 dashboard 单 `/api/traffic` | 最坏 ~19s（50 代理 ÷ 8 并发 × 3s） | **≤6s + `partial` 标记** | `TRAFFIC_DEADLINE` 整体预算；`fetch_histories` 单元测试断言预算与部分结果 |
+| `same_config_active`（30 active unit） | 30 次 `systemctl show` | **1 次** | 批量 `show u1 u2 …`；单元测试断言 show 只调用一次 |
+| 插件连接风暴 | 线程无界 | **≤64 worker；超限快速失败**（503 或 TCP 重置，均=操作失败）；accept 队列 256 | 端到端测试（占住唯一 worker 后第二请求 503）+ 20/200 并发实测（无挂死、线程有界） |
+| ASCII locale | `doctor` 崩溃 | UTF-8 正常输出 | 子进程双测（stdout 中文 + stderr 错误消息） |
+
+### 24.2b 全项自检补正（"所有项是否完整正确"的系统复查）
+
+对方案逐项对账时做了一次**调用点系统复查**（全部 `is_active()` / `is_enabled()`
+直接调用点 grep + 逐条量化结论复算），发现并补正 **3 处同型缺口 + 1 处量化
+修正**：
+
+| # | 项 | 问题 | 补正 |
+|---|----|------|------|
+| 1 | `install` 的换链提示 | 二进制已落盘、软链已切之后才调 `Systemd.is_active()`——systemctl 无响应会让**安装成功**变成退出码 1 | 捕获后跳过该附加提示；安装结果不受探测影响（测试：mock 超时下 exit 0） |
+| 2 | `web password set` 的运行提示 | 口令**已写盘**之后探测 `is_active()`——失败会让"口令已设置"变成失败 | 捕获后 `active=None`，输出"无法探测，若在运行请重启"；JSON `restart_required=true` 保守建议（测试：文件已写入 + 警告） |
+| 3 | `uninstall._clean_units` | 预检与清理之间的窗口里 systemctl 无响应会让整个卸载崩掉 | 收进 `warnings`（"无法探测…请手工确认"）并跳过该项——降级必须可见（测试：三个 unit 各一条 warning） |
+| 4 | status 缓存量化结论 | 方案初稿估算"30s 6 轮探针 6 → 1"；实际 TTL=6s 且命中不续期 → **3 次**（每轮网格 0/5/10/15/20/25 中计算发生在 0/10/20） | 修正 CHANGELOG/§24 数字；新增假时钟测试锁定"6 轮 = 3 次计算" |
+| 5 | 插件超限连接的 TCP 语义 | 自检压测（200 并发）：部分超限连接被内核 **RST** 而不是读到 HTTP 503（服务端 close 时接收缓冲仍有未读请求体，TCP 语义使然） | accept 队列 64 → **256**（容量余量）；尝试"读掉请求体再回包"（非阻塞版与 1ms 等待版**两轮实测均不能消除竞态**、甚至增大 RST 且拖慢 accept）后**回退**为简单实现——稳定承诺校准为"不排队、不挂死、线程有界"，RST 对 frp 同为操作失败；测试与 README 按此语义断言/记录 |
+
+发布前**全量回归 review**（全部 diff 逐行 + 对抗性实测 + 测试有效性反向
+验证）再补 4 项：
+
+| # | 项 | 问题 | 补正 |
+|---|----|------|------|
+| 6 | `_systemctl` 的 `OSError` 缺口 | `available` 检查与执行之间 systemctl 被删除（罕见竞态）→ 裸 `FileNotFoundError` 崩掉 status（与超时同型的异常契约缺口） | 与超时同样收口为契约异常（`test_systemctl_oserror_is_collected_into_contract_error`） |
+| 7 | install 的降级静默 | 自检补正后探测失败只跳过提示、不告警——违反"降级必须可见" | 补 stderr 告警（"无法探测…需自行确认"），测试同步断言 |
+| 8 | 注释与实测语义漂移 + 死代码 | plugin/web 实现注释只写"超限 503"（实测含 TCP 重置）；`web/server.py` 残留孤立注释与零调用别名 `_BoundedThreadingHTTPServer` | 注释对齐实测语义；删除死代码（零调用即删纪律） |
+| 9 | `--version` 快路径条件过宽 | 宿主程序（`argv[0]` 非 frpsctl）命令行恰为 `--version` 且 import `frpsctl.cli` 时会被劫持 | 触发条件加"入口身份"判定（console script / `-m frpsctl`），新增宿主安全守卫测试 |
+
+**测试有效性反向验证**（review 纪律）：临时移除 `_require_owner_known` 的两处
+调用 → `test_mutations_refuse_when_owner_probe_failed` 变红；临时移除 status
+缓存的读取 → 3 条缓存测试变红；恢复后全绿——证明守卫测试真的在测行为，
+而不是在测空气。
+
+**最后一轮发布前 review 的再收口**（对 review 修复本身的复审）：
+
+1. `_stabilize_systemctl` 由"仅无 systemd 宿主生效"改为**无条件**确定性化
+   ——复审实测发现本机（WSL）systemd 实际可用，条件判断让 stub 在**最需要
+   它的机器上不生效**：走 `_precheck` 的卸载测试仍可能被偶发超时 + W2 的
+   fail-closed 误伤。无条件 stub 后测试与宿主彻底解耦（测试中的 unit 本就
+   不存在，"快速非零"与真实 systemd 的语义一致，还省掉每用例的子进程）。
+2. 无条件 stub 随即**让两条脆弱测试现形**（它们隐含依赖"其它 systemctl
+   子进程的 `subprocess._cleanup` 顺带 reap 僵尸"这一副作用）：
+   - `test_force_stops_running_instance_then_removes` 的 `pid_alive` 断言
+     （僵尸对 `kill(pid,0)` 返回成功）→ 改 `process_gone`（产品官方判据）；
+   - `test_stop_when_already_gone_is_not_an_error` → 显式 `os.waitpid`
+     回收（附注释：生产环境不存在该情形——frps 的父进程早已退出，僵尸由
+     init 立即收养）。
+3. 并发 burst 测试的双重缺陷：只捕 `HTTPError` 不捕连接层 `OSError`（RST
+   会让测试 error 而非断言失败）；"必须出现拒绝"的断言对客户端线程到达
+   节奏敏感（会 flaky）→ 改为"结局封闭 + 有 200 + 无挂死"，确定性拒绝由
+   Event 占位的 `test_exhausted_workers_get_503` 保证。
+
+至此全量 **781 passed / 0 skipped**，CI 全套八项本地复刻全绿，发布预演
+（tag 一致性 / release required 与全模块双向核对 / 安装态 55 命令 / CHANGELOG
+首条目）通过——**可发布**。
+
+一条**明确记账的设计判断**：`service status` / `web service status` /
+`plugin service status` 这类**显式状态查询命令**在 systemctl 无响应时直接
+报错（收口后的 `FrpsctlError`，消息含超时原因），而不是返回 `active: false`
+——后者把"探测不到"伪装成"没在运行"，与"降级必须可见"相反。降级只发生在
+**聚合类报告**（`status` / `doctor` / `instances`）里，且必须带
+`systemd_probe_error` 标记。
+
+### 24.3 测试与验收
+
+- 新增 46 条：入口健壮性（locale/快路径/惰性/宿主安全，7）、systemd 超时语义（4）、
+  插件有界并发（3）、`RejectLimiter` 有界（3）、限速实例化与哨兵/驱逐（2）、
+  status 缓存与 30 秒语义（3）、趋势预算（4）、数值上限（12 参数化 + 1 边界）、
+  `same_config_active` 批量（1）、doctor 竞态（1）、**自检补正**（5：install /
+  password set / 异常流 JSON 各 1、`_clean_units` 1、`configure_streams` 2）。
+- 契约快照 diff 人工审查：仅 `min`/`max` 键新增（12 个范围参数），无路径/
+  选项/默认值漂移。
+- 全量 **781 passed / 0 skipped**（含真 frps 0.71.0 + 真 frpc 契约）；
+  非契约 751；覆盖率 **86.38%**（门禁 80%）。
+- 发布前 review 又补 2 条回归（`_systemctl` 的 OSError 收口、宿主劫持守卫）
+  与一处 **flaky 根治**：宿主 systemctl 偶发超时会让卸载类断言误伤——conftest
+  在无 systemd 宿主上确定性化探测（`subprocess.run` 条件化 stub），并把
+  "无假警告"断言收窄到权限类文案（双保险），三轮复跑稳定。
+
+### 24.4 边界与不做（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| `cli/__init__.py` 兼容 shim | 保留（0.3.0 承诺"一个版本周期后收敛"） |
+| `AdminClient` 连接池共享 | 不做：httpx.Client 线程安全但凭据/配置变更的生命周期复杂，收益低于风险 |
+| typer 替换 / 懒命令注册框架 | 不做：快路径 + 惰性依赖已覆盖高频场景，框架化改动面太大 |
+| `/api/status` 缓存的可见延迟 | 明确为"≤6s（外部变化），本进程操作即时"（README 已知边界）；`uptime` 等秒级字段同样滞后——对展示无感 |
+| 插件 503 的语义 | 对 frp 是"该次操作失败"（fail-closed）；文档已写明，64 worker 对插件的轻请求远超正常规模 |
 
 ---
 
