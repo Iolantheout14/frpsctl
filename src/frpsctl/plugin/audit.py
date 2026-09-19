@@ -222,10 +222,12 @@ class AuditLog:
         if thread is not None:
             thread.join(timeout=timeout)
             if thread.is_alive():
+                import contextlib
                 import sys
 
-                sys.stderr.write("[plugin] 审计线程未在超时内退出（可能卡在写盘），残留记录可能未落盘\n")
-                sys.stderr.flush()
+                with contextlib.suppress(OSError):
+                    sys.stderr.write("[plugin] 审计线程未在超时内退出（可能卡在写盘），残留记录可能未落盘\n")
+                    sys.stderr.flush()
             else:
                 self._thread = None
         self.flush()

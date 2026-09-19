@@ -38,6 +38,14 @@ from .types import (
 __all__ = ["DecisionEngine", "EngineResult", "RejectLimiter"]
 
 
+#: 追踪表上限（v0.3.1）。`user` 是客户端自报的任意字符串：拒绝风暴里攻击者
+#: 可以不断换名，让 `_hits` / `_suppressed` 无界增长——与 web/auth.py 的
+#: 失败来源表、审计统计的 `by_user` 是同一条纪律：**输入驱动的表必须有界**。
+#: 上限 4096 远超正常规模（被拒用户通常是少数的配置错误）；超限驱逐
+#: "窗口起点最早"的条目，它离重新被追踪只差一次请求。
+MAX_TRACKED_USERS = 4096
+
+
 class RejectLimiter:
     """拒绝审计记录的限速器（`reject_log_burst` / `reject_log_window`）。
 
@@ -47,11 +55,17 @@ class RejectLimiter:
 
     被抑制的条数会累计，在下一条被记录的拒绝上以 `suppressed` 字段汇报：
     审计可以降采样，但"降了多少"必须看得见（降级必须可见原则）。
+
+    表**有界**（`MAX_TRACKED_USERS`）：驱逐最早的条目只会让某个用户短暂
+    "重新获得"被逐条记录的额度——安全语义（请求仍被拒绝）不受影响。
     """
 
-    def __init__(self, burst: int, window: float, clock=time.monotonic) -> None:
+    def __init__(
+        self, burst: int, window: float, clock=time.monotonic, *, max_tracked: int = MAX_TRACKED_USERS
+    ) -> None:
         self.burst = max(1, burst)
         self.window = max(0.1, window)
+        self.max_tracked = max(1, max_tracked)
         self._clock = clock
         self._hits: dict[str, tuple[float, int]] = {}  # user -> (窗口起点, 已记条数)
         self._suppressed: dict[str, int] = {}
@@ -67,9 +81,22 @@ class RejectLimiter:
             if count >= self.burst:
                 self._suppressed[user] = self._suppressed.get(user, 0) + 1
                 self._hits[user] = (start, count)
+                self._cap_tracked()
                 return False, 0
             self._hits[user] = (start, count + 1)
+            self._cap_tracked()
             return True, self._suppressed.pop(user, 0)
+
+    def _cap_tracked(self) -> None:
+        """把追踪表收敛到上限（持锁调用）：驱逐窗口起点最早的条目。
+
+        `_suppressed` 与 `_hits` 同键同生命周期（抑制计数只会先在 `_hits`
+        有记录的键上产生），一并删除以免成为第二张无界表。
+        """
+        while len(self._hits) > self.max_tracked:
+            oldest = min(self._hits, key=lambda key: self._hits[key][0])
+            self._hits.pop(oldest, None)
+            self._suppressed.pop(oldest, None)
 
 
 @dataclass(frozen=True)

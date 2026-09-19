@@ -352,8 +352,9 @@ class Instance:
                 removed.append(stale)
             except OSError:
                 # 删不掉就留着：快照含机密，"保留 10 份"这条约定失效必须可见，
-                # 不能像以前那样 ignore_errors 静默放过。
+                # 不能像以前那样 ignore_errors 静默放过。stderr 断开时静默。
                 import sys
 
-                sys.stderr.write(f"[frpsctl] 无法清理过期配置快照：{stale}\n")
+                with contextlib.suppress(OSError):
+                    sys.stderr.write(f"[frpsctl] 无法清理过期配置快照：{stale}\n")
         return removed

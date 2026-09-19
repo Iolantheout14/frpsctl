@@ -27,12 +27,13 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..core.auditlog import resolve_audit_path
+from ..core.httpserver import BoundedThreadingHTTPServer
 from .audit import AuditLog
 from .engine import DecisionEngine
 from .policy import PluginPolicy
@@ -53,6 +54,12 @@ class ServerSettings:
     path: str = "/handler"
     #: 是否把每个请求打进 stderr。默认关闭以保持日志干净，审计另有 JSONL。
     access_log: bool = False
+    #: 请求线程上限（v0.3.1，与 Web 管理台同一护栏）。插件请求极轻
+    #: （引擎内无 I/O），64 远超正常并发；过载时超限连接立即被拒绝
+    #: （HTTP 503，或在未读请求体上交由内核 TCP 重置——见
+    #: `core/httpserver.BoundedThreadingHTTPServer` 的过载语义说明）。
+    #: 对 frp 而言两者等价于"该操作失败"，方向正确（快速失败，线程有界）。
+    max_workers: int = 64
     #: 策略文件路径。用于把 `audit.path` 的相对路径解析到**策略文件所在目录**
     #: ——否则审计落点跟随进程 CWD，手工前台运行与 systemd 托管会写到两个
     #: 地方（systemd unit 的 WorkingDirectory 是实例目录，CLI 直接跑是当前
@@ -200,10 +207,14 @@ def _make_handler(engine: DecisionEngine, settings: ServerSettings):
                 self._note("客户端在响应写出前断开连接")
 
         def _note(self, message: str) -> None:
+            # stderr 是运维观察面：管道断开（`| head`）时静默——
+            # 诊断写失败绝不该让请求路径抛异常（v0.3.1）。
+            import contextlib
             import sys
 
-            sys.stderr.write(f"[plugin] {message}\n")
-            sys.stderr.flush()
+            with contextlib.suppress(OSError):
+                sys.stderr.write(f"[plugin] {message}\n")
+                sys.stderr.flush()
 
         def handle_error(self, request, client_address) -> None:  # noqa: ANN001, ARG002
             """连接类异常静默：插件 stderr 是运维观察面，连接中断不是错误。"""
@@ -252,7 +263,7 @@ class PluginServer:
             )
         )
         self.engine = DecisionEngine(policy, self.audit)
-        self._httpd: ThreadingHTTPServer | None = None
+        self._httpd: BoundedThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lifecycle_lock = threading.Lock()
 
@@ -261,12 +272,21 @@ class PluginServer:
     def start(self) -> None:
         """绑定并开始服务。绑定失败（端口占用）会原样抛出 `OSError`。"""
         handler = _make_handler(self.engine, self.settings)
-        self._httpd = ThreadingHTTPServer((self.settings.host, self.settings.port), handler)
-        self._httpd.daemon_threads = True
-        # backlog 上限（同 web/server.py）：插件是登录单点，过载时宁可让多出的
-        # 连接被内核拒绝，也不要无限排队——frp 侧对插件请求没有超时，排队中的
-        # 请求会一直占着客户端的登录链路。
-        self._httpd.request_queue_size = 64
+        # 有界并发（v0.3.1）：与 Web 管理台共用 `core/httpserver.py`——
+        # 此前这里是裸 `ThreadingHTTPServer`，线程数无上限；插件是登录单点
+        # 且 frp 侧对插件请求没有超时，连接风暴会无界堆线程。
+        self._httpd = BoundedThreadingHTTPServer(
+            (self.settings.host, self.settings.port),
+            handler,
+            max_workers=self.settings.max_workers,
+        )
+        # backlog（accept 队列）＝ **256**（v0.3.1 自检调高，原 64）。
+        # 插件是登录单点：frps 重启后大量客户端**同时重连**是常态。accept
+        # 循环本身很快（实测 200 并发下 64 的队列不构成瓶颈）；256 是给突发
+        # 风暴的容量余量——队列满时多出的连接由内核快速拒绝（fail-closed），
+        # 但余量越大，越多连接能走到"HTTP 503 的明确失败"而不是 TCP 层重置。
+        # worker 上限（`max_workers`）另行约束处理并发。
+        self._httpd.request_queue_size = 256
         self._thread = threading.Thread(target=self._httpd.serve_forever, name="frpsctl-plugin", daemon=True)
         self._thread.start()
 
