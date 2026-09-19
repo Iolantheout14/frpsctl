@@ -201,6 +201,13 @@ def _precheck(inst: Instance, *, force: bool) -> None:
             f"实例 {inst.name} 的状态文件已损坏：{inst.state}",
             hint="无法判断进程归属，拒绝卸载。请确认没有 frps 在跑后手工删除该文件，再重试",
         )
+    if status.systemd_probe_error:
+        # 探测失败时 owner 是降级值：systemd 托管的实例会被误判为可直接卸载。
+        # 删除数据而 unit 仍在跑 = "服务在跑、数据已删"——顺序安全原则的反例。
+        raise OwnershipConflict(
+            f"实例 {inst.name} 的 systemd 状态探测失败，无法安全判定所有权，拒绝卸载",
+            hint=f"{status.systemd_probe_error}；恢复 systemd 后重试",
+        )
     if status.owner is Owner.SYSTEMD:
         if not force:
             raise OwnershipConflict(
@@ -236,6 +243,12 @@ def _ensure_stopped(
     就中止（退出码 11），绝不因为"预检时它是停的"就越权停掉一个刚起来的服务。
     """
     status = Lifecycle(inst).status()
+    if status.systemd_probe_error:
+        # 预检与这里之间 systemd 可能刚好无响应——同 `_precheck`：拒绝而非降级。
+        raise OwnershipConflict(
+            f"实例 {inst.name} 的 systemd 状态探测失败，中止卸载",
+            hint=f"{status.systemd_probe_error}；恢复 systemd 后重试",
+        )
     if status.owner is Owner.SYSTEMD:
         if not force:
             raise OwnershipConflict(
@@ -280,7 +293,17 @@ def _clean_units(
         # 判定用 is_active / is_enabled，**不是** template_path.exists()：
         # 模板是全部实例共享的，它存在不代表本实例的 unit 存在——用错会产生
         # "需要 root 才能停用 frps@x" 这类假警告（对从未用过 systemd 的实例）。
-        stop_needed = service.is_active() or service.is_enabled()
+        try:
+            stop_needed = service.is_active() or service.is_enabled()
+        except FrpsctlError as exc:
+            # 预检与清理之间 systemd 可能刚好无响应（v0.3.1 自检补正）：
+            # 收进 warnings 并跳过**这一项**，而不是让整个卸载流程崩在探测上。
+            # 降级必须可见——用户需要手工确认这个 unit 的最终状态。
+            report.warnings.append(
+                f"无法探测{label} unit 状态（{service.unit_name}）：{exc.message}；"
+                "请手工确认它已停止（systemctl status）"
+            )
+            continue
         remove_template = remove_templates and service.template_path.exists()
         if not stop_needed and not remove_template:
             continue

@@ -25,11 +25,10 @@ from pathlib import Path
 from ..errors import FrpsctlError
 from .config import config_flags, needs_unsafe_flag
 from .health import HealthLayer, probe_plugins
-from .healthcheck import is_loopback, parse_dashboard, parse_plugin_targets
+from .healthcheck import PORT_FIELDS, is_loopback, parse_dashboard, parse_plugin_targets
 from .instance import Instance
 from .lifecycle import Lifecycle, Owner, ProcessRef, State
 from .lock import is_locked
-from .schema import PORT_FIELDS
 from .version import MINIMUM_VERSION, Version, read_binary_version, upgrade_hint
 
 __all__ = ["Severity", "Finding", "DoctorReport", "run_doctor"]
@@ -99,7 +98,11 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
     findings.extend(_check_dashboard(inst))
     findings.extend(_check_hardening(inst))
     findings.extend(_check_ports(inst, state=state, ref=ref))
-    findings.extend(_check_ownership(inst, owner=owner, state=state, ref=ref))
+    findings.extend(
+        _check_ownership(
+            inst, owner=owner, state=state, ref=ref, probe_error=lc.owner_probe_error()
+        )
+    )
     findings.extend(_check_lock(inst))
     findings.extend(_check_plugins(inst))
     findings.extend(_check_web_password_file(inst))
@@ -141,7 +144,12 @@ def _check_binary(
         return [Finding("二进制", Severity.ERROR, exc.message, exc.hint or "")]
     if not path.exists():
         return [Finding("二进制", Severity.ERROR, f"不存在：{path}", "运行 `frpsctl install`")]
-    if not path.stat().st_mode & stat.S_IXUSR:
+    try:
+        executable = bool(path.stat().st_mode & stat.S_IXUSR)
+    except OSError as exc:
+        # exists 与 stat 之间文件被删/不可读：doctor 只报告不崩（v0.3.1）。
+        return [Finding("二进制", Severity.ERROR, f"无法读取权限：{path}（{exc}）")]
+    if not executable:
         out.append(Finding("二进制", Severity.ERROR, f"不可执行：{path}", f"chmod 0755 {path}"))
     if version is None:
         out.append(
@@ -220,7 +228,11 @@ def _check_permissions(inst: Instance) -> list[Finding]:
     """含 token 的配置必须 0600（§8.7）。"""
     if not inst.config.exists():
         return []
-    mode = inst.config.stat().st_mode & 0o777
+    try:
+        mode = inst.config.stat().st_mode & 0o777
+    except OSError as exc:
+        # exists 与 stat 之间的竞态（并发删除/权限变化）：doctor 只报告不崩。
+        return [Finding("配置文件权限", Severity.WARN, f"无法读取权限：{inst.config}（{exc}）")]
     has_secret = False
     with contextlib.suppress(Exception):
         data = tomllib.loads(inst.config.read_text("utf-8"))
@@ -471,10 +483,28 @@ def _dig(data: dict, dotted: str):
 
 
 def _check_ownership(
-    inst: Instance, *, owner: Owner, state: State, ref: ProcessRef | None
+    inst: Instance,
+    *,
+    owner: Owner,
+    state: State,
+    ref: ProcessRef | None,
+    probe_error: str | None = None,
 ) -> list[Finding]:
-    """systemd 与 direct 冲突检测（R3）。owner/state 由 run_doctor 单次探测传入。"""
+    """systemd 与 direct 冲突检测（R3）。owner/state 由 run_doctor 单次探测传入。
+
+    `probe_error` 非空表示这次探测是**降级**的（systemctl 超时等）——必须
+    如实报告：不报的话，doctor 会拿一个"按 state.json 猜的所有权"当真结论。
+    """
     out: list[Finding] = []
+    if probe_error:
+        out.append(
+            Finding(
+                "systemd 探测",
+                Severity.WARN,
+                f"systemctl 探测失败，所有权按 state.json 降级判定：{probe_error}",
+                "恢复 systemd 后重跑；变更类操作（start/stop/config）在此期间会拒绝执行",
+            )
+        )
 
     if state is State.FOREIGN:
         out.append(

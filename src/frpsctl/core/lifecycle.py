@@ -186,6 +186,10 @@ class StatusReport:
     systemd_main_pid: int | None = None
     #: state.json 损坏（无法判断进程归属）。status 必须如实报告而不是崩掉。
     state_corrupted: bool = False
+    #: systemd 探测失败（超时/无响应）时的错误文本；None = 探测正常。
+    #: 它出现时 owner 是"按 state.json 降级判定"的结果——变更类操作会拒绝
+    #: 执行（v0.3.1），查询类如实展示这一降级。
+    systemd_probe_error: str | None = None
     #: 控制连接监听（`bindAddr:bindPort`，附录 A 默认 0.0.0.0:7000）。
     listen: ListenInfo | None = None
 
@@ -203,10 +207,15 @@ class Lifecycle:
     def __init__(self, inst: Instance, *, binary: Path | None = None) -> None:
         self.inst = inst
         self._explicit_binary = binary
-        #: `(探测时刻, owner, state.json 戳)`；变更方法会显式清空
+        #: `(探测时刻, owner, state.json 戳, 探测错误)`；变更方法会显式清空
         #: （见 `_invalidate_owner`），戳变化（start 写入 / stop 删除）也会
         #: 让缓存自动失效——否则"刚 start 完的实例"会在 TTL 内被报成 NONE。
-        self._owner_cache: tuple[float, Owner, tuple[int, int] | None] | None = None
+        #: 探测错误一并入缓存：systemd 无响应时不能每轮都重打一次 10 秒超时。
+        self._owner_cache: tuple[float, Owner, tuple[int, int] | None, str | None] | None = None
+        #: 最近一次所有权探测中 systemd 侧的失败信息（成功为 None）。
+        #: 查询路径据此做**可见降级**（报告照出 + 字段如实下发），
+        #: 变更路径据此 **fail-closed 拒绝**（见 `_require_owner_known`）。
+        self._owner_probe_error: str | None = None
 
     # --- 二进制 --------------------------------------------------------
 
@@ -269,27 +278,59 @@ class Lifecycle:
         实例级 TTL 缓存（`OWNER_CACHE_TTL`）：watch/轮询场景下复用同一
         `Lifecycle` 实例即可显著减少 systemctl 子进程；**本类的变更方法
         在返回前清缓存**，因此自己刚做过的动作不会被旧答案掩盖。
+
+        **systemd 探测失败（超时等）时不抛异常**：`status` 的承诺是"永远能回答
+        现在什么情况"，而此前一颗超时炸弹会让它崩成"未分类错误(1)"。失败降级为
+        "按 state.json 判定"，同时把错误记进 `_owner_probe_error`——查询路径
+        如实下发（`StatusReport.systemd_probe_error`），变更路径由
+        `_require_owner_known()` fail-closed 拒绝。降级可见，但绝不静默猜测。
         """
         import time as _time
 
         now = _time.monotonic()
         stamp = self._state_stamp()
         if self._owner_cache is not None:
-            at, cached_owner, cached_stamp = self._owner_cache
+            at, cached_owner, cached_stamp, cached_error = self._owner_cache
             if now - at <= OWNER_CACHE_TTL and stamp == cached_stamp:
+                self._owner_probe_error = cached_error
                 return cached_owner
 
         from .systemd import Systemd
 
         systemd = Systemd(self.inst)
-        if systemd.is_active():
+        probe_error: str | None = None
+        try:
+            active = systemd.is_active()
+        except FrpsctlError as exc:
+            probe_error = exc.render()
+            active = False
+
+        if active:
             owner = Owner.SYSTEMD
         elif self.inst.state.exists():
             owner = Owner.DIRECT
         else:
             owner = Owner.NONE
-        self._owner_cache = (now, owner, stamp)
+        self._owner_probe_error = probe_error
+        self._owner_cache = (now, owner, stamp, probe_error)
         return owner
+
+    def owner_probe_error(self) -> str | None:
+        """最近一次所有权探测中 systemd 侧的失败信息（成功为 None）。"""
+        return self._owner_probe_error
+
+    def _require_owner_known(self) -> None:
+        """变更类操作的前置门：systemd 探测失败时拒绝动手（ADR-7）。
+
+        探测失败意味着"所有权不可判定"（unit 可能在跑而我们看不见），此时
+        direct 路径的 read_ref 判定会把 systemd 托管实例误报成未运行/可启动。
+        查询可以降级（如实标记），**变更绝不能**——拒绝并给出可行动指引。
+        """
+        if self._owner_probe_error:
+            raise OwnershipConflict(
+                f"systemd 状态探测失败，无法安全判定实例所有权：{self._owner_probe_error}",
+                hint="请先恢复 systemd（`systemctl is-system-running`）后重试",
+            )
 
     def _state_stamp(self) -> tuple[int, int] | None:
         """state.json 的 `(mtime_ns, size)`；不存在为 None。
@@ -409,7 +450,12 @@ class Lifecycle:
         self._invalidate_owner()
         self.inst.ensure_private()  # 状态与日志马上要落盘，先把目录收紧
         with instance_lock(self.inst.lock):
-            if self.resolve_owner() is Owner.SYSTEMD:
+            owner = self.resolve_owner()
+            # 探测失败 → 所有权不可判定：拒绝动手（见 `_require_owner_known`）。
+            # 放在 systemd 委托分支**之前**：探测失败时 owner 是降级值，
+            # 沿它走 direct 路径可能对 systemd 托管实例双起。
+            self._require_owner_known()
+            if owner is Owner.SYSTEMD:
                 # ADR-1：所有权是 systemd 时**委托 systemctl**，不碰 pid 文件。
                 # 直接拒绝（旧行为）会让"已被 systemd 纳管"的实例在 frpsctl 里
                 # 完全不可操作，与文档承诺的"全部委托"相矛盾。
@@ -656,7 +702,12 @@ class Lifecycle:
         """
         self._invalidate_owner()
         with instance_lock(self.inst.lock):
-            if self.resolve_owner() is Owner.SYSTEMD:
+            owner = self.resolve_owner()
+            # 同 start：所有权不可判定时拒绝动手。stop 的 direct 路径会读
+            # state.json；systemd 托管实例通常没有 state.json，探测失败下会
+            # 被误报成"未运行(5)"——用户以为没在跑，而 unit 其实活着。
+            self._require_owner_known()
+            if owner is Owner.SYSTEMD:
                 return self._stop_via_systemd()
 
             ref = self.read_ref()  # 损坏时抛 ConfigError(3)，绝不当作"未运行"
@@ -806,6 +857,7 @@ class Lifecycle:
         corrupted = self.inst.state_corrupted()
         listen = parse_listen(self.inst.config)
         owner = self.resolve_owner()
+        probe_error = self._owner_probe_error
 
         if owner is Owner.SYSTEMD:
             # systemd 托管下 state.json **不参与任何判定**（ADR-1）：一份残留且
@@ -814,13 +866,13 @@ class Lifecycle:
             state, ref = State.SYSTEMD_ACTIVE, None
         else:
             if corrupted:
-                return self._indeterminate_report(listen=listen)
+                return self._indeterminate_report(listen=listen, probe_error=probe_error)
             try:
                 state, ref = self._state_from(owner)
             except ConfigError:
                 # 竞态：损坏检查之后、读取之前文件被写坏。status 承诺永不异常，
                 # 如实报告"不可判定"而不是把异常放给调用方。
-                return self._indeterminate_report(listen=listen)
+                return self._indeterminate_report(listen=listen, probe_error=probe_error)
 
         version_hint: str | None = None
         binary_version: str | None = None
@@ -885,10 +937,13 @@ class Lifecycle:
             systemd_unit=unit_name,
             systemd_main_pid=unit_pid,
             state_corrupted=corrupted,
+            systemd_probe_error=probe_error,
             listen=listen,
         )
 
-    def _indeterminate_report(self, *, listen: ListenInfo | None) -> StatusReport:
+    def _indeterminate_report(
+        self, *, listen: ListenInfo | None, probe_error: str | None = None
+    ) -> StatusReport:
         """state.json 损坏且无 systemd 时的"不可判定"报告。
 
         `status` 的承诺是**永远能回答"现在什么情况"**，因此这里如实报告
@@ -907,6 +962,7 @@ class Lifecycle:
             config=self.inst.config if self.inst.config.exists() else None,
             config_mode=mode,
             state_corrupted=True,
+            systemd_probe_error=probe_error,
             listen=listen,
         )
 

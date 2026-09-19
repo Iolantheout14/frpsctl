@@ -78,6 +78,9 @@ def status_payload(
         "owner": report.owner.value,
         "state": report.state.value,
         "state_corrupted": report.state_corrupted,
+        # systemd 探测失败时的如实标记（v0.3.1）：owner 是"按 state.json 降级
+        # 判定"的结果，脚本据此区分"真的没有 systemd"与"systemd 没应答"。
+        "systemd_probe_error": report.systemd_probe_error,
         "pid": report.pid,
         "uptime_seconds": report.uptime_seconds,
     }

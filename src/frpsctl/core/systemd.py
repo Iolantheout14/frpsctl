@@ -262,7 +262,29 @@ def render_web_unit(
 
 
 def _systemctl(*args: str, timeout: float = 10) -> subprocess.CompletedProcess:
-    return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
+    """执行一次 systemctl。**超时必须收口**。
+
+    `subprocess.TimeoutExpired` 既不是 `FrpsctlError` 也不是 `OSError`，放任它
+    冒出去会在 CLI 顶层变成"未分类错误(1)"——把"systemd 无响应"误报成"工具
+    内部出错"（与 `release._verify_binary` 在 v0.2.1 修过的是同一类缺口，
+    systemd 一侧此前一直敞着）。收口为契约内异常后，调用方可以分别决定：
+    查询路径降级并如实报告，变更路径 fail-closed 拒绝。
+    """
+    try:
+        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise FrpsctlError(
+            f"systemctl {' '.join(args)} 超时未返回（{timeout:g} 秒）",
+            hint="systemd 可能无响应；用 `systemctl is-system-running` 确认后重试",
+        ) from None
+    except OSError as exc:
+        # systemctl 在 `available` 检查与执行之间被删除/失去执行权限（罕见
+        # 竞态）。必须同样收口：`resolve_owner` 只捕获 FrpsctlError，裸 OSError
+        # 会让 status 崩成"未分类错误(1)"（v0.3.1 review 复查）。
+        raise FrpsctlError(
+            f"无法执行 systemctl：{exc}",
+            hint="确认 systemd 已安装且在 PATH 中",
+        ) from None
 
 
 def _systemctl_checked(*args: str) -> None:
@@ -671,15 +693,18 @@ class Systemd:
             "--plain",
             timeout=5,
         )
+        units: list[str] = []
         for line in out.stdout.splitlines():
-            parts = line.split()
-            unit = parts[0] if parts else ""
-            if not unit or not unit.endswith(".service"):
-                continue
-            show = self._run("show", "-p", "ExecStart", "--value", unit, timeout=5)
-            if str(self.inst.config) in show.stdout:
-                return True
-        return False
+            # 行首可能有 `●`（failed 标记）等状态符号：取第一个像 unit 名的 token。
+            unit = next((part for part in line.split() if part.endswith(".service")), "")
+            if unit:
+                units.append(unit)
+        if not units:
+            return False
+        # 批量一次查询（v0.3.1）：此前逐个 unit `systemctl show`——多实例机器上
+        # 30 个 active unit 就是 30 次子进程（~300ms），而且发生在 start 的锁内。
+        show = self._run("show", "-p", "ExecStart", "--value", *units, timeout=10)
+        return str(self.inst.config) in show.stdout
 
     def journal_argv(self, *, lines: int = 100, follow: bool = False) -> list[str]:
         """构造查看该 unit 日志的 journalctl argv（CLI 负责执行）。
