@@ -2625,3 +2625,217 @@ class TestRegressionReviewCliFixes:
         )
         lifecycle_mod._print_status(ctx, lc=fake)
         assert calls["n"] == 0, "传入 lc 时不应再新建 Lifecycle"
+
+
+class TestNumericOptionBounds:
+    """v0.3.1：数值选项的**上限**收口。
+
+    Web 侧 v0.2.3 就给全部动作参数设了范围（`_bounded_float`），而 CLI 侧
+    只有下界——`--health-timeout 999999` 会真的等待 11.5 天，`-n 10^9` 会把
+    整份日志拉进内存。参数笔误必须变成用法错误(2)，而不是一个无界动作。
+    """
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["start", "--health-timeout", "999999"],
+            ["start", "--health-timeout", "-1"],
+            ["stop", "--timeout", "1e9"],
+            ["restart", "--timeout", "1e9"],
+            ["restart", "--health-timeout", "1e9"],
+            ["status", "--interval", "99999"],
+            ["log", "-n", "999999999"],
+            ["service", "logs", "-n", "999999999"],
+            ["config", "set", "bindPort", "7000", "--health-timeout", "99999"],
+            ["config", "apply", "--set", "bindPort=7000", "--health-timeout", "99999"],
+            ["config", "rollback", "--health-timeout", "99999"],
+        ],
+    )
+    def test_out_of_range_is_usage_error(self, cli_env, args) -> None:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2, f"{args} → {result.exit_code}: {result.output}"
+
+    def test_boundary_value_is_accepted(self, cli_env) -> None:
+        """上限本身必须可用（600 是合法值，不应被拒）。"""
+        result = runner.invoke(app, ["start", "--health-timeout", "600"])
+        assert result.exit_code != 2, result.output
+
+
+class TestEntryPointRobustness:
+    """v0.3.1：入口层的环境健壮性（ASCII locale / `--version` 快路径 / 惰性导入）。
+
+    这三条都只有**真实子进程**能测：locale 与 import 行为在进程启动时就决定了，
+    进程内 monkeypatch 测不到。
+    """
+
+    def _run(self, args, tmp_path, **env_extra):
+        import os
+        import subprocess
+        import sys
+
+        env = dict(os.environ)
+        env.update(env_extra)
+        env["FRPSCTL_ROOT"] = str(tmp_path / "instances")
+        env["FRPSCTL_DATA_HOME"] = str(tmp_path / "data")
+        return subprocess.run(
+            [sys.executable, "-m", "frpsctl", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=60,
+        )
+
+    def test_ascii_locale_keeps_utf8_stdout(self, tmp_path) -> None:
+        """`LC_ALL=C` + coercion 关闭时，中文 stdout 输出必须照常。
+
+        修复前：`stdout.encoding=ascii` + strict → `UnicodeEncodeError` →
+        未分类错误(1)（`capabilities` / `doctor` 等输出中文的命令全部崩）。
+        修复后：入口 `configure_streams()` 固定 UTF-8 输出。
+        """
+        result = self._run(
+            ["capabilities"],
+            tmp_path,
+            LC_ALL="C",
+            LANG="C",
+            PYTHONCOERCECLOCALE="0",
+            PYTHONUTF8="0",
+        )
+        assert result.returncode == 0, result.stderr
+        assert "命令（" in result.stdout, result.stdout[:300]
+        assert "\\u" not in result.stdout, "中文被转义成乱码（stderr 兜底策略泄漏到 stdout）"
+
+    def test_ascii_locale_error_message_is_readable(self, tmp_path) -> None:
+        """同一环境下的**错误消息**（stderr）也必须是真中文，而非 `\\uXXXX`。"""
+        result = self._run(
+            ["--instance", "robust", "config", "get", "no.such.key"],
+            tmp_path,
+            LC_ALL="C",
+            LANG="C",
+            PYTHONCOERCECLOCALE="0",
+            PYTHONUTF8="0",
+        )
+        assert result.returncode == 3, (result.returncode, result.stderr)
+        assert "配置文件不存在" in result.stderr, result.stderr[:300]
+
+    def test_version_fast_path_does_not_hijack_host_processes(self) -> None:
+        """快路径只服务于**真正的 CLI 入口**（v0.3.1 review 收窄）。
+
+        `frpsctl.cli` 也会被 `capabilities.command_paths()` 作为库 import——
+        若无条件判断 argv，宿主程序命令行恰为 `--version` 时会被劫持成
+        "打印 frpsctl 版本并退出"。这里用非 frpsctl 的 argv[0] 复现宿主场景。
+        """
+        import subprocess
+        import sys
+
+        code = (
+            "import sys\n"
+            "sys.argv = ['some-host-app', '--version']\n"
+            "import frpsctl.cli\n"  # 不得 SystemExit/打印
+            "from frpsctl.capabilities import command_paths\n"
+            "assert len(command_paths()) >= 55\n"
+            "print('host-safe')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "host-safe", result.stdout
+        assert "frpsctl 0.3" not in result.stdout
+
+    def test_version_fast_path_skips_heavy_imports(self) -> None:
+        """`frpsctl --version` 不得加载 httpx / pydantic / typer（v0.3.1 快路径）。
+
+        这是脚本高频调用的探测命令；完整命令链的冷启动成本不该由它承担。
+        """
+        import subprocess
+        import sys
+
+        code = (
+            "import sys\n"
+            "sys.argv = ['frpsctl', '--version']\n"
+            "try:\n"
+            "    import frpsctl.cli\n"
+            "except SystemExit as exc:\n"
+            "    assert exc.code == 0\n"
+            "print('httpx' in sys.modules, 'pydantic' in sys.modules, 'typer' in sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.strip().splitlines()
+        assert lines[0].startswith("frpsctl "), lines  # 快路径打印的版本
+        assert lines[-1] == "False False False", result.stdout
+        assert result.stderr == ""
+
+    def test_status_chain_defers_http_client_and_schema(self) -> None:
+        """常见命令链不为 dashboard（httpx）与校验模型（pydantic）付费。
+
+        `status` 在实例未运行/未开 dashboard 时根本不需要 HTTP；`doctor`
+        也不需要 pydantic（`PORT_FIELDS` 已迁到 healthcheck）。两者的导入
+        成本因此推迟到真正使用时。
+        """
+        import subprocess
+        import sys
+
+        code = (
+            "import sys\n"
+            "sys.argv = ['frpsctl', 'status']\n"
+            "import frpsctl.cli\n"
+            "print('httpx' in sys.modules, 'pydantic' in sys.modules)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "False False", result.stdout
+
+
+class TestBestEffortSystemdProbes:
+    """v0.3.1 自检补正：**动作已完成**之后的 systemd 探测失败不得让命令变失败。
+
+    三处同型缺口（系统化复查 `is_active()` 全部调用点时发现）：install 的换链
+    提示、web password set 的运行提示、uninstall 的 unit 清理探测（后者收进
+    warnings 并把该项标为"需人工确认"）。
+    """
+
+    @staticmethod
+    def _break_systemctl(monkeypatch) -> None:
+        from frpsctl.core import systemd as systemd_mod
+        from frpsctl.errors import FrpsctlError
+
+        def boom(*_args, **_kwargs):
+            raise FrpsctlError("systemctl 超时未返回（10 秒）")
+
+        monkeypatch.setattr(systemd_mod, "_systemctl", boom)
+
+    def test_install_succeeds_when_systemd_probe_fails(self, cli_env, monkeypatch) -> None:
+        install_fake_binary(cli_env)  # frps 已在盘上 → 不下载、只换链
+        self._break_systemctl(monkeypatch)
+        result = runner.invoke(app, ["install"])
+        assert result.exit_code == 0, result.output
+        # 正常的 systemd 提示行（其文案含 "ExecStart 写的是具体路径"）不得出现；
+        # 而"无法探测"的降级告警必须出现（断言用这两个独特短语，避免与告警
+        # 文案里的"若该实例由 systemd 托管"撞词）。
+        assert "ExecStart 写的是具体路径" not in result.output, "探测失败时不应输出托管提示"
+        assert "无法探测" in result.stderr, "降级必须可见（提示自行确认托管状态）"
+
+    def test_password_set_succeeds_when_systemd_probe_fails(self, cli_env, monkeypatch) -> None:
+        self._break_systemctl(monkeypatch)
+        result = runner.invoke(app, ["web", "password", "set"])
+        assert result.exit_code == 0, result.output
+        assert "无法探测" in result.stderr, result.stderr
+        password_file = cli_env / "instances" / "default" / "web-password"
+        assert password_file.exists(), "口令必须已写入（探测失败不影响写入口径）"
+
+    def test_password_set_json_flags_restart_when_probe_fails(self, cli_env, monkeypatch) -> None:
+        """无法探测时 JSON 保守地建议重启（宁可多重启一次）。"""
+        import json as _json
+
+        self._break_systemctl(monkeypatch)
+        result = runner.invoke(app, ["web", "password", "set", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = _json.loads(result.stdout)
+        assert payload["service_active"] is None
+        assert payload["restart_required"] is True

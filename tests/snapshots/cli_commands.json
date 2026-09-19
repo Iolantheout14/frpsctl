@@ -188,6 +188,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -264,6 +266,8 @@
         "default": 1,
         "is_flag": false,
         "kind": "opt",
+        "max": null,
+        "min": 1,
         "multiple": false,
         "name": "steps",
         "opts": [
@@ -280,6 +284,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -389,6 +395,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -413,6 +421,8 @@
         "default": 1,
         "is_flag": false,
         "kind": "opt",
+        "max": null,
+        "min": 1,
         "multiple": false,
         "name": "steps",
         "opts": [
@@ -441,6 +451,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -541,6 +553,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -621,6 +635,8 @@
         "default": 7000,
         "is_flag": false,
         "kind": "opt",
+        "max": 65535,
+        "min": 1,
         "multiple": false,
         "name": "bind_port",
         "opts": [
@@ -633,6 +649,8 @@
         "default": 7500,
         "is_flag": false,
         "kind": "opt",
+        "max": 65535,
+        "min": 0,
         "multiple": false,
         "name": "dashboard_port",
         "opts": [
@@ -814,6 +832,8 @@
         "default": 100,
         "is_flag": false,
         "kind": "opt",
+        "max": 100000,
+        "min": 0,
         "multiple": false,
         "name": "lines",
         "opts": [
@@ -896,6 +916,8 @@
         "default": 50,
         "is_flag": false,
         "kind": "opt",
+        "max": 10000,
+        "min": 1,
         "multiple": false,
         "name": "lines",
         "opts": [
@@ -1433,6 +1455,8 @@
         "default": null,
         "is_flag": false,
         "kind": "opt",
+        "max": null,
+        "min": 0,
         "multiple": false,
         "name": "max_proxies",
         "opts": [
@@ -1589,6 +1613,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -1613,6 +1639,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "timeout",
         "opts": [
@@ -1706,6 +1734,8 @@
         "default": 100,
         "is_flag": false,
         "kind": "opt",
+        "max": 100000,
+        "min": 1,
         "multiple": false,
         "name": "lines",
         "opts": [
@@ -1767,6 +1797,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "health_timeout",
         "opts": [
@@ -1795,6 +1827,8 @@
         "default": 2.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 3600,
+        "min": 0.1,
         "multiple": false,
         "name": "interval",
         "opts": [
@@ -1859,6 +1893,8 @@
         "default": 10.0,
         "is_flag": false,
         "kind": "opt",
+        "max": 600,
+        "min": 0,
         "multiple": false,
         "name": "timeout",
         "opts": [
@@ -2048,6 +2084,8 @@
         "default": 50,
         "is_flag": false,
         "kind": "opt",
+        "max": 10000,
+        "min": 1,
         "multiple": false,
         "name": "lines",
         "opts": [

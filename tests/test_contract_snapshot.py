@@ -5,7 +5,17 @@ CLI 内核重构（拆分 `cli/__init__.py` 为命令包、引入 Runtime 注入
 flag/取值形态、必填性与默认值。这份快照就是那条"零变化"的守门人。
 
 基线文件：`tests/snapshots/cli_commands.json`（首次生成后人工审查并提交）。
-有意变更命令面时：删除基线并重跑一次（会重新生成），然后在 diff 里逐条审查。
+有意变更命令面时：
+
+    .venv/bin/python -m tests.test_contract_snapshot --update
+
+然后 `git diff tests/snapshots/cli_commands.json` **逐条审查**变更是否就是预期
+（v0.3.1 起带生成入口；此前文档只写了"删除基线重跑"，但测试并不会自动重建——
+照做只会得到 FileNotFoundError，已修正为显式命令）。
+
+快照包含**数值范围**（`min` / `max`，来自 Click 的 IntRange/FloatRange）：
+CLI 的参数越界行为是脚本化契约的一部分（v0.3.1 给全部时长/行数参数补了上限），
+没有这条守卫，范围被谁悄悄改回去都不会有人知道。
 
 **为什么需要它**：命令面是脚本化契约（README 命令表、shell 补全、用户脚本都
 依赖它），而文件拆分/名字迁移这类重构**不会**让既有行为测试变红——它们只是
@@ -98,18 +108,21 @@ def _describe(cmd) -> list[dict]:
     out: list[dict] = []
     for param in cmd.params:
         if hasattr(param, "opts"):
-            out.append(
-                {
-                    "kind": "opt",
-                    "name": param.name,
-                    "opts": sorted(param.opts),
-                    "secondary": sorted(getattr(param, "secondary_opts", [])),
-                    "is_flag": bool(getattr(param, "is_flag", False)),
-                    "multiple": bool(getattr(param, "multiple", False)),
-                    "required": bool(getattr(param, "required", False)),
-                    "default": _default_desc(param.default),
-                }
-            )
+            entry = {
+                "kind": "opt",
+                "name": param.name,
+                "opts": sorted(param.opts),
+                "secondary": sorted(getattr(param, "secondary_opts", [])),
+                "is_flag": bool(getattr(param, "is_flag", False)),
+                "multiple": bool(getattr(param, "multiple", False)),
+                "required": bool(getattr(param, "required", False)),
+                "default": _default_desc(param.default),
+            }
+            ptype = getattr(param, "type", None)
+            if hasattr(ptype, "min") or hasattr(ptype, "max"):
+                entry["min"] = getattr(ptype, "min", None)
+                entry["max"] = getattr(ptype, "max", None)
+            out.append(entry)
         else:
             out.append(
                 {
@@ -181,3 +194,25 @@ def test_global_option_after_subcommand_is_hoisted() -> None:
     payload = json.loads(result.output)
     assert payload["state"] == "STOPPED"
     assert "No such option" not in result.output
+
+
+def main(argv: list[str] | None = None) -> int:
+    """显式生成/更新基线：`python -m tests.test_contract_snapshot --update`。
+
+    更新后必须 `git diff` 逐条审查——这份文件的意义就是"变更必须被看见"。
+    """
+    import sys
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--update"]:
+        SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(build_snapshot(), indent=2, sort_keys=True, ensure_ascii=False)
+        SNAPSHOT_PATH.write_text(payload + "\n", "utf-8")
+        print(f"已生成基线：{SNAPSHOT_PATH}")
+        return 0
+    print("用法：python -m tests.test_contract_snapshot --update")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

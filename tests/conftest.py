@@ -112,6 +112,38 @@ def _clean_proxy_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _stabilize_systemctl(monkeypatch):
+    """把所有 `systemctl` 探测确定性化（v0.3.1 review 收口为**无条件**）。
+
+    背景：`resolve_owner` / 卸载预检与清理会真实调用 `systemctl cat <unit>`。
+    测试中的 unit **从来不存在**，所以真实 systemd 上的正确结果永远是"非零、
+    unit 不存在"；但宿主响应时间不可靠——v0.3.1 review 实测到 WSL 上 systemctl
+    偶发超时（即使 `is-system-running` 返回 running），超时被新代码收口成
+    "探测失败"，会误伤两类断言：① "无假警告"（已收窄文案）；② **走
+    `_precheck` 的卸载测试会被 fail-closed 拒绝**（收窄救不了）。让测试结果
+    依赖宿主 systemd 的响应时间是错误的。
+
+    因此统一"快速失败"（退出码 1 = unit 不存在，与真实 systemd 的语义一致），
+    测试与宿主彻底解耦，同时省掉每个用例的 systemctl 子进程。
+
+    实现选择 patch `subprocess.run` 而非 `_systemctl`：test_units / test_faults
+    会自己 patch `subprocess.run` 来构造 systemctl 行为（或注入超时），
+    monkeypatch 后设置者生效、逆序恢复——测试级 patch 稳定覆盖本 fixture
+    （已验证：test_units 的 systemd 组与 faults 注入均不受影响）。
+    """
+    real_run = subprocess.run
+
+    def fast_fail(argv, **kwargs):
+        if isinstance(argv, (list, tuple)) and argv and str(argv[0]).endswith("systemctl"):
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="System has not been booted with systemd"
+            )
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fast_fail)
+
+
 @pytest.fixture
 def write_config(inst: Instance):
     """写一份最小可用配置。"""

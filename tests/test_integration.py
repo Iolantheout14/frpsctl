@@ -1032,7 +1032,7 @@ class TestUninstall:
             lc.stop()
 
     def test_force_stops_running_instance_then_removes(self, inst, write_config) -> None:
-        from frpsctl.core.platform import pid_alive
+        from frpsctl.core.platform import process_gone
         from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
 
         write_config(BASIC_CONFIG)
@@ -1041,7 +1041,13 @@ class TestUninstall:
 
         report = execute_uninstall(plan_uninstall(inst), force=True)
 
-        assert not pid_alive(started.pid), "--force 必须先停止实例"
+        # 用 `process_gone` 而不是 `pid_alive`：假 frps 被 SIGTERM 后是**僵尸**
+        # （父进程没有 wait 它），而 `kill(pid, 0)` 对僵尸仍返回成功——`pid_alive`
+        # 会把"已终止"误报成"存活"。此前这条断言恰好靠"其它 systemctl 子进程
+        # 的 subprocess._cleanup 顺带 reap 僵尸"的副作用通过；conftest 把
+        # systemctl 确定性化后副作用消失，脆弱性现形（v0.3.1 最后一轮 review）。
+        # `process_gone`（含僵尸判定）正是产品里"停止是否真的完成"的官方判据。
+        assert process_gone(started.pid), "--force 必须先停止实例（僵尸亦算已终止）"
         assert not inst.dir.exists()
         assert report.stopped, "停止动作必须出现在报告里"
 
@@ -1101,7 +1107,12 @@ class TestUninstall:
         plan = plan_uninstall(inst, keep_bin=True)
         report = execute_uninstall(plan, unit_dir=unit_dir)
 
-        assert not any("frps@test" in item for item in report.warnings), report.warnings
+        # 断言只针对**权限类假警告**（"需要 root 才能停用 frps@test"）。
+        # "无法探测 unit 状态"是另一类**真警告**（systemd 无响应时的可见降级，
+        # v0.3.1）——宿主 systemctl 偶发超时时它合法出现，不应误伤本断言
+        # （review 实测：WSL 下一次 flaky 即由此而来；conftest 还会把无
+        # systemd 宿主的探测确定性化，双保险）。
+        assert not any("需要 root" in item for item in report.warnings), report.warnings
 
     def test_unit_cleanup_degrades_visibly(self, inst, write_config, tmp_path, monkeypatch) -> None:
         """本实例 unit 处于 enabled 但权限不足：不静默跳过，警告里给出命令。

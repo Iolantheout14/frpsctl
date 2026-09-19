@@ -545,11 +545,172 @@ class TestRejectRateLimiting:
 # ---------------------------------------------------------------------------
 
 
+class TestBoundedConcurrency:
+    """插件并发有界（v0.3.1）：worker 用尽时 503，线程不无界增长。
+
+    插件是**登录单点**且 frp 侧对插件请求没有超时——连接风暴下必须快速失败
+    （503 = 该操作失败，fail-closed 方向正确），而不是无界堆线程。实现与 Web
+    管理台共用 `core/httpserver.py`（此前只有管理台有上限）。
+    """
+
+    def test_exhausted_workers_get_503(self, policy) -> None:
+        import threading
+        import urllib.error
+        import urllib.request
+
+        from frpsctl.plugin.server import PluginServer, ServerSettings
+
+        entered = threading.Event()
+        release = threading.Event()
+        server = PluginServer(
+            policy,
+            ServerSettings(bind="127.0.0.1:0", path="/handler", max_workers=1),
+        )
+        original_handle = server.engine.handle
+
+        def blocking_handle(request, *, source=""):
+            entered.set()
+            release.wait(5)
+            return original_handle(request, source=source)
+
+        server.engine.handle = blocking_handle
+        server.start()
+        try:
+            url = f"http://127.0.0.1:{server.address[1]}/handler?op=Ping&version=0.1.0"
+            request = lambda: urllib.request.Request(  # noqa: E731
+                url, data=b'{"content":{}}', headers={"Content-Type": "application/json"}
+            )
+            first_done: list[bool] = []
+
+            def first_call() -> None:
+                with urllib.request.urlopen(request(), timeout=10) as resp:  # noqa: S310
+                    resp.read()
+                first_done.append(True)
+
+            first = threading.Thread(target=first_call)
+            first.start()
+            assert entered.wait(5), "第一个请求没有进入 handler"
+
+            # 唯一 worker 被占住：第二个请求必须立即 503，而不是排队等待。
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                urllib.request.urlopen(request(), timeout=5)  # noqa: S310
+            assert excinfo.value.code == 503, excinfo.value.code
+
+            release.set()
+            first.join(timeout=10)
+            assert first_done == [True], "被占住的请求在释放后没有完成"
+        finally:
+            release.set()
+            server.close()
+
+    def test_concurrent_burst_gets_bounded_responses(self, policy) -> None:
+        """20 个并发请求在 2 个 worker 下：每个请求都有**明确结局**，无挂死。
+
+        结局都是明确的成功/失败：`200`（被处理）、`503`（worker 用尽时的
+        HTTP 快速失败）、或连接层异常（服务端 close 与客户端发送的竞态触发
+        内核 RST/EOF——对 frp 同样是"该操作失败"）。
+
+        **不**断言"必须出现拒绝"：拒绝何时发生取决于 20 个客户端线程的实际
+        到达节奏（调度敏感，会 flaky）。确定性拒绝由
+        `test_exhausted_workers_get_503`（Event 占住唯一 worker）保证；
+        本测试的职责是"burst 下不挂死、结局封闭、线程有界"。
+        """
+        import time as _time
+        import urllib.error
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor
+
+        from frpsctl.plugin.server import PluginServer, ServerSettings
+
+        server = PluginServer(
+            policy,
+            ServerSettings(bind="127.0.0.1:0", path="/handler", max_workers=2),
+        )
+        original_handle = server.engine.handle
+
+        def slow_handle(request, *, source=""):
+            _time.sleep(0.05)
+            return original_handle(request, source=source)
+
+        server.engine.handle = slow_handle
+        server.start()
+        try:
+            url = f"http://127.0.0.1:{server.address[1]}/handler?op=Ping&version=0.1.0"
+
+            def call() -> int | str:
+                request = urllib.request.Request(  # noqa: S310
+                    url, data=b'{"content":{}}', headers={"Content-Type": "application/json"}
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as resp:  # noqa: S310
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    return exc.code
+                except OSError as exc:
+                    # RST/EOF 是连接层拒绝（内核语义），同样是"明确结局"。
+                    return f"ERR:{type(exc).__name__}"
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                codes = list(pool.map(lambda _index: call(), range(20)))
+        finally:
+            server.close()
+        assert len(codes) == 20, codes
+        assert all(code == 200 or code == 503 or isinstance(code, str) for code in codes), codes
+        assert codes.count(200) >= 1, f"应有一部分请求被正常处理：{codes}"
+
+    def test_default_worker_caps(self) -> None:
+        """两处默认上限是显式契约（管理台 32 / 插件 64）。"""
+        from frpsctl.plugin.server import ServerSettings
+        from frpsctl.web.server import WebSettings
+
+        assert WebSettings().max_workers == 32
+        assert ServerSettings().max_workers == 64
+
+
+class TestRejectLimiterBounded:
+    """拒绝风暴限速器的追踪表**有界**（v0.3.1）。
+
+    `user` 是客户端自报的任意字符串：持续换名的拒绝风暴可以让 `_hits` /
+    `_suppressed` 无界增长——与 web/auth 的失败来源表同一条纪律（输入驱动的
+    表必须有界）。驱逐绝不会改变安全语义（请求仍然被拒绝）。
+    """
+
+    def test_tracked_users_are_bounded(self) -> None:
+        from frpsctl.plugin.engine import RejectLimiter
+
+        clock = [0.0]
+        limiter = RejectLimiter(burst=1, window=10.0, clock=lambda: clock[0], max_tracked=64)
+        for index in range(1000):
+            limiter.check(f"attacker-{index}")
+        assert len(limiter._hits) <= 64, f"追踪表无界：{len(limiter._hits)}"
+        assert len(limiter._suppressed) <= 64
+
+    def test_eviction_does_not_change_decisions(self) -> None:
+        """驱逐后，被驱逐的用户只是重新获得"被逐条记录"的额度——仍会被拒绝。"""
+        from frpsctl.plugin.engine import RejectLimiter
+
+        clock = [0.0]
+        limiter = RejectLimiter(burst=1, window=10.0, clock=lambda: clock[0], max_tracked=4)
+        assert limiter.check("victim")[0] is True
+        for index in range(10):
+            limiter.check(f"other-{index}")
+        keep, _suppressed = limiter.check("victim")
+        assert keep is True, "被驱逐条目重新出现时应恢复记录（而不是丢弃拒绝）"
+
+    def test_default_cap_is_explicit(self) -> None:
+        from frpsctl.plugin.engine import MAX_TRACKED_USERS, RejectLimiter
+
+        clock = [0.0]
+        assert RejectLimiter(burst=1, window=1.0, clock=lambda: clock[0]).max_tracked == MAX_TRACKED_USERS
+        assert MAX_TRACKED_USERS >= 1024, "上限过小会让正常用户被频繁驱逐"
+
+
 @pytest.mark.contract
 @pytest.mark.skipif(
     not Path(FRPS_BIN).exists() or not Path(FRPC_BIN).exists(),
     reason="需要真实 frps 与 frpc（见 FRPSCTL_TEST_BINARY / FRPSCTL_TEST_FRPC）",
 )
+
 class TestRealFrpcContract:
     """**唯一能证明"我们接得住 frp 调用"的一组测试。**
 

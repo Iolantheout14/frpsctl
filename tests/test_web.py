@@ -1197,13 +1197,11 @@ class TestWebOperationAudit:
     """Web 操作审计：动作与登录留痕、来源/会话指纹、读接口 scope。"""
 
     @pytest.fixture(autouse=True)
-    def _reset_login_limiter(self):
-        """失败登录审计限速是模块级状态：每个用例前后都要清（测试隔离）。"""
-        from frpsctl.web import server as web_server
-
-        web_server._login_fail_limiter._last.clear()
+    def _reset_login_limiter(self, web):
+        """失败登录审计限速是 per-WebContext 状态（v0.3.1）：按上下文清（测试隔离）。"""
+        web.ctx.login_audit._last.clear()
         yield
-        web_server._login_fail_limiter._last.clear()
+        web.ctx.login_audit._last.clear()
 
     def _summary(self, web):
         from frpsctl.core import web_audit
@@ -1259,13 +1257,42 @@ class TestWebOperationAudit:
 
     def test_login_failure_audit_is_rate_limited(self, web) -> None:
         """同来源 60 秒内的重复失败只记一条（防审计文件被爆破刷爆）。"""
-        from frpsctl.web import server as web_server
-
-        web_server._login_fail_limiter._last.clear()
+        web.ctx.login_audit._last.clear()
         for _ in range(4):
             Client(web).login("wrong")
         summary = self._summary(web)
         assert summary.error == 1, f"失败登录被逐条记录：{summary}"
+
+    def test_login_audit_limiter_is_per_context(self, tmp_path) -> None:
+        """v0.3.1：审计限速属于 WebContext 实例，不再是模块级单例。
+
+        模块级状态在多实例/多用例之间互相串味：前一个管理台的失败会压制
+        后一个的审计记录（测试里表现为 flaky），而这本应是"每进程一份"。
+        """
+        from frpsctl.core.instance import Instance
+        from frpsctl.web.api import WebContext
+        from frpsctl.web.auth import AuthManager, LoginAuditLimiter
+
+        inst = Instance(name="iso", instances_root=tmp_path / "i", data_home=tmp_path / "d")
+        one = WebContext(inst=inst, auth=AuthManager("pw"))
+        two = WebContext(inst=inst, auth=AuthManager("pw"))
+        assert one.login_audit.allow("1.2.3.4") is True
+        assert one.login_audit.allow("1.2.3.4") is False
+        assert two.login_audit.allow("1.2.3.4") is True, "另一个上下文不应被压制"
+
+        clock = [0.0]
+        limiter = LoginAuditLimiter(window=60.0, clock=lambda: clock[0])
+        assert limiter.allow("s") is True
+        clock[0] = 59.0
+        assert limiter.allow("s") is False
+        clock[0] = 60.0
+        assert limiter.allow("s") is True, "窗口过后应恢复放行"
+
+        # 来源表有界（输入驱动的表必须有界）：超限驱逐最早来源。
+        evicting = LoginAuditLimiter(window=0.0, max_sources=2, clock=lambda: 0.0)
+        for source in ("a", "b", "c"):
+            assert evicting.allow(source) is True
+        assert len(evicting._last) <= 2, "来源表必须有界"
 
     def test_audit_scope_web_payload(self, web) -> None:
         client = Client(web)
@@ -1420,9 +1447,10 @@ class TestBoundedConcurrency:
     """请求线程有界：worker 用尽时立即 503（不无限排队）。"""
 
     def test_exhausted_workers_get_503(self, web_ctx) -> None:
-        from frpsctl.web.server import _BoundedThreadingHTTPServer
+        # v0.3.1：实现已提取到 core/httpserver.py（与插件服务共用）
+        from frpsctl.core.httpserver import BoundedThreadingHTTPServer
 
-        server = _BoundedThreadingHTTPServer(
+        server = BoundedThreadingHTTPServer(
             ("127.0.0.1", 0), _NullHandler, max_workers=1
         )
         try:
@@ -1431,6 +1459,16 @@ class TestBoundedConcurrency:
                 def __init__(self) -> None:
                     self.sent = b""
                     self.closed = False
+                    self.drained = 0
+
+                def setblocking(self, _flag: bool) -> None:
+                    pass
+
+                def recv(self, _size: int) -> bytes:
+                    self.drained += 1
+                    if self.drained > 1:
+                        raise BlockingIOError  # 缓冲读空
+                    return b'POST /x HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}'
 
                 def sendall(self, data: bytes) -> None:
                     self.sent += data
@@ -1451,8 +1489,66 @@ class TestBoundedConcurrency:
             server.server_close()
 
 
+    def test_503_send_failure_is_silent(self) -> None:
+        """超限时向断开的连接写 503 可能失败：必须静默（不把异常带给调用方）。"""
+        from frpsctl.core.httpserver import BoundedThreadingHTTPServer
+
+        server = BoundedThreadingHTTPServer(("127.0.0.1", 0), _NullHandler, max_workers=1)
+        try:
+
+            class _BoomSock:
+                def setblocking(self, _flag: bool) -> None:
+                    pass
+
+                def recv(self, _size: int) -> bytes:
+                    raise BlockingIOError
+
+                def sendall(self, _data: bytes) -> None:
+                    raise OSError("broken pipe")
+
+                def shutdown(self, _how: int) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            assert server._workers.acquire(blocking=False), "测试自占 worker"
+            server.process_request(_BoomSock(), ("127.0.0.1", 1))  # 不抛
+        finally:
+            server._workers.release()
+            server.server_close()
+
+    def test_worker_slot_released_when_spawn_fails(self, monkeypatch) -> None:
+        """派生线程失败时名额必须归还（否则额度随失败次数泄漏）。"""
+        from http.server import ThreadingHTTPServer
+
+        from frpsctl.core.httpserver import BoundedThreadingHTTPServer
+
+        server = BoundedThreadingHTTPServer(("127.0.0.1", 0), _NullHandler, max_workers=1)
+        try:
+
+            def boom(_self, _request, _client_address):
+                raise RuntimeError("spawn failed")
+
+            monkeypatch.setattr(ThreadingHTTPServer, "process_request", boom)
+
+            class _Sock:
+                def shutdown(self, _how: int) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+            with pytest.raises(RuntimeError):
+                server.process_request(_Sock(), ("127.0.0.1", 1))
+            assert server._workers.acquire(blocking=False), "失败后名额未归还"
+            server._workers.release()
+        finally:
+            server.server_close()
+
+
 class _NullHandler:
-    """占位 handler（`_BoundedThreadingHTTPServer` 只要求可被引用）。"""
+    """占位 handler（`BoundedThreadingHTTPServer` 只要求可被引用）。"""
 
 
 class TestFinalReviewGuards:
@@ -1531,3 +1627,72 @@ class TestFinalReviewGuards:
             assert _call(good, "203.0.113.8") == 200, "不同来源不应被连带限速"
         finally:
             server.stop()
+
+
+class TestStatusResponseCache:
+    """`/api/status` 的 6 秒服务端缓存（v0.3.1）。
+
+    页面每 5 秒轮询 status，而每次生成都要做 L2/L3 网络探针 + `server_info`；
+    TTL 必须 ≥ 轮询间隔才有意义（v0.3.0 的量化教训）。写操作经
+    `ctx.cache.invalidate()` 保证本进程操作即时可见；外部变化最多滞后一个 TTL。
+    """
+
+    def _counting_status(self, monkeypatch):
+        from frpsctl.core.lifecycle import Lifecycle
+
+        calls = {"n": 0}
+        original = Lifecycle.status
+
+        def counting(self):
+            calls["n"] += 1
+            return original(self)
+
+        monkeypatch.setattr(Lifecycle, "status", counting)
+        return calls
+
+    def test_repeated_polls_hit_the_cache(self, web, monkeypatch) -> None:
+        calls = self._counting_status(monkeypatch)
+        client = Client(web)
+        client.login()
+        before = calls["n"]
+        status_a, payload_a, _ = client.call("/api/status")
+        status_b, payload_b, _ = client.call("/api/status")
+        assert status_a == status_b == 200
+        assert payload_a == payload_b
+        assert calls["n"] == before + 1, (
+            f"第二次轮询未命中缓存（Lifecycle.status 被调 {calls['n'] - before} 次）"
+        )
+
+    def test_thirty_second_polling_uses_three_computations(self, web, monkeypatch) -> None:
+        """30 秒 / 6 轮轮询的真实计算次数：**3 次**（不是 6 次，也不是 1 次）。
+
+        TTL=6s 且命中不刷新时间戳：轮询网格 0/5/10/15/20/25s 下计算发生在
+        0/10/20 三处（每两轮一次），数据陈旧 ≤6s。"TTL ≥ 轮询间隔"保证的是
+        **每一轮都吃得到上一份缓存**；若命中续期（滑动过期）则数据永不刷新
+        ——那是更糟的失败。这条测试锁定真实语义（v0.3.1 自检修正了方案初稿
+        "6 → 1"的乐观估算）。
+        """
+        clock = [0.0]
+        monkeypatch.setattr(web.ctx, "clock", lambda: clock[0])
+        calls = self._counting_status(monkeypatch)
+        client = Client(web)
+        client.login()
+        for round_no in range(6):
+            clock[0] = round_no * 5.0
+            status, _payload, _ = client.call("/api/status")
+            assert status == 200
+        assert calls["n"] == 3, f"6 轮轮询应计算 3 次（实际 {calls['n']}）"
+
+    def test_write_action_invalidates_status_cache(self, web, monkeypatch) -> None:
+        calls = self._counting_status(monkeypatch)
+        client = Client(web)
+        client.login()
+        client.call("/api/status")  # 填充
+        base = calls["n"]
+        client.call("/api/status")  # 命中
+        assert calls["n"] == base
+        # prune 在 dashboard 未启用时以 502 失败，但动作入口已经失效缓存——
+        # "写操作前显式失效"是缓存语义的一部分（失败也不留陈旧状态）。
+        client.call("/api/actions/prune", method="POST", body={})
+        client.call("/api/status")
+        assert calls["n"] == base + 1, "写操作后 status 必须重新计算"

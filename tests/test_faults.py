@@ -229,6 +229,40 @@ class TestSubprocessFaults:
 # ---------------------------------------------------------------------------
 
 
+    def test_systemctl_timeout_degrades_queries_and_refuses_mutations(
+        self, ready, injector, monkeypatch
+    ) -> None:
+        """systemd 无响应（真注入 `TimeoutExpired`）时的完整语义（v0.3.1）。
+
+        查询路径必须降级但**如实可见**（`systemd_probe_error`），变更路径
+        必须 **fail-closed 拒绝**（卸载会在所有权不明时删掉可能仍在跑的数据）。
+        """
+        from frpsctl.core.lifecycle import Lifecycle
+        from frpsctl.core.systemd import Systemd
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+        from frpsctl.errors import OwnershipConflict
+
+        inst, _, _ = ready
+        monkeypatch.setattr(Systemd, "available", property(lambda _self: True))
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+        injector.on(
+            "subprocess.run.timeout",
+            lambda args, kwargs: subprocess.TimeoutExpired(
+                cmd=args[0], timeout=kwargs.get("timeout", 10)
+            ),
+            matching="systemctl",
+        )
+
+        report = Lifecycle(inst).status()  # 承诺：永不崩
+        assert report.systemd_probe_error, "探测失败没有如实报告"
+        assert "超时" in report.systemd_probe_error
+
+        plan = plan_uninstall(inst)
+        with pytest.raises(OwnershipConflict):
+            execute_uninstall(plan)
+        _assert_invariants(inst)
+
+
 class TestProcessFaults:
     def test_terminate_permission_error_is_reported(self, ready, injector) -> None:
         """发信号被拒（权限不足）：必须报错，且**保留 state.json**。
@@ -274,13 +308,26 @@ class TestProcessFaults:
             kill_quietly(report.pid)
 
     def test_stop_when_already_gone_is_not_an_error(self, ready) -> None:
-        """进程自然退出后再 stop：应当是"未运行"，而不是异常。"""
+        """进程自然退出后再 stop：应当是"未运行"，而不是异常。
+
+        ⚠️ 必须**显式回收**子进程（僵尸）：`pid_alive` 对僵尸返回 True，
+        而 stop 的判定链（is_ours=False + pid_alive=True）会给出所有权冲突
+        而不是"未运行"。此前这条测试靠"其它 systemctl 子进程的
+        subprocess._cleanup 顺带 reap"的脆弱副作用通过——conftest 把
+        systemctl 确定性化后副作用消失、问题现形（v0.3.1 最后一轮 review）。
+        生产环境不存在这一情形：frps 的父进程（frpsctl）早已退出，僵尸由
+        init 立即收养回收。
+        """
+        import contextlib
+        import os
+        import time
+
         inst, _, lc = ready
         report = lc.start(health_timeout=5)
         kill_quietly(report.pid)
-        import time
-
-        time.sleep(0.3)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(report.pid, 0)  # SIGKILL 后立即返回；已被收则忽略
+        time.sleep(0.1)
         with pytest.raises(NotRunning):
             lc.stop(timeout=2)
 

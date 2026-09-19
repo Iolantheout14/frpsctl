@@ -2422,6 +2422,36 @@ class TestWebService:
         assert service.password_file.exists(), "口令文件是数据，卸载 unit 不该删它"
 
 
+
+class TestDoctorStatRace:
+    """doctor 与文件系统竞态：`exists()` 之后 `stat()` 可能失败（v0.3.1）。
+
+    真窗口极小（并发删除/权限变化），但 doctor 的承诺是"只报告、不崩"——
+    在这个窗口里抛裸 OSError 会让整个体检变成"未分类错误(1)"。
+    """
+
+    def test_permissions_check_survives_stat_race(self, inst, monkeypatch) -> None:
+        from frpsctl.core import doctor as doc
+        from frpsctl.core.doctor import Severity
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        real_stat = Path.stat
+        calls: list[int] = []
+
+        def flaky(self, *args, **kwargs):
+            if self == inst.config:
+                calls.append(1)
+                # 第一次（exists 内部）正常，之后（读取权限位时）失败
+                if len(calls) >= 2:
+                    raise PermissionError("simulated race")
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", flaky)
+        findings = doc._check_permissions(inst)
+        assert findings, "竞态失败必须有可见的 Finding，而不是空列表"
+        assert findings[0].severity is Severity.WARN
+
+
 class TestSystemdOwnerDetection:
     """`is_active()` 是 `resolve_owner()` 判 `Owner.SYSTEMD` 的**唯一依据**（ADR-1）。
 
@@ -2480,6 +2510,106 @@ class TestSystemdOwnerDetection:
         monkeypatch.setattr(subprocess, "run", lambda argv, **_kw: calls.append(argv))
         assert systemd.is_active() is False
         assert calls == []
+
+    def test_systemctl_timeout_is_collected_into_contract_error(
+        self, systemd, monkeypatch
+    ) -> None:
+        """v0.3.1：`subprocess.TimeoutExpired` 必须收口为契约内异常。
+
+        此前它一路裸冒到 CLI 顶层变成"未分类错误(1)"——把"systemd 无响应"
+        误报成"工具内部出错"（与 `release._verify_binary` 修过的是同一类缺口）。
+        """
+        from frpsctl.errors import FrpsctlError
+
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+
+        def timeout_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 10))
+
+        monkeypatch.setattr(subprocess, "run", timeout_run)
+        with pytest.raises(FrpsctlError) as excinfo:
+            systemd.is_active()
+        assert "超时" in excinfo.value.message
+        assert "systemctl" in excinfo.value.message
+
+    def test_systemctl_oserror_is_collected_into_contract_error(
+        self, systemd, monkeypatch
+    ) -> None:
+        """v0.3.1 review：systemctl 在 available 检查与执行之间被删（罕见竞态）
+        → 裸 OSError 会让 resolve_owner/status 崩；必须同样收口为契约异常。"""
+        from frpsctl.errors import FrpsctlError
+
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+
+        def gone(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+        monkeypatch.setattr(subprocess, "run", gone)
+        with pytest.raises(FrpsctlError) as excinfo:
+            systemd.is_active()
+        assert "systemctl" in excinfo.value.message
+
+    def test_owner_probe_failure_degrades_visibly_and_is_cached(
+        self, inst, write_config, monkeypatch
+    ) -> None:
+        """探测失败时 `resolve_owner` 不抛：降级判定 + 记录错误 + 缓存复用。
+
+        要求三点：① `status()` 永不崩（承诺）；② 降级结果可见
+        （`systemd_probe_error` 字段）；③ 错误也进缓存——否则 systemd 卡死时
+        每轮 status 都要重打一次 10 秒超时。
+        """
+        from frpsctl.core.lifecycle import Lifecycle, Owner
+        from frpsctl.core.systemd import Systemd
+
+        write_config("bindPort = 17000\n")
+        monkeypatch.setattr(Systemd, "available", property(lambda _self: True))
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+        calls = 0
+
+        def timeout_run(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 10))
+
+        monkeypatch.setattr(subprocess, "run", timeout_run)
+
+        lc = Lifecycle(inst)
+        assert lc.resolve_owner() is Owner.NONE, "无 state.json 时降级为 NONE"
+        assert lc.owner_probe_error() and "超时" in lc.owner_probe_error()
+        first_round = calls
+        assert first_round >= 1
+        lc.resolve_owner()  # 第二次：2 秒 TTL 内必须命中缓存
+        assert calls == first_round, "探测错误没有进缓存（每轮都会重打超时）"
+
+        report = Lifecycle(inst).status()
+        assert report.state_corrupted is False
+        assert report.systemd_probe_error and "超时" in report.systemd_probe_error
+
+    def test_mutations_refuse_when_owner_probe_failed(
+        self, inst, write_config, monkeypatch
+    ) -> None:
+        """变更类操作在所有权不可判定时 **fail-closed 拒绝**（ADR-7）。
+
+        stop 尤其危险：systemd 托管实例通常没有 state.json，降级判定会把它
+        误报成"未运行(5)"——用户以为没在跑，而 unit 其实活着。
+        """
+        from frpsctl.core.lifecycle import Lifecycle
+        from frpsctl.core.systemd import Systemd
+        from frpsctl.errors import OwnershipConflict
+
+        write_config("bindPort = 17000\n")
+        monkeypatch.setattr(Systemd, "available", property(lambda _self: True))
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+
+        def timeout_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 10))
+
+        monkeypatch.setattr(subprocess, "run", timeout_run)
+        lc = Lifecycle(inst)
+        with pytest.raises(OwnershipConflict):
+            lc.start()
+        with pytest.raises(OwnershipConflict):
+            lc.stop()
 
     def test_owner_becomes_systemd_when_unit_active(self, inst, monkeypatch) -> None:
         """端到端：unit active → `Lifecycle.resolve_owner()` 返回 SYSTEMD。
@@ -2612,6 +2742,38 @@ class TestSystemdOwnerDetection:
         assert any("--state=active" in call for call in calls), calls
         assert not any("is-active" in call for call in calls), "不需要逐个问 is-active"
         assert not any("show" in call for call in calls), "空列表时不该调用 show"
+
+    def test_same_config_active_batches_show_calls(self, systemd, monkeypatch) -> None:
+        """v0.3.1：多个 active unit 只发**一次** `systemctl show`。
+
+        此前逐个 unit 查询：多实例机器上 30 个 active unit 就是 30 次子进程
+        （~300ms），而且发生在 start 的实例锁内。
+        """
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if "list-units" in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=(
+                        "a.service loaded active running\n"
+                        "b.service loaded active running\n"
+                        "c.service loaded active running\n"
+                    ),
+                    stderr="",
+                )
+            if "show" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
+        assert systemd.same_config_active() is False
+        show_calls = [call for call in calls if "show" in call]
+        assert len(show_calls) == 1, f"应批量查询（实际 {len(show_calls)} 次）"
+        assert "c.service" in show_calls[0], show_calls[0]
 
 
 class TestSystemdDisableOnly:
@@ -2899,6 +3061,79 @@ class TestAggregateDays:
 
         assert aggregate_days([[{"date": "", "in": 1, "out": 1}, {"in": 2, "out": 2}]]) == []
         assert aggregate_days([]) == []
+
+
+class TestFetchHistoriesBudget:
+    """趋势查询的**整体预算**（v0.3.1）。
+
+    此前 `pool.map` 无预算：慢 dashboard 下 50 个代理 × 3s 超时最坏要等 ~19 秒，
+    单个请求就会长占 Web worker 或让 CLI 干等。现在预算内返回已完成部分，
+    并以 `partial=True` 如实标记——部分数据当全量展示是更糟的失败。
+    """
+
+    def test_deadline_returns_partial_results(self) -> None:
+        import threading
+        import time
+
+        from frpsctl.core.admin import fetch_histories
+
+        release = threading.Event()
+
+        class _FakeClient:
+            def proxy_traffic(self, name: str) -> list[dict]:
+                if name == "slow":
+                    release.wait(5)
+                    return []
+                return [{"date": "2026-09-17", "in": 1, "out": 2}]
+
+        names = [f"proxy-{index}" for index in range(8)] + ["slow"]
+        try:
+            started = time.monotonic()
+            result = fetch_histories(_FakeClient(), names, workers=2, deadline=0.5)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+        assert result.partial is True
+        assert elapsed < 2.0, f"预算未生效（{elapsed:.1f}s）"
+        assert len(result.series) == len(names), "结果必须与输入等长同序"
+        assert result.series[0], "已完成的结果必须保留"
+        assert result.series[-1] == [], "未完成的记空曲线"
+
+    def test_all_done_is_not_partial(self) -> None:
+        from frpsctl.core.admin import fetch_histories
+
+        class _FakeClient:
+            def proxy_traffic(self, name: str) -> list[dict]:
+                return [{"date": "d", "in": 1, "out": 1}]
+
+        result = fetch_histories(_FakeClient(), ["a", "b", "c"], workers=2, deadline=5.0)
+        assert result.partial is False
+        assert all(result.series)
+
+    def test_single_name_still_works(self) -> None:
+        from frpsctl.core.admin import fetch_histories
+
+        class _FakeClient:
+            def proxy_traffic(self, name: str) -> list[dict]:
+                return [{"date": "d", "in": 1, "out": 1}]
+
+        result = fetch_histories(_FakeClient(), ["only"], deadline=5.0)
+        assert result.partial is False and len(result.series) == 1
+
+    def test_offline_proxy_does_not_fail_the_batch(self) -> None:
+        """离线代理（FrpsctlError）照旧记空曲线，不受预算逻辑影响。"""
+        from frpsctl.core.admin import fetch_histories
+        from frpsctl.errors import AdminUnreachable
+
+        class _FakeClient:
+            def proxy_traffic(self, name: str) -> list[dict]:
+                if name == "gone":
+                    raise AdminUnreachable("404")
+                return [{"date": "d", "in": 1, "out": 1}]
+
+        result = fetch_histories(_FakeClient(), ["ok", "gone"], deadline=5.0)
+        assert result.partial is False
+        assert result.series == [[{"date": "d", "in": 1, "out": 1}], []]
 
 
 class TestDoctorCounts:
@@ -3545,3 +3780,61 @@ class TestRegressionReviewFixes:
             for item in auditlog.rotated_paths(path)
         )
         assert on_disk == total, f"并发写入丢失记录：{on_disk}/{total}"
+
+
+class TestUninstallCleanUnitsProbeFailure:
+    """卸载的 unit 清理阶段：探测失败收进 warnings，而不是崩掉整个流程（v0.3.1）。
+
+    `_precheck` 会拦住"探测失败 + 所有权不明"的实例，但预检与清理之间仍有
+    时间窗口——清理阶段必须自己兜住，并按"降级必须可见"汇总给用户。
+    """
+
+    def test_probe_failure_becomes_visible_warning(self, inst, monkeypatch, tmp_path) -> None:
+        from frpsctl.core.systemd import PluginService, Systemd, WebService
+        from frpsctl.core.uninstall import UninstallReport, _clean_units
+        from frpsctl.errors import FrpsctlError
+
+        def boom(_self):
+            raise FrpsctlError("systemctl 超时未返回（10 秒）")
+
+        for cls in (Systemd, PluginService, WebService):
+            monkeypatch.setattr(cls, "available", property(lambda _self: True))
+            monkeypatch.setattr(cls, "is_active", boom)
+            monkeypatch.setattr(cls, "is_enabled", boom)
+
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        report = UninstallReport()
+        _clean_units(inst, remove_templates=False, unit_dir=unit_dir, report=report)
+        assert report.warnings, "探测失败必须可见"
+        assert all("无法探测" in item for item in report.warnings), report.warnings
+        assert len(report.warnings) == 3, "三个 unit 各自汇报：%r" % report.warnings
+
+
+class TestConfigureStreams:
+    """入口 UTF-8 固定（v0.3.1）：对"不寻常"的流对象保持零异常。"""
+
+    def test_tolerates_streams_without_reconfigure(self, monkeypatch) -> None:
+        import sys as _sys
+
+        from frpsctl.core.diagnostics import configure_streams
+
+        class _Plain:
+            pass
+
+        monkeypatch.setattr(_sys, "stdout", _Plain())
+        monkeypatch.setattr(_sys, "stderr", _Plain())
+        configure_streams()  # 不抛即可
+
+    def test_reconfigure_failure_is_silent(self, monkeypatch) -> None:
+        import sys as _sys
+
+        from frpsctl.core.diagnostics import configure_streams
+
+        class _Boom:
+            def reconfigure(self, **_kwargs):
+                raise ValueError("I/O operation on closed file")
+
+        monkeypatch.setattr(_sys, "stdout", _Boom())
+        monkeypatch.setattr(_sys, "stderr", _Boom())
+        configure_streams()  # 不抛即可

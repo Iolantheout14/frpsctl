@@ -33,6 +33,8 @@ STATUS_CLI_KEYS = {
     "owner",
     "state",
     "state_corrupted",
+    # v0.3.1：systemd 探测失败时的如实标记（status 永不崩、降级可见）
+    "systemd_probe_error",
     "pid",
     "uptime_seconds",
     "binary",
@@ -54,6 +56,7 @@ STATUS_WEB_KEYS = {
     "owner",
     "state",
     "state_corrupted",
+    "systemd_probe_error",
     "pid",
     "uptime_seconds",
     "binary_version",
