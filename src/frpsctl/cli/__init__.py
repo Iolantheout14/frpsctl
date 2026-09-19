@@ -17,6 +17,40 @@
 
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+
+def _is_version_fastpath() -> bool:
+    """`--version` 快路径的**触发条件**（v0.3.1 review 收窄）。
+
+    除"恰好单个 `--version`"外，还要求**当前进程以 frpsctl 身份入口**：
+    - console script / uv-tool shim：`argv[0]` 以 `frpsctl` 开头；
+    - `python -m frpsctl`：`__main__` 的 spec 是 `frpsctl.__main__`。
+
+    `frpsctl.cli` 也被 `capabilities.command_paths()` 作为库 import——若无条件
+    判断 argv，任何宿主程序只要命令行恰为 `--version` 就会被劫持成"打印
+    frpsctl 版本并退出"。这条限定让快路径只服务于真正的 CLI 入口。
+    """
+    if _sys.argv[1:] != ["--version"]:
+        return False
+    if _os.path.basename(_sys.argv[0] or "").startswith("frpsctl"):
+        return True
+    main_mod = _sys.modules.get("__main__")
+    spec = getattr(main_mod, "__spec__", None)
+    return getattr(spec, "name", "") == "frpsctl.__main__"
+
+
+# `--version` 快路径（v0.3.1）：这是唯一能在**任何重 import 之前**拦截的
+# 高频脚本调用（探测工具是否存在/版本）。完整命令链要加载 typer /
+# pydantic / httpx（实测冷启动 0.3–1.4 秒），版本查询不该为它们付费。
+# 其它组合（`--version --json` 等）照旧走 Click 的 eager 解析，行为一致。
+if _is_version_fastpath():
+    from .. import __version__
+
+    _sys.stdout.write(f"frpsctl {__version__}\n")
+    raise SystemExit(0)
+
 from . import ui
 from .app import (
     _GLOBAL_BOOL_FLAGS,

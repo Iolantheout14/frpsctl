@@ -38,7 +38,7 @@ def start(
         help="前台运行（调试用：不写 state、脱离本工具的托管，stop 管不到它）",
     ),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """启动实例：verify → 加锁 → 派生 → 早退检测 → 写 state → 健康检查。
@@ -84,7 +84,9 @@ def stop(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     force: bool = typer.Option(False, "--force", help="直接 SIGKILL（不做 SIGTERM 等待）"),
-    timeout: float = typer.Option(10.0, "--timeout", min=0, help="SIGTERM 后等待秒数"),
+    timeout: float = typer.Option(
+        10.0, "--timeout", min=0, max=600, help="SIGTERM 后等待秒数（上限 600）"
+    ),
 ) -> None:
     """停止实例。身份校验不通过时**拒绝**（退出码 11），绝不冒险 kill。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
@@ -99,9 +101,11 @@ def stop(
 def restart(
     ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
-    timeout: float = typer.Option(10.0, "--timeout", min=0, help="停止等待秒数"),
+    timeout: float = typer.Option(
+        10.0, "--timeout", min=0, max=600, help="停止等待秒数（上限 600）"
+    ),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """重启实例（stop → start）。配置变更请用 `config set`，它会自动回滚。"""
@@ -187,7 +191,9 @@ def status(
     watch: bool = typer.Option(False, "--watch", help="持续刷新"),
     # 负数会让 time.sleep 抛 ValueError → "未分类错误(1)"；0 则是忙循环。
     # 用 Click 的数值范围校验把它归入**用法错误(2)**（脚本据此区分"参数写错"）。
-    interval: float = typer.Option(2.0, "--interval", min=0.1, help="--watch 的刷新间隔秒数"),
+    interval: float = typer.Option(
+        2.0, "--interval", min=0.1, max=3600, help="--watch 的刷新间隔秒数（上限 3600）"
+    ),
 ) -> None:
     """状态聚合：owner / 状态 / pid / 版本 / 运行时长 / 客户端 / 代理 / 流量 / 健康。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
@@ -268,6 +274,10 @@ def _print_status(app_ctx: AppContext, *, compact: bool = False, lc=None) -> Non
             "  无法判断进程归属，因此 stop/start/config set 都会拒绝执行。\n"
             "  请确认没有 frps 在跑，然后删除该文件。"
         )
+    if report.systemd_probe_error:
+        ui.warn(
+            f"⚠ systemd 探测失败（所有权暂按 state.json 降级判定）：{report.systemd_probe_error}"
+        )
     ui.emit(f"instance : {report.instance:<18} owner : {report.owner.value}")
     if report.systemd_unit:
         ui.emit(f"unit     : {report.systemd_unit} (MainPID {report.systemd_main_pid})")
@@ -315,7 +325,9 @@ def _print_status(app_ctx: AppContext, *, compact: bool = False, lc=None) -> Non
 def log(
     ctx: typer.Context,
     follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪"),
-    lines: int = typer.Option(100, "--lines", "-n", min=0, help="显示行数（0 = 不显示历史）"),
+    lines: int = typer.Option(
+        100, "--lines", "-n", min=0, max=100_000, help="显示行数（0 = 不显示历史；上限 100000）"
+    ),
 ) -> None:
     """看日志。优先 `log.to` 指向的文件；缺失时回退到 startup 日志（ADR-5）。
 

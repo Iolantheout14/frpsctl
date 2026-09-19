@@ -100,7 +100,7 @@ def service_status(
 @service_app.command("logs")
 def service_logs(
     ctx: typer.Context,
-    lines: int = typer.Option(100, "--lines", "-n", min=1, help="显示行数"),
+    lines: int = typer.Option(100, "--lines", "-n", min=1, max=100_000, help="显示行数（上限 100000）"),
     follow: bool = typer.Option(False, "--follow", "-f", help="持续跟踪"),
 ) -> None:
     """查看 systemd 托管的实例日志（`journalctl -u frps@<name>`）。

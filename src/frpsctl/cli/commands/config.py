@@ -149,7 +149,7 @@ def config_set(
         False, "--prompt", help="交互式隐藏输入值（敏感值不进 argv 与 shell 历史）"
     ),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """写单个键，走 §9 事务闭环（校验 → 备份 → 原子替换 → 重启 → 失败回滚）。
@@ -185,7 +185,7 @@ def config_unset(
     no_restart: bool = typer.Option(False, "--no-restart", help="只写不重启（变更尚未生效）"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只校验并展示 diff，不写入、不重启"),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """删除一个键，让它回落到 frp 的默认值。
@@ -333,7 +333,7 @@ def _resolve_editor() -> list[str]:
 def config_edit(
     ctx: typer.Context,
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="跳过「应用以上改动并重启？」的确认"),
 ) -> None:
@@ -421,7 +421,7 @@ def config_rollback(
     steps: int = typer.Argument(1, min=1, help="回滚到 N 份之前的快照"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """回滚到 N 份之前。**复用同一闭环**，而不是简单 cp 覆盖。"""
@@ -461,7 +461,7 @@ def config_apply(
     no_restart: bool = typer.Option(False, "--no-restart", help="只写不重启（变更尚未生效）"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只校验并展示 diff，不写入、不重启"),
     health_timeout: float = typer.Option(
-        10.0, "--health-timeout", min=0, help="健康检查等待秒数"
+        10.0, "--health-timeout", min=0, max=600, help="健康检查等待秒数（上限 600）"
     ),
 ) -> None:
     """**多键**变更：一次提交 → 一份快照 → 一次重启（与 Web 配置表单同语义）。

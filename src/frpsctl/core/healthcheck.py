@@ -24,12 +24,26 @@ __all__ = [
     "DashboardInfo",
     "ListenInfo",
     "PluginTarget",
+    "PORT_FIELDS",
     "is_loopback",
     "parse_bind",
     "parse_dashboard",
     "parse_listen",
     "parse_plugin_targets",
 ]
+
+#: 需要做"端口可绑定性"探测的键（`doctor` §8.7 用）。
+#: v0.3.1 从 `core/schema.py` 迁到此处：doctor 只用到这一个常量，而 import
+#: schema 会拉起 pydantic（整个常见命令链上最重的一跳）；healthcheck 是本模块
+#: 已有的轻量依赖。schema 保留 re-export 以免既有导入点失效。
+PORT_FIELDS: tuple[str, ...] = (
+    "bindPort",
+    "kcpBindPort",
+    "quicBindPort",
+    "vhostHTTPPort",
+    "vhostHTTPSPort",
+    "webServer.port",
+)
 
 
 def parse_bind(bind: str, *, default_port: int) -> tuple[str, int]:

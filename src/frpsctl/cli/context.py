@@ -109,6 +109,11 @@ def run_cli(app: typer.Typer) -> None:
 
     `--help` 与显式 `typer.Exit(n)` 走 Click 的 `Exit` 分支，原样透传退出码。
     """
+    # locale 无关的 UTF-8 输出（v0.3.1）：ASCII locale 下中文错误消息会
+    # UnicodeEncodeError → "未分类错误(1)"；入口统一 reconfigure。
+    from ..core.diagnostics import configure_streams
+
+    configure_streams()
     with map_exceptions():
         app(standalone_mode=True)
 

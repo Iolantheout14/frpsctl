@@ -22,7 +22,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ..errors import ConfigError
-from .healthcheck import is_loopback
+from .healthcheck import PORT_FIELDS, is_loopback
 
 __all__ = [
     "ServerConfig",
@@ -31,15 +31,9 @@ __all__ = [
     "PORT_FIELDS",
 ]
 
-#: 需要做"端口可绑定性"探测的键（doctor §8.7 用）。
-PORT_FIELDS: tuple[str, ...] = (
-    "bindPort",
-    "kcpBindPort",
-    "quicBindPort",
-    "vhostHTTPPort",
-    "vhostHTTPSPort",
-    "webServer.port",
-)
+#: `PORT_FIELDS` 的唯一定义在 `core/healthcheck.py`（v0.3.1 迁出）：doctor 是
+#: 它唯一的用户，而从本模块导入会拉起 pydantic。此处 re-export 保持既有
+#: 导入点的兼容（`from frpsctl.core.schema import PORT_FIELDS` 仍可用）。
 
 _LOG_LEVELS = ("trace", "debug", "info", "warn", "error")
 

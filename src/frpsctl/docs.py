@@ -103,6 +103,9 @@ def check_all(readme: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     """`python -m frpsctl.docs check [README 路径]`。"""
+    from .core.diagnostics import configure_streams
+
+    configure_streams()  # 中文输出与 locale 无关（与 CLI 入口同纪律）
     args = list(sys.argv[1:] if argv is None else argv)
     readme_path = Path(args[1]) if len(args) > 1 else Path("README.md")
     if args and args[0] != "check":
