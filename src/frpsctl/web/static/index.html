@@ -551,6 +551,12 @@ async function doRefresh() {
     });
   }
   if (status.version_hint) banners.push({ kind: "warn", text: "⚠ " + status.version_hint });
+  if (status.systemd_probe_error) {
+    banners.push({
+      kind: "warn",
+      text: "⚠ systemd 探测失败（所有权暂按 state.json 降级判定，变更操作会拒绝执行）：\n" + status.systemd_probe_error,
+    });
+  }
   const h = status.health;
   if (h && h.plugin_warning) banners.push({ kind: "warn", text: "⚠ " + h.plugin_warning });
   setBanners(banners);
@@ -790,9 +796,10 @@ async function refreshTraffic() {
   try {
     const data = await api("/api/traffic");
     $("chart-7d").replaceChildren(bars7d(data.days || []));
-    $("chart-7d-hint").textContent = data.truncated
-      ? `已截断：仅统计前 ${data.limit} 个代理（共 ${data.total} 个）`
-      : "";
+    const hints = [];
+    if (data.truncated) hints.push(`已截断：仅统计前 ${data.limit} 个代理（共 ${data.total} 个）`);
+    if (data.partial) hints.push("部分代理的流量历史未在预算内返回，汇总可能偏低");
+    $("chart-7d-hint").textContent = hints.join("；");
   } catch (err) { /* dashboard 不可用时保留旧图 */ }
   finally { trafficLoading = false; }
   const dash = (lastStatus && lastStatus.dashboard) || {};

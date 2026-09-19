@@ -9,9 +9,13 @@
 **认证边界**：除 `POST /api/login` 与登录页（`GET /`）外，一切 API 都要求有效
 会话；一切 POST（除 login）都要求 `X-CSRF-Token` 头。
 
-**CSP 说明**：单文件前端的内联样式与脚本需要 `'unsafe-inline'`；但
-`default-src 'none'` + `connect-src 'self'` 仍封死了"加载外部资源/外发数据"
-的通道——XSS 面只剩我们自己那一个文件。
+**CSP 说明**（v0.3.0 起）：脚本/样式只认**每请求 nonce**，无 `'unsafe-inline'`；
+配合 `default-src 'none'` + `connect-src 'self'` + `base-uri`/`form-action`/
+`frame-ancestors` 限制——前端本就没有注入点，这层把"万一"的出口也封死。
+
+**并发**：`BoundedThreadingHTTPServer`（`core/httpserver.py`，与插件服务共用）
+——worker 上限内每请求一线程；超限时 HTTP 503（或在未读请求体上交由内核
+TCP 重置，两者对客户端都是明确失败）。见类 docstring 的过载语义说明。
 """
 
 from __future__ import annotations
@@ -21,15 +25,15 @@ import json
 import secrets
 import signal
 import threading
-import time
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..core.healthcheck import parse_bind
+from ..core.httpserver import BoundedThreadingHTTPServer
 from ..core import web_audit
 from .api import RequestInfo, WebContext, dispatch
 from .auth import SESSION_COOKIE
@@ -87,34 +91,6 @@ class WebSettings:
     @property
     def port(self) -> int:
         return parse_bind(self.bind, default_port=8787)[1]
-
-
-class _LoginFailLimiter:
-    """失败登录的**审计**限速：每来源每 60 秒最多写一条失败记录。
-
-    与认证的失败限速（AuthManager，5 次/60 秒）是两件事：那个决定"还能不能
-    试"，这个决定"失败要不要逐条写审计"。爆破场景下逐条写会把审计文件刷爆，
-    而第一条失败已经足以定位来源；限速窗口与认证侧同量级。
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._last: dict[str, float] = {}
-
-    def allow(self, source: str) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            last = self._last.get(source, 0.0)
-            if now - last < 60.0:
-                return False
-            self._last[source] = now
-            if len(self._last) > 1024:
-                oldest = min(self._last, key=lambda key: self._last[key])
-                self._last.pop(oldest, None)
-            return True
-
-
-_login_fail_limiter = _LoginFailLimiter()
 
 
 def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
@@ -229,7 +205,7 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             if session is None:
                 # 失败留痕（含被限速的请求——限速器让"每来源每分钟记一条"成立，
                 # 攻击者的海量重试不会把审计文件刷爆，但第一次一定看得见）。
-                if _login_fail_limiter.allow(source) and not web_audit.record(
+                if ctx.login_audit.allow(source) and not web_audit.record(
                     ctx.inst, action="login", result="error", source=source
                 ):
                     self._note("⚠ Web 操作审计写入失败（登录失败本身已拒绝）：检查实例目录权限与磁盘空间")
@@ -480,10 +456,14 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             super().handle_error(request, client_address)
 
         def _note(self, message: str) -> None:
+            # stderr 是辅助通道：断开（`2>&1 | head` 之类）时静默放弃——
+            # 告警写失败绝不该让响应路径抛异常（v0.3.1；与 cli.ui 同纪律）。
+            import contextlib
             import sys
 
-            sys.stderr.write(f"[web] {message}\n")
-            sys.stderr.flush()
+            with contextlib.suppress(OSError):
+                sys.stderr.write(f"[web] {message}\n")
+                sys.stderr.flush()
 
         def log_message(self, *args: object) -> None:
             """默认访问日志太吵（每请求两行）；只在诊断需要时打开。"""
@@ -491,45 +471,6 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 super().log_message(*args)  # type: ignore[arg-type]
 
     return Handler
-
-
-class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """有界并发的 HTTP 服务：worker 用尽时直接 503 并断开。
-
-    这是 README"已知边界"里"管理台不限制并发连接数"的收口：单机管理工具
-    不该在慢 dashboard 下无限堆线程。503 是**明确的失败**，比无限排队
-    （浏览器一直转圈、内存持续上涨）更容易被理解和处理。
-    """
-
-    daemon_threads = True
-
-    def __init__(self, *args: object, max_workers: int = 32, **kwargs: object) -> None:
-        self._workers = threading.BoundedSemaphore(max(1, max_workers))
-        super().__init__(*args, **kwargs)
-
-    def process_request(self, request, client_address) -> None:  # noqa: ANN001
-        if not self._workers.acquire(blocking=False):
-            try:
-                request.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
-                )
-            except OSError:
-                pass
-            finally:
-                self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._workers.release()
-            raise
-
-    def process_request_thread(self, request, client_address) -> None:  # noqa: ANN001
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._workers.release()
 
 
 class WebServer:
@@ -544,7 +485,7 @@ class WebServer:
     ) -> None:
         self.ctx = ctx
         self.settings = settings
-        self._httpd: ThreadingHTTPServer | None = None
+        self._httpd: BoundedThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._static = static_index
 
@@ -553,15 +494,15 @@ class WebServer:
     def start(self) -> None:
         """绑定并开始服务。绑定失败（端口占用）原样抛 `OSError`。"""
         handler = _make_handler(self.ctx, self.settings, self._static or STATIC_INDEX)
-        self._httpd = _BoundedThreadingHTTPServer(
+        self._httpd = BoundedThreadingHTTPServer(
             (self.settings.host, self.settings.port),
             handler,
             max_workers=self.settings.max_workers,
         )
         # 未 accept 的连接队列上限（backlog）。管理台不面向高并发，设一个小值
         # 让过载时的行为可预期（多出的连接被内核拒绝，而不是无限排队）。
-        # 注意这是**唯一**的并发护栏：请求线程数没有上限（单机管理工具，
-        # 见 README"已知边界"）。
+        # 请求线程另有 worker 上限（`max_workers`，超限 503）——
+        # 两者共同构成过载护栏（v0.3.0 起；README"已知边界"同步）。
         self._httpd.request_queue_size = 64
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="frpsctl-web", daemon=True

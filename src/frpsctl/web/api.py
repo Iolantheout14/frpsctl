@@ -55,7 +55,7 @@ from ..errors import (
     FrpsctlError,
     UsageError,
 )
-from .auth import AuthManager
+from .auth import AuthManager, LoginAuditLimiter
 from .cache import TTLCache
 
 __all__ = ["WebContext", "dispatch", "http_status_for"]
@@ -80,6 +80,11 @@ CACHE_TTL_LISTS = 6.0
 CACHE_TTL_LOGS = 3.0
 #: 趋势是逐日粒度：30 秒内重复查询只是把 50 个 HTTP 往返重复一遍。
 TRAFFIC_CACHE_TTL = 30.0
+
+#: `/api/status` 的服务端缓存时间（秒，v0.3.1）。与列表同口径：TTL 必须
+#: **大于等于**浏览器轮询间隔（5s）才有意义；状态变化在写操作路径上即时失效，
+#: 外部变化最多滞后一个 TTL（≤6s，README"已知边界"已注明）。
+STATUS_CACHE_TTL = 6.0
 
 #: 审计视图返回的记录条数（尾部）。
 AUDIT_TAIL_LINES = 50
@@ -118,10 +123,12 @@ def _audit(ctx: WebContext, info: RequestInfo | None, *, action: str, target: st
         session_id=info.session_id if info else "",
     )
     if not ok:
+        import contextlib
         import sys
 
-        sys.stderr.write("[web] ⚠ Web 操作审计写入失败（动作本身已执行）：检查实例目录权限与磁盘空间\n")
-        sys.stderr.flush()
+        with contextlib.suppress(OSError):
+            sys.stderr.write("[web] ⚠ Web 操作审计写入失败（动作本身已执行）：检查实例目录权限与磁盘空间\n")
+            sys.stderr.flush()
 
 
 @dataclass
@@ -133,6 +140,9 @@ class WebContext:
     clock: Callable[[], float] = time.monotonic
     previews: dict[str, _Preview] = field(default_factory=dict)
     preview_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: 失败登录的审计限速（v0.3.1：每上下文一份，不再是模块级单例——
+    #: 模块级状态让多实例/测试互相串味）。
+    login_audit: LoginAuditLimiter = field(default_factory=LoginAuditLimiter)
     #: 只读端点的响应缓存（traffic/lists/logs）。经 lambda 取 clock：测试
     #: monkeypatch `ctx.clock` 后缓存同样读到假时钟，无需重建上下文。
     cache: TTLCache = field(init=False)
@@ -308,7 +318,15 @@ def _health(report: HealthReport | None) -> dict | None:
 
 
 def status_payload(ctx: WebContext) -> dict:
-    """进程状态 + dashboard 统计（统计不可得时为 None，不影响状态本身）。"""
+    """进程状态 + dashboard 统计（统计不可得时为 None，不影响状态本身）。
+
+    带 6 秒服务端缓存（v0.3.1）：`/api/status` 是页面 5 秒轮询的主接口，而每次
+    生成都要做 L2/L3 网络探针 + 一次 `server_info`——TTL 必须 ≥ 轮询间隔才有
+    意义（v0.3.0 量化验证的教训），写操作经 `cache.invalidate()` 保证即时可见。
+    """
+    cached = ctx.cache.get("status", STATUS_CACHE_TTL)
+    if cached is not None:
+        return cached
     report = ctx.lifecycle().status()
     dashboard: dict[str, Any] | None = None
     if report.state in (State.RUNNING, State.SYSTEMD_ACTIVE):
@@ -331,7 +349,9 @@ def status_payload(ctx: WebContext) -> dict:
             }
     # 与 CLI `status --json` 同一份形状（差异仅在 include_paths=False：
     # 页面不需要 binary/config 的本机路径），公共部分由 report 单点生成。
-    return report_mod.status_payload(report, dashboard=dashboard, include_paths=False)
+    payload = report_mod.status_payload(report, dashboard=dashboard, include_paths=False)
+    ctx.cache.put("status", payload)
+    return payload
 
 
 def clients_payload(ctx: WebContext) -> dict:
@@ -385,13 +405,15 @@ def traffic_payload(ctx: WebContext) -> dict:
         page = admin.page_proxies()
         truncated = page.total > TRAFFIC_MAX_PROXIES
         names = [item.name for item in page.items[:TRAFFIC_MAX_PROXIES]]
-        series = fetch_histories(admin, names)
+        fetched = fetch_histories(admin, names)
     payload = {
         "granularity": "day",
-        "days": aggregate_days(series),
+        "days": aggregate_days(fetched.series),
         "proxies": len(names),
         "total": page.total,
         "truncated": truncated,
+        # v0.3.1：整体预算内未取全时如实标记（前端在图表提示里展示）
+        "partial": fetched.partial,
         "limit": TRAFFIC_MAX_PROXIES,
     }
     ctx.cache.put("traffic", payload)

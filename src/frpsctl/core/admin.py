@@ -11,11 +11,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Generic, TypeVar
-
-import httpx
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 from ..errors import AdminUnreachable, ApiVersionMismatch, FrpsctlError
+
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查
+    import httpx
+
+#: ⚠️ `httpx` 只在真正构造/调用客户端时导入（v0.3.1）：它是本模块唯一的
+#: 重依赖，而本模块被 `cli.runtime` / `report` 等常见链顶层引用——放在顶层会
+#: 让 `frpsctl status`（实例未开 dashboard 时根本不需要 HTTP）也付出它的
+#: 导入成本（实测冷启动 0.75s → 其中 httpx 链路占大头）。运行时用到的地方
+#: （`__init__` / `healthz` / `_get`）各自函数内导入；注解由
+#: `from __future__ import annotations` 字符串化，不受影响。
 
 __all__ = [
     "AdminClient",
@@ -40,6 +48,12 @@ TRAFFIC_MAX_PROXIES = 50
 #: 趋势查询的并发度：dashboard 是本机 HTTP 服务，串行查 50 个代理要 50 个往返；
 #: 并发只要不把 dashboard 打爆即可（它同样是 ThreadingHTTPServer）。
 TRAFFIC_WORKERS = 8
+
+#: 一次趋势查询的**整体预算**（秒，v0.3.1）。50 个代理 × 单请求 3s 超时、8 并发
+#: 下最坏接近 19 秒——单个 `/api/traffic` 请求会占住 Web worker 这么久（几个
+#: 这样的请求就能把有界并发排满），CLI 也要干等。预算内返回**已完成的部分**
+#: 并如实标记（`partial=True`），未完成的代理记空曲线（与离线代理同一降级路径）。
+TRAFFIC_DEADLINE = 6.0
 
 #: frp v0.71.0 的全部代理类型（`frps` 文档与 v2 Admin API 一致）。
 #: CLI `proxies --type` 用它做输入校验：拼错类型过去会静默返回空列表，
@@ -242,16 +256,48 @@ def aggregate_days(series: list[list[dict]]) -> list[dict]:
     return [days[key] for key in sorted(days)]
 
 
+@dataclass(frozen=True)
+class HistoryFetch:
+    """一次多代理流量查询的结果。
+
+    `series` 与 `names` 等长且同序；`partial=True` 表示有代理在整体预算内
+    没有返回（`series` 里对应位置为空曲线）——调用方必须**如实展示**，
+    不能把部分数据当全量（"降级必须可见"）。
+    """
+
+    series: list[list[dict]]
+    partial: bool = False
+
+
 def fetch_histories(
-    client: AdminClient, names: list[str], *, workers: int = TRAFFIC_WORKERS
-) -> list[list[dict]]:
+    client: AdminClient,
+    names: list[str],
+    *,
+    workers: int = TRAFFIC_WORKERS,
+    deadline: float = TRAFFIC_DEADLINE,
+) -> HistoryFetch:
     """并发取多个代理的流量历史；单个代理失败记空曲线（不拖垮整体）。
 
     `httpx.Client` 是线程安全的（官方保证），因此可以直接共享一个 AdminClient。
     串行查 50 个代理要 50 个 HTTP 往返——dashboard 稍慢就能把一次趋势刷新拖到
     秒级；并发后总耗时约等于最慢的那一个。
+
+    **整体预算**（v0.3.1）：`deadline` 秒内完成多少算多少，未完成的记空曲线
+    并以 `partial=True` 上报。此前用 `pool.map` 无预算：慢 dashboard 下最坏
+    ~19 秒才返回，长占调用方（Web worker / 终端）。
+
+    ⚠️ `shutdown(wait=False)` 只保证**函数**按预算返回；线程池线程是非 daemon
+    的，解释器退出时会 atexit join 未完成任务——CLI `traffic` 命令返回后，
+    进程退出最多再等**单个请求**的超时（`AdminClient.timeout`，默认 3s；
+    实测预算 0.3s 返回、进程因一个 5s 慢任务拖到 5.1s）。Web 服务进程常驻、
+    无此影响；CLI 侧这个尾巴小于修复前的最坏 19s，且没有干净的取消手段
+    （Python 无法强杀运行中的线程），如实记录为已知行为。
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    results: list[list[dict]] = [[] for _ in names]
+    if not names:
+        return HistoryFetch(series=results)
 
     def fetch(name: str) -> list[dict]:
         try:
@@ -260,10 +306,23 @@ def fetch_histories(
             # 离线/已删除的代理返回"无数据"是常态，不拖垮整体（真机语义 404）。
             return []
 
-    if len(names) <= 1:
-        return [fetch(name) for name in names]
-    with ThreadPoolExecutor(max_workers=min(workers, len(names))) as pool:
-        return list(pool.map(fetch, names))
+    if len(names) == 1:
+        return HistoryFetch(series=[fetch(names[0])])
+
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(names)))
+    try:
+        futures = {pool.submit(fetch, name): index for index, name in enumerate(names)}
+        done, pending = wait(futures, timeout=max(0.0, deadline))
+        for future in done:
+            results[futures[future]] = future.result()
+        for future in pending:
+            future.cancel()
+        partial = bool(pending)
+    finally:
+        # wait=False：不能等未完成的任务（那会让预算失效）；
+        # cancel_futures 清掉尚在队列中的提交。
+        pool.shutdown(wait=False, cancel_futures=True)
+    return HistoryFetch(series=results, partial=partial)
 
 
 class AdminClient:
@@ -278,6 +337,8 @@ class AdminClient:
         *,
         trust_env: bool | None = None,
     ) -> None:
+        import httpx  # 惰性：见模块顶部说明
+
         auth = (user, password) if (user or password) else None
         self._base_url = base_url.rstrip("/")
         if trust_env is None:
@@ -309,6 +370,8 @@ class AdminClient:
         调用方关心的是"活着吗"，而不是"为什么没活着"。
         """
         import time
+
+        import httpx  # 惰性：见模块顶部说明
 
         started = time.monotonic()
         try:
@@ -494,6 +557,8 @@ class AdminClient:
     # --- 内部 ----------------------------------------------------------
 
     def _get(self, path: str, *, params: dict | None = None) -> httpx.Response:
+        import httpx  # 惰性：见模块顶部说明
+
         try:
             return self._client.get(path, params=params)
         except httpx.HTTPError as exc:

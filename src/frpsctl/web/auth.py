@@ -25,10 +25,65 @@ import threading
 import time
 from dataclasses import dataclass
 
-__all__ = ["AuthManager", "Session", "generate_password", "SESSION_COOKIE"]
+__all__ = [
+    "AUDIT_FAIL_WINDOW",
+    "AuthManager",
+    "LoginAuditLimiter",
+    "Session",
+    "generate_password",
+    "SESSION_COOKIE",
+]
 
 #: 会话 Cookie 名（解析与下发都用这一个常量）。
 SESSION_COOKIE = "frpsctl_session"
+
+#: 失败登录的**审计**限速窗口（秒）。
+AUDIT_FAIL_WINDOW = 60.0
+
+#: 审计限速的来源表上限（输入驱动的表必须有界，同 `MAX_TRACKED_SOURCES`）。
+AUDIT_MAX_SOURCES = 1024
+
+
+class LoginAuditLimiter:
+    """失败登录的**审计**限速：每来源每 60 秒最多写一条失败记录。
+
+    与认证的失败限速（`AuthManager`，5 次/60 秒）是两件事：那个决定"还能不能
+    试"，这个决定"失败要不要逐条写审计"。爆破场景下逐条写会把审计文件刷爆，
+    而第一条失败已经足以定位来源；限速窗口与认证侧同量级。
+
+    v0.3.1：从 `web/server.py` 的**模块级单例**改为 `WebContext` 持有的实例
+    ——模块级状态在多实例（测试里多个 WebServer）之间互相串味：前一个进程/
+    用例的失败会压制后一个的审计记录，而它本来的语义就是"每个管理台进程一份"。
+    """
+
+    def __init__(
+        self,
+        window: float = AUDIT_FAIL_WINDOW,
+        *,
+        max_sources: int = AUDIT_MAX_SOURCES,
+        clock=time.monotonic,
+    ) -> None:
+        self.window = window
+        self.max_sources = max_sources
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last: dict[str, float] = {}
+
+    def allow(self, source: str) -> bool:
+        """该来源此刻是否允许写审计（同来源在窗口内只放行一次）。"""
+        now = self._clock()
+        with self._lock:
+            # 哨兵用 `None` 而不是 0.0：单调时钟的合法值可以是 0（可注入假时钟），
+            # 用 0.0 当"从未见过"会让首次调用在 `now=0` 时被误判为冷却中
+            # （v0.3.1，测试用假时钟从 0 起步时暴露）。
+            last = self._last.get(source)
+            if last is not None and now - last < self.window:
+                return False
+            self._last[source] = now
+            if len(self._last) > self.max_sources:
+                oldest = min(self._last, key=lambda key: self._last[key])
+                self._last.pop(oldest, None)
+            return True
 
 #: 登录失败限速：窗口（秒）与窗口内允许的失败次数。
 FAILURE_WINDOW = 60.0
