@@ -2280,6 +2280,539 @@ class TestServiceManifest:
         assert not inst.service_manifest.exists()
 
 
+class TestServeRuntime:
+    """后台服务运行时（v0.3.3）：start / stop / probe / 状态文件 / 日志。
+
+    全部用**真进程**（`python -c sleep`，argv 里带独立的 `serve` 元素）——
+    三重校验与停止等待只有对真实 /proc 数据才有意义。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, inst):
+        yield
+        import contextlib
+
+        from frpsctl.core import serve_runtime as sr
+
+        for spec in (sr.WEB_SPEC, sr.PLUGIN_SPEC):
+            with contextlib.suppress(Exception):
+                status = sr.probe(inst, spec)
+                if status.running:
+                    sr.stop_background(inst, spec, timeout=1)
+
+    @staticmethod
+    def _sleeper() -> list[str]:
+        import sys
+
+        # 末尾独立的 "serve" 元素：模拟真实 `frpsctl web serve` 的命令行标记
+        return [sys.executable, "-c", "import time; time.sleep(60)", "serve"]
+
+    def _start(self, inst, spec, *, argv=None, args=None, host=None, port=None):
+        from frpsctl.core import serve_runtime as sr
+
+        return sr.start_background(
+            inst,
+            spec,
+            argv=argv or self._sleeper(),
+            args=args or {"bind": "127.0.0.1:8787"},
+            host=host,
+            port=port,
+            wait=0.3,
+        )
+
+    def test_start_records_state_and_probes_direct(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core import platform as plat
+
+        state = self._start(inst, sr.WEB_SPEC)
+        assert plat.pid_alive(state.pid)
+        assert state.start_time > 0
+        assert state.argv[-1] == "serve"
+        assert state.args == {"bind": "127.0.0.1:8787"}
+        path = sr.state_path(inst, sr.WEB_SPEC)
+        assert path.exists()
+        assert path.stat().st_mode & 0o777 == 0o600
+
+        status = sr.probe(inst, sr.WEB_SPEC)
+        assert status.running
+        assert status.state.pid == state.pid
+        assert status.uptime_seconds is not None
+
+    def test_start_twice_rejected(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import ServeAlreadyRunning
+
+        first = self._start(inst, sr.WEB_SPEC)
+        with pytest.raises(ServeAlreadyRunning, match=str(first.pid)):
+            self._start(inst, sr.WEB_SPEC)
+
+    def test_stale_state_is_cleaned(self, inst) -> None:
+        import json
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+
+        # 一个已经退出的进程：wait() 之后 pid 进入僵尸/消失，start 应清理记录
+        import subprocess
+
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        inst.ensure_dirs()
+        sr.state_path(inst, sr.WEB_SPEC).write_text(
+            json.dumps(
+                {
+                    "pid": proc.pid,
+                    "start_time": 1,
+                    "binary": "/bin/true",
+                    "argv": ["/bin/true", "serve"],
+                    "args": {},
+                    "log": "",
+                    "started_at": "",
+                }
+            ),
+            "utf-8",
+        )
+        assert plat.process_gone(proc.pid)
+        state = self._start(inst, sr.WEB_SPEC)
+        assert state.pid != proc.pid
+        assert sr.probe(inst, sr.WEB_SPEC).running
+
+    def test_foreign_pid_rejected(self, inst) -> None:
+        import json
+        import os
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import OwnershipConflict
+
+        me = os.getpid()
+        inst.ensure_dirs()
+        sr.state_path(inst, sr.WEB_SPEC).write_text(
+            json.dumps(
+                {
+                    "pid": me,
+                    "start_time": plat.proc_start_time(me),
+                    "binary": __import__("sys").executable,
+                    "argv": [__import__("sys").executable, "serve"],
+                    "args": {},
+                    "log": "",
+                    "started_at": "",
+                }
+            ),
+            "utf-8",
+        )
+        # pytest 进程的 cmdline 不含独立的 "serve" 元素 → 身份不符
+        with pytest.raises(OwnershipConflict):
+            self._start(inst, sr.WEB_SPEC)
+        with pytest.raises(OwnershipConflict):
+            sr.stop_background(inst, sr.WEB_SPEC, timeout=0.2)
+        assert sr.probe(inst, sr.WEB_SPEC).owner is sr.ServeOwner.FOREIGN
+
+    def test_stop_stops_process_and_cleans(self, inst) -> None:
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+
+        state = self._start(inst, sr.WEB_SPEC)
+        stopped = sr.stop_background(inst, sr.WEB_SPEC, timeout=5)
+        assert stopped.pid == state.pid
+        assert plat.process_gone(state.pid)
+        assert not sr.state_path(inst, sr.WEB_SPEC).exists()
+        assert sr.probe(inst, sr.WEB_SPEC).owner is sr.ServeOwner.NONE
+
+    def test_stop_when_not_running(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import ServeNotRunning
+
+        with pytest.raises(ServeNotRunning, match="Web 管理台"):
+            sr.stop_background(inst, sr.WEB_SPEC)
+
+    def test_stale_stop_cleans_and_reports(self, inst) -> None:
+        import json
+
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import ServeNotRunning
+
+        inst.ensure_dirs()
+        sr.state_path(inst, sr.PLUGIN_SPEC).write_text(
+            json.dumps(
+                {
+                    "pid": 999_999_99,
+                    "start_time": 1,
+                    "binary": "/bin/true",
+                    "argv": ["/bin/true", "serve"],
+                    "args": {},
+                    "log": "",
+                    "started_at": "",
+                }
+            ),
+            "utf-8",
+        )
+        with pytest.raises(ServeNotRunning):
+            sr.stop_background(inst, sr.PLUGIN_SPEC)
+        assert not sr.state_path(inst, sr.PLUGIN_SPEC).exists()
+
+    def test_startup_failure_cleans_state_and_keeps_log(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import StartupFailed
+
+        with pytest.raises(StartupFailed, match="启动后立即退出"):
+            self._start(inst, sr.WEB_SPEC, argv=["/bin/false", "serve"])
+        assert not sr.state_path(inst, sr.WEB_SPEC).exists()
+        assert sr.log_path(inst, sr.WEB_SPEC).exists()
+
+    def test_startup_failure_when_port_not_ready(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import StartupFailed
+
+        with pytest.raises(StartupFailed) as info:
+            self._start(inst, sr.WEB_SPEC, host="127.0.0.1", port=1)
+        assert "端口未就绪" in (info.value.hint or "")
+        assert "Web 管理台" in info.value.message
+        assert not sr.state_path(inst, sr.WEB_SPEC).exists()
+        # 半活进程必须被收拾掉（不能留下"端口没通但进程还在"的孤儿）
+        assert sr.probe(inst, sr.WEB_SPEC).owner is sr.ServeOwner.NONE
+
+    def test_port_ready_accepts_listening_process(self, inst) -> None:
+        import socket
+        import sys
+
+        from frpsctl.core import serve_runtime as sr
+
+        # 只借一个空闲端口号（立刻释放），真正的监听由子进程做
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        argv = [
+            sys.executable,
+            "-c",
+            "import socket, time; s=socket.socket(); "
+            f"s.bind(('127.0.0.1', {port})); s.listen(1); time.sleep(60)",
+            "serve",
+        ]
+        state = self._start(inst, sr.WEB_SPEC, argv=argv, host="127.0.0.1", port=port)
+        assert sr.probe(inst, sr.WEB_SPEC).running
+        assert state.port == port
+
+    def test_corrupted_state_is_reported(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import ConfigError
+
+        inst.ensure_dirs()
+        sr.state_path(inst, sr.WEB_SPEC).write_text("{ broken", "utf-8")
+        status = sr.probe(inst, sr.WEB_SPEC)
+        assert status.owner is sr.ServeOwner.CORRUPTED
+        assert status.error
+        with pytest.raises(ConfigError):
+            self._start(inst, sr.WEB_SPEC)
+        with pytest.raises(ConfigError):
+            sr.stop_background(inst, sr.WEB_SPEC)
+
+    def test_state_missing_fields_rejected(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.errors import ConfigError
+
+        inst.ensure_dirs()
+        sr.state_path(inst, sr.WEB_SPEC).write_text('{"pid": 123}', "utf-8")
+        with pytest.raises(ConfigError):
+            sr.stop_background(inst, sr.WEB_SPEC)
+
+    def test_sigkill_fallback_for_stubborn_process(self, inst) -> None:
+        import sys
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+
+        argv = [
+            sys.executable,
+            "-c",
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+            "serve",
+        ]
+        state = self._start(inst, sr.WEB_SPEC, argv=argv)
+        stopped = sr.stop_background(inst, sr.WEB_SPEC, timeout=0.3)
+        assert stopped.pid == state.pid
+        assert plat.process_gone(state.pid)
+
+    def test_rotate_log(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+
+        inst.ensure_dirs()
+        log = sr.log_path(inst, sr.WEB_SPEC)
+        log.write_bytes(b"x" * (sr.LOG_MAX_BYTES + 1))
+        sr.rotate_log(log)
+        assert not log.exists()
+        rotated = log.parent / (log.name + ".1")
+        assert rotated.exists() and rotated.stat().st_size > sr.LOG_MAX_BYTES
+
+    def test_log_tail_reads_tail(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+
+        inst.ensure_dirs()
+        log = sr.log_path(inst, sr.WEB_SPEC)
+        log.write_text("\n".join(f"line-{i}" for i in range(50)) + "\n", "utf-8")
+        assert "line-49" in sr.log_tail(log, lines=5)
+        assert "line-0" not in sr.log_tail(log, lines=5)
+
+    def test_probe_none_when_never_started(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+
+        assert sr.probe(inst, sr.PLUGIN_SPEC).owner is sr.ServeOwner.NONE
+
+
+class TestUninstallLocalServices:
+    """uninstall / doctor 对 web/plugin direct 后台的防护（v0.3.3，真进程）。
+
+    孤儿状态（服务在跑、数据已删）是这一层要堵的核心：预检拒绝、--force 先停、
+    doctor 如实报告。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, inst):
+        yield
+        import contextlib
+
+        from frpsctl.core import serve_runtime as sr
+
+        for spec in (sr.WEB_SPEC, sr.PLUGIN_SPEC):
+            with contextlib.suppress(Exception):
+                status = sr.probe(inst, spec)
+                if status.running:
+                    sr.stop_background(inst, spec, timeout=1)
+
+    @staticmethod
+    def _start(inst, spec):
+        import sys
+
+        from frpsctl.core import serve_runtime as sr
+
+        return sr.start_background(
+            inst,
+            spec,
+            argv=[sys.executable, "-c", "import time; time.sleep(60)", "serve"],
+            args={},
+            wait=0.3,
+        )
+
+    def test_precheck_refuses_running_direct(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core.uninstall import _precheck
+        from frpsctl.errors import OwnershipConflict
+
+        self._start(inst, sr.WEB_SPEC)
+        with pytest.raises(OwnershipConflict, match="拒绝卸载"):
+            _precheck(inst, force=False)
+        _precheck(inst, force=True)  # --force 允许（实际停止在 _ensure_stopped）
+
+    def test_execute_without_force_refuses(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+        from frpsctl.errors import OwnershipConflict
+
+        self._start(inst, sr.WEB_SPEC)
+        with pytest.raises(OwnershipConflict):
+            execute_uninstall(plan_uninstall(inst))
+
+    def test_force_uninstall_stops_direct(self, inst) -> None:
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        state = self._start(inst, sr.PLUGIN_SPEC)
+        report = execute_uninstall(plan_uninstall(inst), force=True)
+        assert plat.process_gone(state.pid), "direct 插件进程必须被停止"
+        assert any("插件服务" in item for item in report.stopped)
+
+    def test_doctor_reports_running_direct(self, inst) -> None:
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core.doctor import Severity, _check_local_services
+
+        state = self._start(inst, sr.WEB_SPEC)
+        findings = _check_local_services(inst)
+        assert any(
+            f.severity is Severity.INFO
+            and "Web 管理台" in f.message
+            and str(state.pid) in f.message
+            for f in findings
+        )
+
+    def test_doctor_warns_when_port_unreachable(self, inst) -> None:
+        """状态说在跑、端口却连不上 → WARN（服务半死；v0.3.3 P1）。"""
+        import json as json_module
+        import socket
+        import subprocess
+        import sys
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+        from frpsctl.core.doctor import Severity, _check_local_services
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "serve"])
+        try:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            inst.ensure_dirs()
+            sr.state_path(inst, sr.WEB_SPEC).write_text(
+                json_module.dumps(
+                    {
+                        "pid": proc.pid,
+                        "start_time": plat.proc_start_time(proc.pid),
+                        "binary": sys.executable,
+                        "argv": [sys.executable, "serve"],
+                        "args": {},
+                        "log": "",
+                        "started_at": "",
+                        "host": "127.0.0.1",
+                        "port": port,
+                    }
+                ),
+                "utf-8",
+            )
+            findings = _check_local_services(inst)
+            assert any(
+                f.severity is Severity.WARN and "无法连接" in f.message for f in findings
+            )
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_doctor_reports_none_silently(self, inst) -> None:
+        from frpsctl.core.doctor import _check_local_services
+
+        assert _check_local_services(inst) == []
+
+
+class TestServeEndToEnd:
+    """direct 后台的**真链路**（真 `python -m frpsctl ... serve` 子进程）。
+
+    与 `TestServeRuntime`（sleeper 进程验证生命周期原语）互补：这里验证
+    spawn 的命令行真的能对外服务——Web 的 HTTP 200、插件的裁决与审计刷盘。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _env_and_cleanup(self, inst, monkeypatch):
+        import contextlib
+        import os
+
+        monkeypatch.setenv("FRPSCTL_ROOT", str(inst.instances_root))
+        monkeypatch.setenv("FRPSCTL_DATA_HOME", str(inst.data_home))
+        monkeypatch.setenv("FRPSCTL_INSTANCE", inst.name)
+        assert os.environ["FRPSCTL_ROOT"]  # 子进程继承同一数据目录
+        yield
+        from frpsctl.core import serve_runtime as sr
+
+        for spec in (sr.WEB_SPEC, sr.PLUGIN_SPEC):
+            with contextlib.suppress(Exception):
+                if sr.probe(inst, spec).running:
+                    sr.stop_background(inst, spec, timeout=1)
+
+    @staticmethod
+    def _exe(*args: str) -> list[str]:
+        import sys
+
+        return [sys.executable, "-m", "frpsctl", *args]
+
+    @staticmethod
+    def _free_port() -> int:
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    def test_web_serve_end_to_end(self, inst) -> None:
+        import urllib.request
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+
+        port = self._free_port()
+        inst.ensure_dirs()
+        pw = inst.dir / "web-password"
+        pw.write_text("e2e-secret\n", "utf-8")
+        pw.chmod(0o600)
+        state = sr.start_background(
+            inst,
+            sr.WEB_SPEC,
+            argv=self._exe(
+                "web", "serve", "--bind", f"127.0.0.1:{port}", "--password-file", str(pw)
+            ),
+            args={"bind": f"127.0.0.1:{port}"},
+            host="127.0.0.1",
+            port=port,
+        )
+        assert sr.probe(inst, sr.WEB_SPEC).running
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:  # noqa: S310
+            body = resp.read().decode()
+            status = resp.status
+        assert status == 200 and "frpsctl" in body
+        sr.stop_background(inst, sr.WEB_SPEC, timeout=5)
+        assert plat.process_gone(state.pid)
+
+    def test_plugin_serve_end_to_end_audit_flush(self, inst) -> None:
+        import json as json_module
+        import urllib.request
+
+        from frpsctl.core import platform as plat
+        from frpsctl.core import serve_runtime as sr
+
+        port = self._free_port()
+        inst.ensure_dirs()
+        policy = inst.dir / "plugin-policy.json"
+        policy.write_text(
+            json_module.dumps(
+                {
+                    "users": {"alice": {"allowed_ports": [6000]}},
+                    "audit": {
+                        "enabled": True,
+                        "path": "plugin-audit.jsonl",
+                        "flush_every": 1,
+                        "flush_interval": 0.05,
+                    },
+                }
+            ),
+            "utf-8",
+        )
+        state = sr.start_background(
+            inst,
+            sr.PLUGIN_SPEC,
+            argv=self._exe(
+                "plugin", "serve", "--policy", str(policy), "--bind", f"127.0.0.1:{port}"
+            ),
+            args={"bind": f"127.0.0.1:{port}", "policy": str(policy)},
+            host="127.0.0.1",
+            port=port,
+        )
+        body = json_module.dumps(
+            {
+                "version": "0.1.0",
+                "op": "Login",
+                "content": {"user": "alice", "metas": {"client_id": "alice"}},
+            }
+        ).encode()
+        request = urllib.request.Request(  # noqa: S310 - 固定回环
+            f"http://127.0.0.1:{port}/handler?version=0.1.0&op=Login",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as resp:  # noqa: S310
+            payload = json_module.loads(resp.read())
+        assert resp.status == 200
+        assert payload.get("reject") in (False, None), f"Login 应放行：{payload}"
+
+        # 停止走 SIGTERM：plugin serve 会先刷审计再退出
+        sr.stop_background(inst, sr.PLUGIN_SPEC, timeout=5)
+        assert plat.process_gone(state.pid)
+        audit = inst.dir / "plugin-audit.jsonl"
+        assert audit.exists(), "审计文件未生成"
+        assert "alice" in audit.read_text("utf-8"), "停止后审计未落盘"
+
+
 class TestPluginService:
     """`plugin service install` 的 unit 渲染与部署体检（§11.2 的 systemd 落地）。
 

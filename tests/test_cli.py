@@ -2431,6 +2431,294 @@ class TestServiceInstallIdentity:
         assert payload["user"] == "pluguser" and payload["user_source"] == "explicit"
 
 
+class TestServeBackgroundCommands:
+    """后台命令（v0.3.3）：接线、JSON 契约、互斥与口令落盘。
+
+    真进程生命周期由 tests/test_units.py::TestServeRuntime 覆盖；这里用
+    monkeypatch 隔离 spawn，专注命令层。
+    """
+
+    @staticmethod
+    def _fake_state(tmp_path, **over):
+        from frpsctl.core.serve_runtime import ServeState
+
+        data = {
+            "pid": 4321,
+            "start_time": 99,
+            "binary": "/usr/local/bin/frpsctl",
+            "argv": ("/usr/local/bin/frpsctl", "web", "serve"),
+            "args": {"bind": "127.0.0.1:8787", "password_file": str(tmp_path / "pw")},
+            "log": str(tmp_path / "web.log"),
+            "started_at": "now",
+            "host": "127.0.0.1",
+            "port": 8787,
+        }
+        data.update(over)
+        return ServeState(**data)
+
+    def _patch_exe(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "frpsctl.cli.runtime._frpsctl_executable", lambda: Path("/usr/local/bin/frpsctl")
+        )
+
+    def test_web_start_json_and_password_file(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        captured: dict = {}
+
+        def fake_start(_inst, _spec, **kwargs):
+            captured.update(kwargs)
+            return self._fake_state(cli_env)
+
+        monkeypatch.setattr("frpsctl.cli.commands.web.serve_runtime.start_background", fake_start)
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["web", "start", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["owner"] == "direct"
+        assert payload["password_generated"] is True
+        assert payload["url"] == "http://127.0.0.1:8787/"
+        pw_file = Path(payload["password_file"])
+        assert pw_file.exists(), "口令必须落盘（后台模式可读回）"
+        assert pw_file.stat().st_mode & 0o777 == 0o600
+        argv_text = " ".join(captured["argv"])
+        assert "--password-file" in argv_text
+        assert payload["password"] not in argv_text, "明文口令不得出现在进程命令行里"
+        assert captured["args"]["bind"] == "127.0.0.1:8787"
+
+    def test_web_start_non_loopback_rejected(self, cli_env, monkeypatch) -> None:
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["web", "start", "--bind", "0.0.0.0:8787"])
+        assert result.exit_code == 2, result.output
+        assert "非回环" in result.output
+
+    def test_web_start_conflicts_with_systemd(self, cli_env, monkeypatch) -> None:
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.unit_exists", lambda _s: True)
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.is_active", lambda _s: True)
+        result = runner.invoke(app, ["web", "start"])
+        assert result.exit_code == 11, result.output
+        assert "systemd" in result.output
+
+    def test_web_stop_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.unit_exists", lambda _s: False)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.serve_runtime.stop_background",
+            lambda _inst, _spec: self._fake_state(cli_env),
+        )
+        result = runner.invoke(app, ["web", "stop", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json_module.loads(result.stdout)["stopped"] is True
+
+    def test_web_stop_refuses_when_systemd_active(self, cli_env, monkeypatch) -> None:
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.unit_exists", lambda _s: True)
+        monkeypatch.setattr("frpsctl.cli.commands.web.WebService.is_active", lambda _s: True)
+        result = runner.invoke(app, ["web", "stop"])
+        assert result.exit_code == 11
+
+    def test_web_status_direct_and_none(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        from frpsctl.core import serve_runtime as sr
+
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.WebService.available", property(lambda _s: False)
+        )
+        state = self._fake_state(cli_env)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.serve_runtime.probe",
+            lambda _inst, spec: sr.ServeStatus(
+                spec=spec, owner=sr.ServeOwner.DIRECT, state=state, uptime_seconds=65
+            ),
+        )
+        result = runner.invoke(app, ["web", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["owner"] == "direct" and payload["active"] is True
+        assert payload["pid"] == 4321
+
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.serve_runtime.probe",
+            lambda _inst, spec: sr.ServeStatus(spec=spec, owner=sr.ServeOwner.NONE),
+        )
+        result = runner.invoke(app, ["web", "status", "--json"])
+        assert json_module.loads(result.stdout)["owner"] == "none"
+
+    def test_web_service_start_refuses_when_direct_running(self, cli_env, monkeypatch) -> None:
+        from frpsctl.core import serve_runtime as sr
+
+        monkeypatch.setattr(
+            "frpsctl.core.serve_runtime.probe",
+            lambda _inst, spec: sr.ServeStatus(
+                spec=spec, owner=sr.ServeOwner.DIRECT, state=self._fake_state(cli_env)
+            ),
+        )
+        result = runner.invoke(app, ["web", "service", "start"])
+        assert result.exit_code == 11, result.output
+        assert "direct" in result.output
+
+    def test_web_restart_reads_args_before_stop(self, cli_env, monkeypatch) -> None:
+        """restart 的参数复用必须"先读后停"（review 修复的顺序守卫）。
+
+        stop 会删除状态文件：若先停再读，旧参数（bind 等）会静默回落默认值。
+        用事件顺序断言，而不是只看结果——两种实现的最终 JSON 可能碰巧相同。
+        """
+
+        pw = cli_env / "external-web-password"
+        pw.write_text("ext\n", "utf-8")
+        old_state = self._fake_state(
+            cli_env,
+            args={"bind": "127.0.0.1:18791", "password_file": str(pw)},
+        )
+        events: list[str] = []
+
+        def fake_read(_inst, _spec):
+            events.append("read")
+            return (old_state, None)
+
+        def fake_stop(_inst, _spec):
+            events.append("stop")
+            return old_state
+
+        captured: dict = {}
+
+        def fake_start(_inst, _spec, **kwargs):
+            events.append("start")
+            captured.update(kwargs)
+            return old_state
+
+        monkeypatch.setattr("frpsctl.cli.commands.web.serve_runtime.read_state", fake_read)
+        monkeypatch.setattr("frpsctl.cli.commands.web.serve_runtime.stop_background", fake_stop)
+        monkeypatch.setattr("frpsctl.cli.commands.web.serve_runtime.start_background", fake_start)
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["web", "restart", "--json"])
+        assert result.exit_code == 0, result.output
+        assert events.index("read") < events.index("stop"), "必须先读旧参数再停止"
+        assert captured["args"]["bind"] == "127.0.0.1:18791", "restart 复用了默认参数"
+        argv = captured["argv"]
+        assert argv[argv.index("--password-file") + 1] == str(pw), (
+            "restart 必须复用上次的口令文件路径（外部文件不能静默回落默认）"
+        )
+
+    def test_plugin_restart_reads_args_before_stop(self, cli_env, monkeypatch) -> None:
+        """plugin restart 的同型顺序守卫。"""
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        policy = cli_env / "instances" / "default" / "plugin-policy.json"
+        old_state = self._fake_state(
+            cli_env,
+            args={
+                "bind": "127.0.0.1:18080",
+                "path": "/handler",
+                "policy": str(policy),
+                "access_log": False,
+            },
+        )
+        events: list[str] = []
+
+        def fake_read(_inst, _spec):
+            events.append("read")
+            return (old_state, None)
+
+        def fake_stop(_inst, _spec):
+            events.append("stop")
+            return old_state
+
+        captured: dict = {}
+
+        def fake_start(_inst, _spec, **kwargs):
+            events.append("start")
+            captured.update(kwargs)
+            return old_state
+
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.serve_runtime.read_state", fake_read)
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.serve_runtime.stop_background", fake_stop)
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.serve_runtime.start_background", fake_start)
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["plugin", "restart", "--json"])
+        assert result.exit_code == 0, result.output
+        assert events.index("read") < events.index("stop")
+        assert captured["args"]["bind"] == "127.0.0.1:18080"
+
+    def test_plugin_start_conflicts_with_systemd(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.PluginService.unit_exists", lambda _s: True)
+        monkeypatch.setattr("frpsctl.cli.commands.plugin.PluginService.is_active", lambda _s: True)
+        result = runner.invoke(app, ["plugin", "start"])
+        assert result.exit_code == 11, result.output
+        assert "systemd" in result.output
+
+    def test_plugin_service_start_refuses_when_direct_running(self, cli_env, monkeypatch) -> None:
+        from frpsctl.core import serve_runtime as sr
+
+        monkeypatch.setattr(
+            "frpsctl.core.serve_runtime.probe",
+            lambda _inst, spec: sr.ServeStatus(
+                spec=spec, owner=sr.ServeOwner.DIRECT, state=self._fake_state(cli_env)
+            ),
+        )
+        result = runner.invoke(app, ["plugin", "service", "start"])
+        assert result.exit_code == 11, result.output
+        assert "direct" in result.output
+
+    def test_plugin_start_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        captured: dict = {}
+
+        def fake_start(_inst, _spec, **kwargs):
+            captured.update(kwargs)
+            return self._fake_state(
+                cli_env,
+                port=8080,
+                args={
+                    "bind": "127.0.0.1:8080",
+                    "path": "/handler",
+                    "policy": str(cli_env / "instances" / "default" / "plugin-policy.json"),
+                    "access_log": False,
+                },
+            )
+
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.plugin.serve_runtime.start_background", fake_start
+        )
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["plugin", "start", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["owner"] == "direct"
+        assert payload["path"] == "/handler"
+        assert "plugin" in " ".join(captured["argv"])
+
+    def test_plugin_start_non_loopback_rejected(self, cli_env, monkeypatch) -> None:
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        self._patch_exe(monkeypatch)
+        result = runner.invoke(app, ["plugin", "start", "--bind", "0.0.0.0:8080"])
+        assert result.exit_code == 2, result.output
+        assert "非回环" in result.output
+
+    def test_plugin_status_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        from frpsctl.core import serve_runtime as sr
+
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.plugin.PluginService.available", property(lambda _s: False)
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.plugin.serve_runtime.probe",
+            lambda _inst, spec: sr.ServeStatus(spec=spec, owner=sr.ServeOwner.NONE),
+        )
+        result = runner.invoke(app, ["plugin", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json_module.loads(result.stdout)["owner"] == "none"
+
+
 class TestPluginWebServiceUninstallCommand:
     def test_plugin_service_uninstall(self, cli_env, monkeypatch) -> None:
         import json
@@ -2705,17 +2993,22 @@ class TestRegressionReviewCliFixes:
     """v0.3.0 回归 review 的 CLI 侧修复守卫。"""
 
     def test_config_set_noop_masks_secret(self, cli_env) -> None:
-        """M7：noop 分支不得把敏感值明文打到 stdout（§10 硬约束 2）。"""
-        import re
+        """M7：noop 分支不得把敏感值明文打到 stdout（§10 硬约束 2）。
 
+        用固定、**以 `-` 开头**的口令：随机口令（base64url）有约 1.6% 概率以
+        `-` 开头，会被 CLI 当选项解析而报 `No such option`——这条测试曾经
+        因此偶发失败（v0.3.3 review 定位）。`--` 是标准的"其后全是位置参数"
+        分隔符（`_AnywhereGroup` 明确遵守），顺带把这条语义固化。
+        """
         install_fake_binary(cli_env)
         runner.invoke(app, ["init", "--no-input", "--dashboard-port", "0"])
-        config = cli_env / "instances" / "default" / "frps.toml"
-        password = re.search(r'password = "([^"]+)"', config.read_text("utf-8")).group(1)
-        result = runner.invoke(app, ["config", "set", "webServer.password", password])
+        fixed = "-e-flaky-boundary-secret"
+        result = runner.invoke(app, ["config", "set", "webServer.password", "--", fixed])
         assert result.exit_code == 0, result.output
-        assert "无需变更" in result.output
-        assert password not in result.output, "敏感值明文出现在 noop 输出里"
+        noop = runner.invoke(app, ["config", "set", "webServer.password", "--", fixed])
+        assert noop.exit_code == 0, noop.output
+        assert "无需变更" in noop.output
+        assert fixed not in noop.output, "敏感值明文出现在 noop 输出里"
 
     def test_legacy_policy_shows_numeric_audit_defaults(self, cli_env) -> None:
         """M3：老策略缺 `audit.max_mb`/`max_days` 时不得显示成布尔 true。"""

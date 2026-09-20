@@ -256,6 +256,31 @@ class TestFrontendPureFunctionsRuntime:
 class TestCspReadiness:
     """CSP nonce 化的静态前提（server 测试验证注入行为，这里守源头文件）。"""
 
+    def test_v033_component_classes_have_styles(self) -> None:
+        """v0.3.3 新增组件类都必须有样式定义（否则动效/布局静默失效）。"""
+        style = _style_block(_index_html())
+        for cls in (
+            "hero", "metric", "skeleton", "empty", "modal-card", "toolbar",
+            "kbd", "grid-line", "crosshair", "tip-box", "tip-text", "bar-hit",
+            "view-anim", "login-logo", "grad-in-stop", "grad-out-stop", "ticon",
+        ):
+            assert f".{cls}" in style, f"缺少 .{cls} 样式"
+
+    def test_reduced_motion_and_aurora_present(self) -> None:
+        """无障碍与视觉基线：尊重 reduced-motion；极光/玻璃令牌已启用。"""
+        html = _index_html()
+        style = _style_block(html)
+        assert "prefers-reduced-motion" in style
+        assert "radial-gradient" in style
+        assert "--accent-grad" in style and "var(--accent-grad)" in style
+
+    def test_no_native_blocking_dialogs(self) -> None:
+        """不再使用原生 confirm/alert/prompt（改自绘 modal：可样式化、可键盘操作）。"""
+        js = "\n".join(_script_blocks(_index_html()))
+        assert "confirm(" not in js, "仍有原生 confirm 调用"
+        assert "alert(" not in js, "仍有原生 alert 调用"
+        assert "confirmAsync(" in js
+
     def test_no_inline_style_attributes(self) -> None:
         import re
 

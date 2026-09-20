@@ -591,10 +591,16 @@ class TestBoundedConcurrency:
             first.start()
             assert entered.wait(5), "第一个请求没有进入 handler"
 
-            # 唯一 worker 被占住：第二个请求必须立即 503，而不是排队等待。
-            with pytest.raises(urllib.error.HTTPError) as excinfo:
+            # 唯一 worker 被占住：第二个请求必须**立即失败**，而不是排队等待。
+            # 形态有两种且都正确（README 已知边界）：HTTP 503，或服务端 close
+            # 与客户端发送的竞态触发内核 TCP 重置（连接层 OSError）——对 frp
+            # 同样是"该操作失败"。只断言 503 会随调度偶发 flaky（v0.3.3 最后
+            # 一轮 review 定位；与 `test_concurrent_burst_gets_bounded_responses`
+            # 同一条语义）。
+            with pytest.raises((urllib.error.HTTPError, OSError)) as excinfo:
                 urllib.request.urlopen(request(), timeout=5)  # noqa: S310
-            assert excinfo.value.code == 503, excinfo.value.code
+            if isinstance(excinfo.value, urllib.error.HTTPError):
+                assert excinfo.value.code == 503, excinfo.value.code
 
             release.set()
             first.join(timeout=10)
