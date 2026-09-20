@@ -26,6 +26,8 @@ __all__ = [
     "ChecksumMismatch",
     "NotRunning",
     "AlreadyRunning",
+    "ServeNotRunning",
+    "ServeAlreadyRunning",
     "AdminUnreachable",
     "ApiVersionMismatch",
     "PermissionRequired",
@@ -185,15 +187,37 @@ class StartupFailed(FrpsctlError):
 
     `detail` 是 frp 的原始报错（回显给用户，G6）；`hint` 用于覆盖默认的
     "见 startup 日志"——例如停止流程里"SIGKILL 后仍未退出"需要不同的指引。
+    `subject` 供 web/plugin 的后台服务复用同一异常（默认 "frps"）。
     """
 
     exit_code = ExitCode.STARTUP_FAILED
 
-    def __init__(self, detail: str = "", *, hint: str | None = None) -> None:
+    def __init__(self, detail: str = "", *, hint: str | None = None, subject: str = "frps") -> None:
         super().__init__(
-            "frps 启动后立即退出",
+            f"{subject} 启动后立即退出",
             hint=hint if hint is not None else (detail.strip() or "见 startup 日志"),
         )
+
+
+class ServeNotRunning(FrpsctlError):
+    """后台服务（Web 管理台 / 插件服务）未在运行（v0.3.3 direct 模式）。"""
+
+    exit_code = ExitCode.NOT_RUNNING
+
+    def __init__(self, label: str) -> None:
+        super().__init__(
+            f"{label}未在后台运行",
+            hint="用 start 启动；由 systemd 托管时用 service start",
+        )
+
+
+class ServeAlreadyRunning(FrpsctlError):
+    """后台服务已在运行（direct 模式；与 systemd 的互斥由调用方先行检查）。"""
+
+    exit_code = ExitCode.ALREADY_RUNNING
+
+    def __init__(self, label: str, pid: int) -> None:
+        super().__init__(f"{label}已在后台运行（pid {pid}）", hint="先 stop，或用 restart")
 
 
 class StopFailed(FrpsctlError):
