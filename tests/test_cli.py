@@ -2263,7 +2263,10 @@ class TestServiceInstallUninstallCommand:
         assert payload["unit"] == "frps@default.service"
         assert payload["template"] == "/etc/systemd/system/frps@.service"
         assert payload["owner"] == "systemd"
-        assert captured["user"] == "frps"
+        assert payload["user"]
+        assert captured["user"] == payload["user"]
+        assert payload["user_source"] in ("default-frps", "default-current")
+        assert payload["created_user"] is False
         assert captured["log_dir"] == Path("/var/log/frps")
 
     def test_service_uninstall_reports_removed(self, cli_env, monkeypatch) -> None:
@@ -2277,6 +2280,155 @@ class TestServiceInstallUninstallCommand:
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout) == {"unit": "frps@default.service", "removed": True}
         assert calls == ["uninstall"]
+
+
+class TestServiceInstallIdentity:
+    """服务账户解析的 CLI 侧（§12.2 v0.3.2）：--user/--create-user/来源与警告。"""
+
+    def _fake_install(self, monkeypatch) -> dict:
+        captured: dict = {}
+
+        def fake_install(_self, **kwargs):
+            captured.update(kwargs)
+            return Path("/etc/systemd/system/frps@.service")
+
+        monkeypatch.setattr("frpsctl.cli.commands.service.Systemd.install_template", fake_install)
+        return captured
+
+    def test_explicit_user_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+        import pwd
+
+        me = pwd.getpwuid(__import__("os").geteuid()).pw_name
+        install_fake_binary(cli_env)
+        captured = self._fake_install(monkeypatch)
+        result = runner.invoke(app, ["service", "install", "--user", me, "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["user"] == me
+        assert payload["group"]
+        assert payload["user_source"] == "explicit"
+        assert payload["created_user"] is False
+        assert captured["user"] == me
+
+    def test_missing_binary_reported_before_account_creation(self, cli_env, monkeypatch) -> None:
+        """执行顺序：二进制缺失先报（退出码 4），不会先执行 --create-user（review 收口）。"""
+        touched: list = []
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.ensure_service_account",
+            lambda *_a, **_k: touched.append("ensure"),
+        )
+        result = runner.invoke(app, ["service", "install", "--user", "ghost", "--create-user"])
+        assert result.exit_code == 4, result.output
+        assert touched == [], "二进制缺失时不应触碰账户解析/创建"
+
+    def test_create_user_requires_user_option(self, cli_env) -> None:
+        # 需要二进制先就位：执行顺序是"二进制 → 账户解析"（review 收口后）。
+        install_fake_binary(cli_env)
+        result = runner.invoke(app, ["service", "install", "--create-user"])
+        assert result.exit_code == 2, result.output
+        assert "需要配合 --user" in result.output
+
+    def test_create_user_flow_and_root_warning(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        from frpsctl.core.systemd import ServiceIdentity
+
+        install_fake_binary(cli_env)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.ensure_service_account",
+            lambda *_a, **_k: ServiceIdentity("ghost", "ghost", 0, 0, "explicit", created=True),
+        )
+        self._fake_install(monkeypatch)
+        result = runner.invoke(app, ["service", "install", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["created_user"] is True
+        assert "root" in result.stderr, "root 安全警告必须进 stderr（JSON 模式也不豁免）"
+
+        text = runner.invoke(app, ["service", "install"])
+        assert "已创建系统用户 ghost" in text.output
+        assert "服务用户为 root" in text.output
+
+    def test_force_template_conflict_warns(self, cli_env, monkeypatch) -> None:
+        from frpsctl.core.systemd import ServiceIdentity
+
+        install_fake_binary(cli_env)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.ensure_service_account",
+            lambda *_a, **_k: ServiceIdentity("newuser", "newuser", 1001, 1001, "explicit"),
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.read_template_user", lambda _path: "olduser"
+        )
+        self._fake_install(monkeypatch)
+        result = runner.invoke(app, ["service", "install", "--force"])
+        assert result.exit_code == 0, result.output
+        assert "olduser" in result.output and "newuser" in result.output
+
+    def test_service_status_shows_accounts(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        monkeypatch.setattr("frpsctl.cli.commands.service.Systemd.is_active", lambda _s: True)
+        monkeypatch.setattr("frpsctl.cli.commands.service.Systemd.is_enabled", lambda _s: True)
+        monkeypatch.setattr("frpsctl.cli.commands.service.Systemd.main_pid", lambda _s: 4321)
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.service.show_unit_accounts", lambda _unit: ("svc", "svcgrp")
+        )
+        result = runner.invoke(app, ["service", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["user"] == "svc" and payload["group"] == "svcgrp"
+        assert payload["main_pid"] == 4321
+        text = runner.invoke(app, ["service", "status"])
+        assert "user     : svc" in text.output
+
+    def test_web_service_install_identity_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        from frpsctl.core.systemd import ServiceIdentity
+
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.ensure_service_account",
+            lambda *_a, **_k: ServiceIdentity("webuser", "webgroup", 1001, 1001, "explicit"),
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.runtime._frpsctl_executable",
+            lambda: Path("/usr/local/bin/frpsctl"),
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.web.WebService.install_template",
+            lambda _self, **_k: (Path("/etc/systemd/system/frpsctl-web@.service"), ""),
+        )
+        result = runner.invoke(app, ["web", "service", "install", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["user"] == "webuser" and payload["group"] == "webgroup"
+        assert payload["user_source"] == "explicit"
+
+    def test_plugin_service_install_identity_json(self, cli_env, monkeypatch) -> None:
+        import json as json_module
+
+        from frpsctl.core.systemd import ServiceIdentity
+
+        runner.invoke(app, ["init", "--no-input"])
+        runner.invoke(app, ["plugin", "init"])
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.plugin.ensure_service_account",
+            lambda *_a, **_k: ServiceIdentity("pluguser", "pluggroup", 1001, 1001, "explicit"),
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.runtime._frpsctl_executable",
+            lambda: Path("/usr/local/bin/frpsctl"),
+        )
+        monkeypatch.setattr(
+            "frpsctl.cli.commands.plugin.PluginService.install_template",
+            lambda _self, **_k: Path("/etc/systemd/system/frpsctl-plugin@.service"),
+        )
+        result = runner.invoke(app, ["plugin", "service", "install", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json_module.loads(result.stdout)
+        assert payload["user"] == "pluguser" and payload["user_source"] == "explicit"
 
 
 class TestPluginWebServiceUninstallCommand:

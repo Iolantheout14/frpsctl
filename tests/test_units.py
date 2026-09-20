@@ -1614,7 +1614,9 @@ class TestSystemdDelegation:
         binary.chmod(0o755)
         log_dir = tmp_path / "logs"
 
-        path = systemd.install_template(binary=binary, log_dir=log_dir)
+        path = systemd.install_template(
+            binary=binary, log_dir=log_dir, user="frps", group="frps"
+        )
         assert path == systemd.template_path
         assert path.exists()
         assert f"ExecStart={binary}" in path.read_text("utf-8")
@@ -1882,6 +1884,400 @@ class TestSystemdDelegation:
         # `unit_dir` 在 dataclass 实例上，改类属性对已构造的实例无效。
         monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _name: "/usr/bin/systemctl")
         assert Systemd(systemd.inst, unit_dir=tmp_path / "missing").available is False
+
+
+class TestServiceIdentityResolution:
+    """服务账户解析（§12.2 v0.3.2）：`frps` 只是候选，任何用户都可用。
+
+    覆盖 `--user` 缺省的三级解析、组回退、数字 UID/GID、`--create-user`
+    的完整控制流——它们共同保证"服务用户"不再是写死的假设。
+    """
+
+    @staticmethod
+    def _pw(uid: int, gid: int, name: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(pw_uid=uid, pw_gid=gid, pw_name=name)
+
+    @staticmethod
+    def _gr(gid: int, name: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(gr_gid=gid, gr_name=name)
+
+    def test_default_prefers_existing_frps(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import resolve_service_identity
+
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._user_record",
+            lambda name: self._pw(1001, 1002, "frps") if name == "frps" else None,
+        )
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._group_record",
+            lambda name: self._gr(1002, "frps") if name == "frps" else None,
+        )
+        identity = resolve_service_identity(None)
+        assert (identity.user, identity.group) == ("frps", "frps")
+        assert (identity.uid, identity.gid) == (1001, 1002)
+        assert identity.source == "default-frps"
+        assert identity.notes == ()
+
+    def test_default_falls_back_to_current_user(self, monkeypatch) -> None:
+        import grp
+        import pwd
+
+        from frpsctl.core.systemd import resolve_service_identity
+
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._user_record",
+            lambda name: self._pw(4242, 4343, "tester") if name == "tester" else None,
+        )
+        monkeypatch.setattr("frpsctl.core.systemd._group_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 4242)
+        monkeypatch.setattr(pwd, "getpwuid", lambda _uid: self._pw(4242, 4343, "tester"))
+        monkeypatch.setattr(grp, "getgrgid", lambda _gid: self._gr(4343, "testergrp"))
+
+        identity = resolve_service_identity(None)
+        assert (identity.user, identity.group) == ("tester", "testergrp")
+        assert identity.uid == 4242
+        assert identity.source == "default-current"
+        assert any("主组" in note for note in identity.notes)
+
+    def test_explicit_numeric_uid_and_gid(self, monkeypatch) -> None:
+        import grp
+        import pwd
+
+        from frpsctl.core.systemd import resolve_service_identity
+
+        monkeypatch.setattr(pwd, "getpwuid", lambda _uid: self._pw(4242, 4343, "numuser"))
+        monkeypatch.setattr(grp, "getgrgid", lambda _gid: self._gr(5555, "numgrp"))
+        identity = resolve_service_identity("4242", "5555")
+        assert (identity.user, identity.group) == ("numuser", "numgrp")
+        assert identity.source == "explicit"
+
+    def test_numeric_uid_missing_rejected(self, monkeypatch) -> None:
+        import pwd
+
+        from frpsctl.core.systemd import resolve_service_identity
+        from frpsctl.errors import UsageError
+
+        def boom(_uid):
+            raise KeyError("nope")
+
+        monkeypatch.setattr(pwd, "getpwuid", boom)
+        with pytest.raises(UsageError, match="用户 ID 不存在"):
+            resolve_service_identity("4242")
+
+    def test_numeric_gid_missing_rejected(self, monkeypatch) -> None:
+        import grp
+
+        from frpsctl.core.systemd import resolve_service_identity
+        from frpsctl.errors import UsageError
+
+        def boom(_gid):
+            raise KeyError("nope")
+
+        monkeypatch.setattr(grp, "getgrgid", boom)
+        with pytest.raises(UsageError, match="组 ID 不存在"):
+            resolve_service_identity("root", "5555")
+
+    def test_illegal_token_rejected(self) -> None:
+        from frpsctl.core.systemd import resolve_service_identity
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError, match="非法"):
+            resolve_service_identity("bad\nname")
+
+    def test_missing_same_name_group_falls_back_to_primary(self, monkeypatch) -> None:
+        import grp
+
+        from frpsctl.core.systemd import resolve_service_identity
+
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._user_record",
+            lambda name: self._pw(1000, 100, "alice") if name == "alice" else None,
+        )
+        monkeypatch.setattr("frpsctl.core.systemd._group_record", lambda _n: None)
+        monkeypatch.setattr(grp, "getgrgid", lambda _gid: self._gr(100, "users"))
+
+        identity = resolve_service_identity("alice")
+        assert identity.group == "users"
+        assert identity.uid == 1000
+        assert any("主组" in note for note in identity.notes)
+
+    def test_create_user_requires_explicit_name(self) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError, match="需要配合 --user"):
+            ensure_service_account(None, None, create_user=True)
+
+    def test_missing_user_without_create_rejected(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import UsageError
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        with pytest.raises(UsageError, match="系统用户或组不存在") as info:
+            ensure_service_account("ghost", create_user=False)
+        assert "--create-user" in (info.value.hint or "")
+
+    def test_missing_explicit_group_rejected_even_with_create(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import UsageError
+
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._user_record",
+            lambda name: self._pw(1000, 100, "alice") if name == "alice" else None,
+        )
+        monkeypatch.setattr("frpsctl.core.systemd._group_record", lambda _n: None)
+        with pytest.raises(UsageError, match="系统组不存在"):
+            ensure_service_account("alice", "missinggrp", create_user=True)
+
+    def test_create_user_with_missing_explicit_group_does_not_create(self, monkeypatch) -> None:
+        """显式 --group 缺失时先拒绝：不能为注定失败的安装先创建账户（review 收口）。"""
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import UsageError
+
+        calls: list = []
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.subprocess.run", lambda *a, **_k: calls.append(a)
+        )
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+        with pytest.raises(UsageError, match="系统组不存在"):
+            ensure_service_account("ghost", "missinggrp", create_user=True)
+        assert calls == [], "显式组缺失时不应执行 useradd"
+
+    def test_create_user_flow(self, monkeypatch) -> None:
+        import subprocess
+
+        from frpsctl.core.systemd import ensure_service_account
+
+        state = {"created": False}
+        calls: list[list[str]] = []
+
+        def fake_user(name):
+            if name == "ghost" and state["created"]:
+                return self._pw(4321, 4321, "ghost")
+            return None
+
+        def fake_group(name):
+            return self._gr(4321, "ghost") if (state["created"] and name == "ghost") else None
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            state["created"] = True
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", fake_user)
+        monkeypatch.setattr("frpsctl.core.systemd._group_record", fake_group)
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _n: "/usr/sbin/useradd")
+        monkeypatch.setattr("frpsctl.core.systemd.subprocess.run", fake_run)
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+
+        identity = ensure_service_account("ghost", create_user=True)
+        assert identity.created is True
+        assert (identity.uid, identity.gid) == (4321, 4321)
+        assert identity.source == "explicit"
+        argv = next(call for call in calls if "useradd" in call[0])
+        assert argv[1:] == [
+            "--system",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--user-group",
+            "ghost",
+        ]
+
+    def test_create_user_non_root_rejected(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import PermissionRequired
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 1000)
+        with pytest.raises(PermissionRequired, match="创建服务账户"):
+            ensure_service_account("ghost", create_user=True)
+
+    def test_create_user_invalid_account_name(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import UsageError
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+        with pytest.raises(UsageError, match="不是规范的系统账户名"):
+            ensure_service_account("Upper", create_user=True)
+
+    def test_create_user_useradd_missing(self, monkeypatch) -> None:
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import FrpsctlError
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+        with pytest.raises(FrpsctlError, match="找不到 useradd"):
+            ensure_service_account("ghost", create_user=True)
+
+    def test_create_user_useradd_failure_surfaces_stderr(self, monkeypatch) -> None:
+        import subprocess
+
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import FrpsctlError
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _n: "/usr/sbin/useradd")
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+
+        def fake_run(argv, **_kwargs):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="useradd: 账户已锁定")
+
+        monkeypatch.setattr("frpsctl.core.systemd.subprocess.run", fake_run)
+        with pytest.raises(FrpsctlError, match="创建系统用户失败") as info:
+            ensure_service_account("ghost", create_user=True)
+        assert "账户已锁定" in info.value.message
+
+    def test_create_user_useradd_timeout(self, monkeypatch) -> None:
+        import subprocess
+
+        from frpsctl.core.systemd import ensure_service_account
+        from frpsctl.errors import FrpsctlError
+
+        monkeypatch.setattr("frpsctl.core.systemd._user_record", lambda _n: None)
+        monkeypatch.setattr("frpsctl.core.systemd.shutil.which", lambda _n: "/usr/sbin/useradd")
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+
+        def fake_run(argv, **_kwargs):
+            raise subprocess.TimeoutExpired(argv, 15)
+
+        monkeypatch.setattr("frpsctl.core.systemd.subprocess.run", fake_run)
+        with pytest.raises(FrpsctlError, match="超时"):
+            ensure_service_account("ghost", create_user=True)
+
+
+class TestServiceManifest:
+    """安装留档 `service.json`（v0.3.2）：安装参数在下游可跟随。"""
+
+    @pytest.fixture
+    def systemd(self, inst, tmp_path):
+        from frpsctl.core.systemd import Systemd
+
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        return Systemd(inst, unit_dir=tmp_path / "systemd")
+
+    @pytest.fixture
+    def recorded(self, monkeypatch):
+        import subprocess
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        return calls
+
+    @pytest.fixture
+    def as_root(self, monkeypatch):
+        monkeypatch.setattr("frpsctl.core.systemd.os.geteuid", lambda: 0)
+
+    @pytest.fixture
+    def fake_accounts(self, monkeypatch):
+        monkeypatch.setattr(
+            "frpsctl.core.systemd._account_ids", lambda *_: (os.getuid(), os.getgid())
+        )
+
+    def _write_binary(self, tmp_path) -> Path:
+        binary = tmp_path / "frps-0.71.0"
+        binary.write_text("#!/bin/sh\ntrue\n", "utf-8")
+        binary.chmod(0o755)
+        return binary
+
+    def test_install_records_manifest(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        from frpsctl.core.systemd import read_service_manifest
+
+        log_dir = tmp_path / "logs"
+        systemd.install_template(
+            binary=self._write_binary(tmp_path), log_dir=log_dir, user="frps", group="frps"
+        )
+        data, error = read_service_manifest(systemd.inst)
+        assert error is None
+        record = data["frps"]
+        assert record["user"] == "frps" and record["group"] == "frps"
+        assert record["log_dir"] == str(log_dir.resolve())
+        assert record["unit"] == "frps@test.service"
+        assert record["installed_at"]
+        assert systemd.inst.service_manifest.stat().st_mode & 0o777 == 0o600
+
+    def test_manifest_records_resolved_default(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        import pwd
+
+        from frpsctl.core.systemd import read_service_manifest
+
+        systemd.install_template(binary=self._write_binary(tmp_path), log_dir=tmp_path / "logs")
+        data, _ = read_service_manifest(systemd.inst)
+        try:
+            pwd.getpwnam("frps")
+            expected = "frps"
+        except KeyError:
+            expected = pwd.getpwuid(os.geteuid()).pw_name
+        assert data["frps"]["user"] == expected
+        assert data["frps"]["group"]
+
+    def test_uninstall_removes_record(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        systemd.install_template(
+            binary=self._write_binary(tmp_path), log_dir=tmp_path / "logs", user="frps", group="frps"
+        )
+        assert systemd.inst.service_manifest.exists()
+        systemd.uninstall()
+        assert not systemd.inst.service_manifest.exists(), "最后一个服务卸载后留档应删除"
+
+    def test_manifest_keeps_other_services(
+        self, systemd, recorded, tmp_path, as_root, fake_accounts
+    ) -> None:
+        import json
+
+        from frpsctl.core.systemd import read_service_manifest
+
+        systemd.inst.ensure_dirs()
+        systemd.inst.service_manifest.write_text(
+            json.dumps({"web": {"user": "webuser", "group": "webuser"}}), "utf-8"
+        )
+        systemd.install_template(
+            binary=self._write_binary(tmp_path), log_dir=tmp_path / "logs", user="frps", group="frps"
+        )
+        data, _ = read_service_manifest(systemd.inst)
+        assert set(data) == {"frps", "web"}
+        systemd.uninstall()
+        data, _ = read_service_manifest(systemd.inst)
+        assert set(data) == {"web"}, "卸载 frps 不应影响其它服务的留档"
+
+    def test_manifest_missing_reads_empty(self, inst) -> None:
+        from frpsctl.core.systemd import read_service_manifest
+
+        data, error = read_service_manifest(inst)
+        assert data == {} and error is None
+
+    def test_manifest_corrupted_reads_error(self, inst) -> None:
+        from frpsctl.core.systemd import read_service_manifest
+
+        inst.ensure_dirs()
+        inst.service_manifest.write_text("{ not json", "utf-8")
+        data, error = read_service_manifest(inst)
+        assert data == {}
+        assert error is not None and "JSON" in error
+
+    def test_remove_service_record_missing_key_is_noop(self, inst) -> None:
+        from frpsctl.core.systemd import remove_service_record
+
+        inst.ensure_dirs()
+        remove_service_record(inst, "frps")
+        assert not inst.service_manifest.exists()
 
 
 class TestPluginService:
@@ -3780,6 +4176,248 @@ class TestRegressionReviewFixes:
             for item in auditlog.rotated_paths(path)
         )
         assert on_disk == total, f"并发写入丢失记录：{on_disk}/{total}"
+
+
+class TestDoctorSystemdDeployment:
+    """doctor 的 systemd 部署检查（v0.3.2）：账户 / 二进制 / 路径的下游一致性。"""
+
+    def _write_manifest(self, inst, record: dict) -> None:
+        import json
+
+        inst.ensure_dirs()
+        inst.service_manifest.write_text(json.dumps(record), "utf-8")
+
+    def test_not_installed_produces_nothing(self, inst) -> None:
+        from frpsctl.core.doctor import _check_systemd_deployment
+
+        assert _check_systemd_deployment(inst) == []
+
+    def test_missing_service_user_is_error(self, inst) -> None:
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        self._write_manifest(inst, {"frps": {"user": "ghost-svc-x", "group": "ghost-svc-x"}})
+        findings = _check_systemd_deployment(inst)
+        errors = [f for f in findings if f.severity is Severity.ERROR]
+        assert any("ghost-svc-x" in f.message and "不存在" in f.message for f in errors)
+
+    def test_missing_group_is_error(self, inst) -> None:
+        import pwd
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        self._write_manifest(inst, {"frps": {"user": me, "group": "ghost-grp-x"}})
+        findings = _check_systemd_deployment(inst)
+        assert any(
+            f.severity is Severity.ERROR and "ghost-grp-x" in f.message for f in findings
+        )
+
+    def test_show_values_take_precedence_over_manifest(self, inst, monkeypatch) -> None:
+        import pwd
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        self._write_manifest(inst, {"frps": {"user": me, "group": me}})
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", lambda _self: True)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.show_unit_accounts",
+            lambda _unit: ("ghost-svc-y", "ghost-svc-y"),
+        )
+        findings = _check_systemd_deployment(inst)
+        assert any(
+            f.severity is Severity.ERROR and "ghost-svc-y" in f.message for f in findings
+        ), "systemctl show 的实际值必须优先于留档"
+
+    def test_binary_unreachable_is_error(self, inst, monkeypatch) -> None:
+        import grp
+        import pwd
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        record = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(record.pw_gid).gr_name
+        self._write_manifest(inst, {"frps": {"user": record.pw_name, "group": group}})
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", lambda _self: True)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.show_unit_accounts",
+            lambda _unit: (record.pw_name, group),
+        )
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.read_template_exec", lambda _path: "/root/secret/frps"
+        )
+        findings = _check_systemd_deployment(inst)
+        errors = [f for f in findings if f.severity is Severity.ERROR]
+        assert any("缺少执行" in f.message or "ProtectHome" in f.message for f in errors)
+
+    def test_probe_failure_warns_not_crashes(self, inst, monkeypatch) -> None:
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+        from frpsctl.errors import FrpsctlError
+
+        def boom(_self):
+            raise FrpsctlError("systemd 无响应")
+
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", boom)
+        findings = _check_systemd_deployment(inst)
+        assert any(f.severity is Severity.WARN and "无法探测" in f.message for f in findings)
+
+    def test_corrupted_manifest_warns(self, inst) -> None:
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        inst.ensure_dirs()
+        inst.service_manifest.write_text("{ broken", "utf-8")
+        findings = _check_systemd_deployment(inst)
+        assert any(f.severity is Severity.WARN and f.check == "安装记录" for f in findings)
+
+    def test_legacy_unit_without_manifest_is_checked(self, inst, monkeypatch) -> None:
+        """旧部署（unit 存在、无留档）：仍用 `systemctl show` 实际账户检查。"""
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", lambda _self: True)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.show_unit_accounts",
+            lambda _unit: ("ghost-legacy-x", "ghost-legacy-x"),
+        )
+        findings = _check_systemd_deployment(inst)
+        assert any(
+            f.severity is Severity.ERROR and "ghost-legacy-x" in f.message for f in findings
+        )
+
+    def test_log_dir_missing_is_error(self, inst, monkeypatch) -> None:
+        import grp
+        import pwd
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        record = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(record.pw_gid).gr_name
+        self._write_manifest(
+            inst,
+            {"frps": {"user": record.pw_name, "group": group, "log_dir": "/nonexistent-logs-032"}},
+        )
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", lambda _self: True)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.show_unit_accounts",
+            lambda _unit: (record.pw_name, group),
+        )
+        findings = _check_systemd_deployment(inst)
+        assert any(
+            f.severity is Severity.ERROR and "日志目录不可用" in f.message for f in findings
+        )
+
+    def test_workdir_not_writable_is_error(self, inst, monkeypatch) -> None:
+        import grp
+        import pwd
+
+        from frpsctl.core.doctor import Severity, _check_systemd_deployment
+
+        record = pwd.getpwuid(os.geteuid())
+        group = grp.getgrgid(record.pw_gid).gr_name
+        self._write_manifest(inst, {"frps": {"user": record.pw_name, "group": group}})
+        monkeypatch.setattr("frpsctl.core.systemd.Systemd.unit_exists", lambda _self: True)
+        monkeypatch.setattr(
+            "frpsctl.core.systemd.show_unit_accounts",
+            lambda _unit: (record.pw_name, group),
+        )
+        old_mode = inst.dir.stat().st_mode & 0o777
+        inst.dir.chmod(0o500)
+        try:
+            findings = _check_systemd_deployment(inst)
+        finally:
+            inst.dir.chmod(old_mode)
+        assert any(
+            f.severity is Severity.ERROR and "实例目录对服务用户不可用" in f.message
+            for f in findings
+        )
+
+
+class TestUninstallServiceWarnings:
+    """卸载的服务账户 / 日志目录提示跟随安装留档（v0.3.2）。"""
+
+    def _warnings(
+        self, inst, monkeypatch, existing: set[str], log_dir: Path | None = None
+    ) -> list[str]:
+        import pwd
+
+        from frpsctl.core.uninstall import (
+            UninstallReport,
+            _collect_manifest_hints,
+            _courtesy_warnings,
+        )
+
+        def fake(name):
+            if name in existing:
+                return pwd.struct_passwd(("placeholder", "x", 1000, 1000, "", "/", ""))
+            raise KeyError(name)
+
+        monkeypatch.setattr("frpsctl.core.uninstall.pwd.getpwnam", fake)
+        users, log_dirs = _collect_manifest_hints((inst,))
+        report = UninstallReport()
+        _courtesy_warnings(report, users=users, log_dirs=log_dirs, log_dir=log_dir)
+        return report.warnings
+
+    def _manifest(self, inst, data: dict) -> None:
+        import json
+
+        inst.ensure_dirs()
+        inst.service_manifest.write_text(json.dumps(data), "utf-8")
+
+    def test_manifest_users_prompted(self, inst, monkeypatch) -> None:
+        import pwd
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        self._manifest(inst, {"frps": {"user": me}, "web": {"user": me}})
+        warnings = self._warnings(inst, monkeypatch, existing={me})
+        assert any(f"userdel {me}" in w for w in warnings)
+
+    def test_frps_not_reported_when_unused(self, inst, monkeypatch) -> None:
+        import pwd
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        self._manifest(inst, {"frps": {"user": me}})
+        warnings = self._warnings(inst, monkeypatch, existing={me, "frps"})
+        assert not any("userdel frps" in w for w in warnings), "未使用的 frps 不应误报"
+
+    def test_log_dir_from_manifest(self, inst, tmp_path, monkeypatch) -> None:
+        log_dir = tmp_path / "svclogs"
+        log_dir.mkdir()
+        self._manifest(inst, {"frps": {"user": "ghost", "log_dir": str(log_dir)}})
+        warnings = self._warnings(inst, monkeypatch, existing=set())
+        assert any(str(log_dir) in w for w in warnings)
+        assert not any("/var/log/frps" in w for w in warnings)
+
+    def test_fallback_without_manifest(self, inst, monkeypatch) -> None:
+        warnings = self._warnings(inst, monkeypatch, existing={"frps"})
+        assert any("userdel frps" in w for w in warnings)
+
+    def test_execute_uninstall_collects_hints_before_deleting(
+        self, inst, tmp_path, monkeypatch
+    ) -> None:
+        """删除顺序守卫：留档提示必须在数据删除**之前**收集。
+
+        v0.3.2 review 实测复现：`_courtesy_warnings` 原先在 `_remove_data`
+        之后才读 `service.json`——那时实例目录已被删除，自定义账户与日志
+        路径的提示会静默退化成默认假设。
+        """
+        import json
+        import pwd
+
+        from frpsctl.core.uninstall import execute_uninstall, plan_uninstall
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        inst.ensure_dirs()
+        inst.config.write_text("bindPort = 17000\n", "utf-8")
+        inst.service_manifest.write_text(
+            json.dumps({"frps": {"user": me, "log_dir": "/nonexistent-review032"}}), "utf-8"
+        )
+        # unit_dir 注入空目录：与真实 /etc/systemd/system 完全隔离（root 开发机
+        # 上也不会误删系统 unit），同时不依赖 systemctl stub。
+        report = execute_uninstall(plan_uninstall(inst), unit_dir=tmp_path / "units")
+        assert not inst.dir.exists(), "实例数据应已删除"
+        assert any(f"userdel {me}" in w for w in report.warnings), (
+            "留档中的服务账户提示在删除后丢失（收集顺序回归）"
+        )
 
 
 class TestUninstallCleanUnitsProbeFailure:
