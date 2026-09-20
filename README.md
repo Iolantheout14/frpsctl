@@ -208,7 +208,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.3.1
+ ✓ 命令可用：frpsctl 0.3.2
 
 frpsctl 安装完成
 ```
@@ -307,7 +307,7 @@ frpsctl install --with-frpc        # frps + frpc
 ### 验证安装
 
 ```bash
-frpsctl --version                  # frpsctl 0.3.1
+frpsctl --version                  # frpsctl 0.3.2
 frpsctl install                    # 下载 frps 二进制
 frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
@@ -357,14 +357,15 @@ pipx uninstall frpsctl             # uv 安装：uv tool uninstall frpsctl
 # ./install.sh --uninstall
 
 # 4) 清理"不属于本工具、因而不会代删"的东西（确认无用后手工执行）
-sudo rm -rf /var/log/frps          # 日志目录（可能仍被其它实例使用）
-sudo userdel frps                  # 服务账户（可能另有用途）
+sudo rm -rf /var/log/frps          # 日志目录（uninstall 会按实际 --log-dir 提示路径）
+sudo userdel <服务账户>            # 服务账户（uninstall 按安装留档逐个提示实际账户）
 sudo rm -rf /opt/frpsctl           # 数据目录残壳（uninstall 已删实例与 bin）
 ```
 
 > `frpsctl uninstall` 只处理"实例数据 + 共享二进制 + unit"；服务账户、
-> `/var/log/frps` 与 frpsctl 本体不在它的代删范围（第 3 / 4 步）——这与
-> 第 2 步说明的边界一致。
+> 日志目录与 frpsctl 本体不在它的代删范围（第 3 / 4 步），工具会按安装留档
+> （`service.json`）提示**实际使用过**的账户与日志路径——这与第 2 步说明的
+> 边界一致。
 
 ---
 
@@ -1127,10 +1128,14 @@ $ tail -1 plugin-audit.jsonl
 
 ### 用 systemd 托管 frps
 
+> 以下命令需要 root：建议 `sudo -i` 进入 root shell 后执行。单条 `sudo` 会
+> **重置环境变量**——数据目录不在默认位置时必须写成
+> `sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl …`（或 `sudo -E`）。
+
 ```bash
-sudo frpsctl service install      # 安装 frps@.service 模板并 enable
-sudo frpsctl service status       # 查看托管状态
-sudo frpsctl service uninstall    # 解除托管
+frpsctl service install           # 安装 frps@.service 模板并 enable
+frpsctl service status            # 查看托管状态（含运行账户 user/group）
+frpsctl service uninstall         # 解除托管
 ```
 
 安装后 `owner` 变为 `systemd`，`start` / `stop` / `restart` 全部**委托 systemctl**，
@@ -1138,12 +1143,12 @@ pid 文件不再参与任何判定。
 
 #### 部署前置（`service install` 会在安装前检查）
 
-unit 只是第一步——下面三项不满足时 `systemctl start` 必然失败。`service install`
+unit 只是第一步——下面各项不满足时 `systemctl start` 必然失败。`service install`
 会在**安装之前**逐项检查并当场拒绝，而不是让你事后去 systemctl 的报错里找原因：
 
 | 检查 | 不满足时的典型表现 | 处置 |
 |------|------------------|------|
-| 服务用户存在（默认 `frps`） | `Failed to determine user credentials` | `sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps`，或用 `--user`/`--group` 指定已有账户 |
+| 服务用户存在（默认优先 `frps`，否则当前用户；可 `--user` 任意账户） | `Failed to determine user credentials` | 用 `--user` 指定已有账户，或加 `--create-user` 自动创建系统账户（需 root） |
 | 二进制对服务用户可执行 | `Permission denied` | `sudo frpsctl install` 默认装在 `/root/.local/share`（`/root` 是 0700，frps 用户读不到）。改用共享目录：`sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl install` |
 | 日志目录可写（默认 `/var/log/frps`） | `Failed to set up mount namespacing` | `service install` 会自动创建并 chown；无法写入时会被拒绝，可用 `--log-dir` 换位置 |
 | 二进制与实例目录**不在家目录下** | unit 看不到路径（`ProtectHome=true` 的挂载隔离） | 用 `/opt`、`/etc`、`/srv` 等系统路径，别用 `~/.local` |
@@ -1159,15 +1164,23 @@ root 换成服务用户）——否则 frps 进程读不到目录里的 `frps.to
 > 目录只要沾了 `/root`、`/home`，unit 的 `ProtectHome=true`（挂载隔离，
 > **改权限无效**）就会让安装被拒或服务起不来。
 
-**第 0 步：frpsctl 装到系统路径 + 创建服务账户**
+**第 0 步：frpsctl 装到系统路径；服务账户按需选择**
 
 ```bash
 pipx install --global frpsctl        # → /usr/local/bin/frpsctl（推荐）
 # 或：sudo pip install frpsctl ／ sudo ./install.sh --system
 hash -r && command -v frpsctl        # 必须解析到 /usr/local/bin，而不是 ~/.local/bin
-
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
 ```
+
+服务账户三种选择（`service install` 时解析——**不再写死 `frps`**，任何账户都可用）：
+
+| 选择 | 做法 | 适用 |
+|------|------|------|
+| 默认（零配置） | 什么都不做 | 系统已有 `frps` 用户则用它；否则用**当前用户**（root 部署即 `root`） |
+| 指定已有账户 | `--user alice`（`--group` 默认同名组，缺失则回退用户主组） | 已有专用账户 |
+| 自动创建 | `--user frps --create-user` | 没有账户、让 frpsctl 建（`--system`、无家目录、nologin；需 root） |
+
+> 以 `root` 作服务用户可用（安装时会给出安全警告），但专用账户是推荐做法。
 
 **第 1 步：数据目录放到系统路径（并持久化）**
 
@@ -1186,9 +1199,10 @@ echo 'export FRPSCTL_DATA_HOME=/opt/frpsctl' >> ~/.bashrc   # 后续命令都要
 ```bash
 frpsctl install                 # 下载 frps（sha256 强校验）→ /opt/frpsctl/bin
 frpsctl init --no-input         # ⚠️ 打印的 token 与口令只显示这一次，记录下来
-frpsctl service install         # 体检（账户/权限/家目录）→ 渲染 unit → enable
+frpsctl service install         # 体检（账户/可达/日志/家目录）→ 渲染 unit → enable
 frpsctl start                   # 委托 systemctl
 frpsctl status                  # owner 应显示 systemd
+frpsctl doctor                  # 部署体检：账户 / 二进制可达性 / ReadWritePaths 等
 ```
 
 **第 3 步（可选）：Web 管理台与插件**
@@ -1202,13 +1216,13 @@ frpsctl plugin service install && frpsctl plugin service start
 
 | 报错 | 原因 | 处置 |
 |------|------|------|
-| `系统用户或组不存在：frps/frps` | 服务账户未创建 | 第 0 步的 `useradd`（或 `--user` 指定已有账户） |
-| `服务用户 'frps' 无法执行 frpsctl：目录 /root 对服务用户缺少执行（x）权限` | frpsctl 装在 `/root/.local/bin` | 第 0 步改用系统路径（`pipx install --global` 等） |
+| `系统用户或组不存在：<用户>/<组>` | 目标服务账户不存在 | `--user <账户> --create-user` 自动创建，或 `--user` 指定已有账户；不带 `--user` 时按第 0 步默认解析 |
+| `服务用户 '<实际用户>' 无法执行 frpsctl：目录 /root 对服务用户缺少执行（x）权限` | frpsctl 装在 `/root/.local/bin` | 第 0 步改用系统路径（`pipx install --global` 等） |
 | `frpsctl 位于 /root 下…会被 unit 的 ProtectHome=true 挡住`／`实例目录位于 /home 下…` | 数据目录仍在家目录 | 第 1 步的 `FRPSCTL_DATA_HOME=/opt/frpsctl` |
 | 后续命令报 `实例不存在`／改动不生效 | 新 shell 丢了 `FRPSCTL_DATA_HOME` | 第 1 步的持久化（写进 `~/.bashrc`） |
 | `日志目录对服务用户不可写` | `/var/log/frps` 权限不足 | `service install` 会自动创建并 chown；仍失败用 `--log-dir` 换位置 |
 
-渲染出的 unit（`/etc/systemd/system/frps@.service`）：
+unit 模板（示意；`User=`/`Group=` 与各路径以实际解析结果和数据目录为准）：
 
 ```ini
 [Unit]
@@ -1252,7 +1266,9 @@ WantedBy=multi-user.target
 
 两者的部署要求与 frps 一致（frpsctl 在系统路径 / 实例目录不在家目录 / 服务
 账户存在），都由安装命令在**安装前**体检；数据目录也要与 frps 一致（同一
-`FRPSCTL_DATA_HOME`），否则会操作到另一个实例。
+`FRPSCTL_DATA_HOME`），否则会操作到另一个实例。账户选项（`--user` /
+`--group` / `--create-user`）与 frps 完全相同——但注意 unit 模板是共享的，
+同一模板下的实例共用同一个服务用户。
 
 ```bash
 # Web 管理台：Restart=on-failure（交互工具，正常停止不自启）
@@ -1371,6 +1387,7 @@ esac
         ├── web-password          # Web 管理台口令文件（web service install 生成，0600）
         ├── plugin-policy.json    # 插件策略（若使用插件）
         ├── plugin-audit.jsonl    # 插件审计
+        ├── service.json          # systemd 安装留档（user/group/log_dir…，0600）
         ├── config-history/       # 最近 10 份配置快照（0600）+ meta.json
         │   └── 0001-20260915-211140/
         └── startup/              # 最近 3 份启动日志（0600，诊断"启动即退出"）
@@ -1379,6 +1396,10 @@ esac
 `state.json` 记录 `{pid, start_time, binary, config, version, started_at, owner}`——
 其中 `start_time` 是识别 pid 复用的唯一依据，`binary` 存的是**真实路径**（不是软链，
 否则换版本后身份校验会失配）。
+
+`service.json` 是 systemd 服务的**安装留档**（v0.3.2）：记录三个服务各自实际
+使用的 `user`/`group` 与渲染参数（`log_dir`/`bind` 等），供卸载提示与 `doctor`
+部署检查跟随实际配置；不装任何 systemd 服务时该文件不存在。
 
 ### 备份与回滚
 
@@ -1615,6 +1636,8 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **`max_proxies` 计数需配 `admin_url`** | 不配时只在插件进程内计数（重启归零、多实例各算各的），`plugin check` 会告警 |
 | **frps 没有热重载** | 改配置必然重启，因此 `config set` 的设计目标就是"失败了要能退回去" |
 | **systemd 模式下 pid 文件不参与判定** | 所有权委托 systemctl；`install` 换版本后需 `systemctl restart` |
+| **同一 unit 模板的实例共享一个服务用户** | `frps@.service` / `frpsctl-web@.service` / `frpsctl-plugin@.service` 都是模板：`User=` 是模板级参数，改它会影响**所有**使用该模板的实例（`--force` 覆盖时会明确警告）。per-instance 不同用户需要 systemd drop-in，属未做项 |
+| **systemd 服务账户不自动删除** | 账户可能另有用途，`uninstall` 只按安装留档逐个提示 `userdel` 命令，不代删（v0.3.2） |
 | **Web 管理台并发有界** | 请求线程上限默认 32，超限直接 `503`（v0.3.0 起；此前无限排队）。单机工具不面向高并发，公网暴露仍建议前置反代限流 |
 | **插件服务并发有界（64）** | 超限连接立即 `503`；高并发冲撞下部分连接会由内核按 TCP 语义重置（同为"该操作失败"，**刻意不做等待**以免拖慢 accept——frp 对插件请求没有超时）。插件请求极轻，正常规模远达不到（v0.3.1 起与 Web 共用同一实现，accept 队列 256） |
 | **`/api/status` 有 6 秒服务端缓存** | 页面轮询与外部变化最多滞后一个 TTL；管理台自身的写操作会立即失效缓存，注册登录等即时操作不受影响（v0.3.1） |

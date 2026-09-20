@@ -1458,13 +1458,13 @@ WantedBy=multi-user.target
 
 以 `frps@.service` 模板形式安装，多实例即多 unit，与 §6 的实例模型天然对齐。安装后 `owner` 变为 `systemd`，CLI 的 `start/stop/restart/status` 全部委托 `systemctl`（ADR-1）。
 
-**部署前置（v0.2.0 起在安装前强制体检）**：unit 能起来取决于三项环境事实，
+**部署前置（v0.2.0 起在安装前强制体检）**：unit 能起来取决于四项环境事实，
 任何一项不满足 `service install` 会当场拒绝——它们过去都只在 `systemctl start`
 时才暴露，错误现场与安装动作相隔很远：
 
 | 事实 | 失败表现 | 实现 |
 |------|---------|------|
-| 服务账户存在（默认 `frps`，可 `--user`/`--group`） | `Failed to determine user credentials` | `_account_ids()` |
+| 服务账户存在（默认优先 `frps`，否则当前用户；`--user` 任意账户 / `--create-user` 自动创建） | `Failed to determine user credentials` | `resolve_service_identity()` + `ensure_service_account()` |
 | 二进制对服务用户可执行 | `Permission denied`（典型：`sudo frpsctl install` 落在 0700 的 `/root` 下） | `_access_problem()` 逐级检查 x 位 |
 | 日志目录存在且可写 | `Failed to set up mount namespacing`（`ProtectSystem=strict` 下 ReadWritePaths 必须存在） | `_ensure_log_dir()` 创建并 chown |
 | 二进制与实例目录不在家目录下 | unit 看不到路径（`ProtectHome=true` 是挂载隔离，权限位检查看不出） | `_protect_home_conflict()` 识别 `/home`、`/root`、`/run/user` |
@@ -1476,6 +1476,22 @@ WantedBy=multi-user.target
 安装时还会把实例目录（0700）的属主**移交**给服务用户：unit 以它运行，必须读得到
 `frps.toml`（内含 token）。安全性不降级——同机其他用户依然读不到；root 不受权限位
 限制，后续运维照常。因此 systemd 模式下应统一以 root 执行 frpsctl。
+
+**服务账户解析矩阵（v0.3.2，详 §25）**：`frps` 从"写死的默认"退化为"候选之一"，
+任何系统账户都可以是服务用户：
+
+| `--user` | 系统已有 `frps` | 解析结果 |
+|----------|----------------|----------|
+| 显式给出（含数字 UID → 账户名） | 无关 | 用它；`--group` 缺省 → 同名组，缺失回退**用户主组**（可见提示） |
+| 缺省 | 是 | `frps`（向后兼容；source=`default-frps`） |
+| 缺省 | 否 | 当前有效用户（root 部署零配置；source=`default-current`） |
+| 显式 + `--create-user` | 用户不存在 | `useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`（需 root，幂等） |
+
+安装参数（user/group/log_dir）同时写入 `<实例>/service.json`（0600）**安装留档**：
+卸载提示与 `doctor` 部署检查据此跟随**实际配置**——账户被删、二进制被移走、
+路径落在家目录等下游漂移会在 doctor 里变成 ERROR，而不是等 `systemctl start`
+才炸。`_account_ids` 同步修正为**必查具体组名**（此前 `group=None` 时只查用户，
+"用户存在但同名组缺失"的 unit 会被放行到启动才失败）。
 
 ---
 
@@ -3392,3 +3408,126 @@ git ls-tree -r --name-only v0.52.0 | grep -E 'pkg/config/load.go|conf/frps.toml'
 1. `-v` / `--version` 是**持久标志**（`PersistentFlags`），`verify` 子命令同样认识它们——所以 §8.4 的 `config_flags()` 把标志放在子命令**之前**，两种位置虽然都能工作，但只沿用一种写法以免未来踩 Cobra 的解析顺序坑。
 2. `--allow-unsafe` 是 `StringSlice`，值为 `TokenSourceExec`（对应 `security.ServerUnsafeFeatures`），**不是布尔开关**。
 3. 版本矩阵会随 frp 发版变化，因此**它是 CI 断言（§13.1 C7），不是一次性结论**。本文档记录的是 v0.71.0 时点的观测值。
+
+---
+
+## 25. 第十二轮迭代（v0.3.2：systemd 全用户支持）
+
+v0.3.1 发布后的真实部署（root + pipx 用户级安装）暴露了"frps 用户写死"的完整
+链条：`service install` 的默认账户、报错提示、卸载提示、doctor 四处都假设
+服务用户只能是 `frps`。本轮按"**任何系统账户都可以是服务用户**"重构解析层，
+并把安装参数持久化为留档，让下游（卸载/体检）跟随**实际配置**而不是默认假设。
+
+方法：systemd/账户全链路 10 个模块逐行通读（`core/systemd.py` 1051 行、
+`core/lifecycle.py` 981、`core/uninstall.py` 366、`core/doctor.py` 629、
+`cli/commands/service.py`、`cli/app.py`、`cli/runtime.py`、`core/instance.py`、
+`capabilities.py`、`env.py`，共 4.1k 行）+ 全库 6 类硬编码模式扫描 + 设计方案
+systemd 相关章节定向复核。
+
+统计：修复 **4 处缺陷**、落地 **3 个机制**（账户解析矩阵 / `--create-user` /
+安装留档 + doctor 部署检查）；契约变化仅新增选项（`--create-user`）与 `--user`
+默认值改为解析（快照同步）。新增 **47 条测试**（781 → 828；非契约 751 → 798），
+覆盖率 86.38% → **87%**。
+
+### 25.1 硬编码清单（本轮起点）
+
+| # | 位置 | 问题与后果 |
+|---|------|-----------|
+| A1 | `DEFAULT_SERVICE_USER` + 三处 CLI `--user` 默认值 + 三个 core 函数签名 | 系统没有 `frps` 用户时**默认路径必然失败**（真实部署踩坑） |
+| A2 | 三处 `useradd --… {user}` 提示 | 工具只教手工建账户，名字永远是 frps |
+| A3 | `uninstall._courtesy_warnings` 只查 `DEFAULT_SERVICE_USER` | `--user alice` 部署后 alice 残留不可见；系统里恰好有 frps 时反而**误报** |
+| A4 | `DEFAULT_LOG_DIR = /var/log/frps` 写死 | 自定义 `--log-dir` 时卸载提示错误路径 |
+| A5 | 渲染参数（user/group/log_dir）**不落盘** | unit 在 `/etc/systemd/system`、数据在实例目录，工具在下游完全失明 |
+| A6 | `doctor` 无 systemd 部署检查 | 账户被删、二进制被移走、路径变化 → doctor 全绿，直到 `systemctl start` 才炸 |
+| A7 | 共享模板下 `User=` 覆盖无警告 | 多实例机上 `--force` 重装会静默改变**所有实例**的服务用户 |
+| A8 | `--user root` 无警告、无文档 | 加固基线被部分抵消而用户不知情 |
+| A0 | `_account_ids(user, group=None)` 不查组 | 渲染的 `Group=` 实际是 `group or user`：**用户存在但同名组缺失**的 unit 会被放行，启动才报 "Group not found"（本轮扫描新发现的既有缺陷） |
+
+### 25.2 设计：解析矩阵与留档
+
+`--user` 缺省时的三级解析（`resolve_service_identity`，纯查询；账户创建独立）：
+
+| `--user` | 系统已有 frps | 结果（source） |
+|----------|--------------|----------------|
+| 显式（含数字 UID → 账户名） | 无关 | 用它（`explicit`）；`--group` 缺省 → 同名组，缺失回退用户主组（`notes`） |
+| 缺省 | 是 | `frps`（`default-frps`，向后兼容） |
+| 缺省 | 否 | 当前有效用户（`default-current`，root 部署零配置） |
+
+`--create-user`（`ensure_service_account`）：
+- 必须配合显式 `--user`——缺省解析下用户必然已存在，"创建谁"无从谈起；
+- 创建形态固定为 `useradd --system --no-create-home --shell /usr/sbin/nologin
+  --user-group`（系统账户、无家目录、nologin、同名组随建），幂等、仅 root；
+- 显式 `--group` 缺失**不自动建组**（唯一例外是同名用户组，由 `--user-group` 建）；
+- `useradd` 缺失/失败/超时全部收口为契约内异常（错误消息带手工命令）。
+
+**安装留档 `<实例>/service.json`（0600）**：三个服务（`frps`/`plugin`/`web`）
+各记 `user`/`group` + 特有参数（`log_dir`/`bind`/`policy`）+ `unit`/`template`/
+`installed_at`。安装成功写入；对应 `uninstall` 删除该域（空文件即删）。缺失 =
+旧部署 → 下游回退旧默认（行为与历史版本一致）；损坏 → 读取方降级并如实报告
+（doctor WARN；卸载忽略并回退）。
+
+**doctor 部署检查**（`_check_systemd_deployment`）：unit 存在或有留档时逐个服务
+检查——账户/组存在、ExecStart 二进制对服务用户可达（复用 `_access_problem`）、
+二进制与实例目录不在 `ProtectHome` 前缀下；账户以 `systemctl show -p User -p
+Group` 的**实际生效值**为准（留档仅回退）。探测失败 → WARN（不崩 doctor）。
+
+**共享模板语义**：维持"模板级 `User=`"（不改架构）。`--force` 覆盖且服务用户
+变化时输出警告；"同模板多实例不同用户"（drop-in）记为未做项（§25.5）。
+
+### 25.3 实现落点
+
+| 层 | 改动 |
+|----|------|
+| `core/systemd.py` | 新增 `ServiceIdentity` / `resolve_service_identity` / `ensure_service_account` / `_create_system_user` / `_validate_identity_token`；`_account_ids` 组必查（修 A0）；`read_service_manifest` / `_record_service` / `remove_service_record`；`read_template_user` / `read_template_exec` / `show_unit_accounts`（键值行解析，不依赖 `--value` 顺序）；三个 `install_template(user=None)` 内部解析 + 写留档；三个 `uninstall` 删留档；`DEFAULT_LOG_DIR` 集中定义（CLI 与卸载共用） |
+| `core/doctor.py` | `_check_systemd_deployment`（新检查，见 25.2）；`run_doctor` 接线 |
+| `core/uninstall.py` | `_courtesy_warnings` 跟随留档（多账户去重提示 + 实际 log_dir）；`execute_uninstall(log_dir=None)` 解析顺序：显式注入 > 留档 > 默认 |
+| `cli/commands/service.py` | `--user` 默认改 `None`、新增 `--create-user`；root 警告 / 组回退提示 / 创建提示（无条件 stderr）；`service status` 显示 user/group（JSON 同步）；`--force` 模板冲突警告 |
+| `cli/commands/{web,plugin}.py` | 同上接入（`web/plugin service install` 的 JSON 增加 `user_source` / `created_user`） |
+| `cli/runtime.py` | `_identity_summary` / `_identity_warnings`（三命令共用展示口径） |
+| `core/instance.py` | `service_manifest` 路径属性 + `SERVICE_MANIFEST_NAME` 常量（避免与 systemd 循环导入） |
+
+### 25.4 测试与验收
+
+- **单元 39 条**：解析矩阵（frps 存在/缺失/当前用户/数字 UID/GID/非法 token）、
+  组回退主组、`--create-user` 全控制流（幂等 / 非 root / 非法名 / useradd 缺失 /
+  失败回显 stderr / 超时）、留档读写改删与损坏容错、doctor 部署检查
+  （未装零输出 / 账户缺失 ERROR / 组缺失 ERROR / show 优先于留档 / 二进制不可达 /
+  探测失败 WARN / 留档损坏 WARN）、卸载提示跟随留档（多账户 / 不误报 frps /
+  实际 log_dir / 无留档回退）。
+- **CLI 7 条**：显式账户 JSON、`--create-user` 必须配合 `--user`（退出码 2）、
+  创建 + root 警告（JSON 模式 stderr 也必须有）、`--force` 模板冲突警告、
+  `service status` 账户行（人读 + JSON）、web/plugin 的 JSON 身份字段。
+- **测试有效性反向验证**：临时让 `resolve_service_identity` 恒返回 `frps`
+  （`uid=0`），`TestServiceIdentityResolution` 与 CLI 侧相关断言成批变红；
+  恢复后全绿——守卫测试测的是行为而不是空气。
+- **契约快照**：`--create-user`（×3）+ `user.default: "frps" → null`，`--update`
+  后 diff 逐行复核（仅 39 行增量，全部预期）。
+- **最终验收**：全量 **828 passed / 0 skipped**（非契约 798），覆盖率 **87%**。
+
+### 25.4b 发布前全量回归 review 补正
+
+对全部 diff（15 文件、+1.9k 行）逐行审查 + 对抗性实测（真实 CLI 的非 root
+参数边界矩阵）+ 删除顺序实测，发现并补正 **3 处**（其中 1 处为实测复现的
+真实缺陷），新增 4 条守卫测试：
+
+| # | 项 | 问题 | 补正 |
+|---|----|------|------|
+| R-4 | CLI 副作用顺序 | `ensure_service_account`（可能创建账户）先于二进制 / ExecStart 检查——二进制缺失时账户已被创建 | 三命令改为"先定位二进制/ExecStart，再解析/创建账户"；新增 CLI 守卫测试（无二进制 → 退出码 4 且零账户解析） |
+| R-11 | `--create-user` + 显式 `--group` 缺失 | 会先执行 `useradd`，再报"组不存在"——为注定失败的安装产生了系统副作用 | 显式组缺失时**先拒绝**（先于创建分支）；新增测试断言 `subprocess.run` 零调用 |
+| R-16 | **卸载留档提示失效（实测复现）** | `execute_uninstall` 在 `_remove_data` **之后**才读 `service.json`——实例目录已删，自定义账户/日志路径提示静默退化为默认假设（W6 的目标场景恰好失效） | 删除**之前** `_collect_manifest_hints` 预收集，`_courtesy_warnings` 改收预收集数据（纯函数化）；新增端到端顺序守卫 + 测试有效性反向验证（短路收集 → 守卫变红） |
+
+另：真实 CLI 对抗矩阵（空串 / 含空格 / 不存在 UID / 不存在 GID / 不存在账户 /
+无 `--user` 的 `--create-user`）确认错误处置优先级符合既有行为（二进制检查先于
+账户解析）；损坏留档 → doctor WARN 实测符合预期。测试期间唯一一次未复现失败
+的来源锁定为 v0.3.1 遗留的未跟踪空探针文件（`tests/tmpvqc2jvew_probe_test.py`，
+已删除），此后连续多次全量与非契约全绿。
+
+### 25.5 未做与边界（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| systemd --user（用户级 unit） | 不做：需要 linger/会话模型，与"系统服务"定位不同，另立议题 |
+| per-instance 不同服务用户（drop-in `frps@x.service.d/user.conf`） | 不做：架构级改动；当前语义"同模板 = 同用户"，`--force` 覆盖有警告 |
+| 数字 UID 的"无账户"形态（unit `User=1000` 而系统无该 UID） | 不支持：解析要求 UID 已存在——无账户的裸 UID 无法被 `userdel`/`systemctl show` 等下游一致处理，拒绝优于半可用 |
+| `--create-user` 自动建非同名组 | 不做：只随用户建同名组（`--user-group`）；显式 `--group` 要求已存在，避免乱建组 |
+| 服务账户的自动删除 | 不做：账户可能另有用途，卸载只提示（遵循"不确定就拒绝"） |
