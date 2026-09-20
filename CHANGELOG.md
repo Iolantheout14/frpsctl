@@ -3,6 +3,51 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-09-20
+
+**systemd 全用户支持（任何账户都可以作服务用户）**。`frps` 不再是写死的默认：
+`--user` 缺省时优先系统已有的 `frps` 用户、否则当前用户；新增 `--create-user`
+自动创建系统账户；服务安装参数写入 `<实例>/service.json` 留档，`uninstall` 与
+`doctor` 跟随实际配置。零新命令、零新环境变量；契约变化仅新增选项（快照同步）。
+新增 47 条测试（781 → 828；非契约 751 → 798），覆盖率 86.38% → 87%。
+
+### 新增
+
+- **`--create-user`（`service install` / `web service install` /
+  `plugin service install` 三处）**：目标服务用户不存在时自动创建系统账户
+  （`useradd --system --no-create-home --shell /usr/sbin/nologin --user-group`），
+  幂等、仅 root；须配合显式 `--user`（"创建谁"不能靠猜）。
+- **服务账户解析（§12.2 / §25）**：`--user` 缺省 → 系统已有 `frps` 则用它
+  （向后兼容现有部署），否则当前有效用户（root 部署零配置可装）；`--user` 接受
+  数字 UID、`--group` 接受数字 GID（解析为账户名）；`--group` 缺省且同名组缺失
+  时回退**用户主组**（可见提示，不再产出"装得上、起不来"的 unit）。
+- **安装留档 `<实例>/service.json`（0600）**：记录三个服务实际使用的
+  user/group/log_dir/bind 等渲染参数；`uninstall` 按留档提示实际服务账户与
+  日志目录，`service status` 显示运行账户（`systemctl show` 实际值）。
+- **`doctor` systemd 部署检查**：账户被删 / 组被删 / ExecStart 二进制对服务
+  用户不可达 / 路径落在家目录 → ERROR；以 `systemctl show` 的实际值为准、
+  留档回退；探测失败降级 WARN（doctor 不崩）。
+
+### 修复
+
+- **"用户存在但同名组不存在"的 unit 被放行**：`_account_ids` 此前只在显式
+  `--group` 时查组，而渲染出的 `Group=` 实际是 `group or user`——缺失组会
+  安装成功、`systemctl start` 才报 "Group not found"。现在用户与组都必查。
+- **卸载的服务账户提示写死 `frps`**：用 `--user alice` 部署时 alice 的残留
+  不会被提示，而系统里恰好有 frps 时反而误报；现在按安装留档逐个提示。
+- **卸载的日志目录提示写死 `/var/log/frps`**：改用留档里的实际 `--log-dir`。
+- **unit 文件注入面收紧**：`--user`/`--group` 值经字符集校验（不允许换行/
+  空格/等号）后才进 unit 模板。
+
+### 变更
+
+- **`--user` 默认值由 `"frps"` 改为"按矩阵解析"**（契约快照同步）：缺省路径
+  不再因系统没有 frps 用户而失败。
+- **`--force` 覆盖共享模板且服务用户变化时输出警告**（模板是全部实例共享的，
+  改 `User=` 影响所有使用它的实例）。
+- **以 `root` 作服务用户时输出安全警告**（stderr；JSON 模式同样输出，脚本
+  收集 stderr 时也必须看到）。
+
 ## [0.3.1] - 2026-09-19
 
 **稳定性与可靠性补强（CLI + Web）**。零新命令、零新 API；唯一契约变化是
