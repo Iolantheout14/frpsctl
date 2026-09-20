@@ -106,6 +106,7 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
     findings.extend(_check_lock(inst))
     findings.extend(_check_plugins(inst))
     findings.extend(_check_web_password_file(inst))
+    findings.extend(_check_systemd_deployment(inst))
 
     return DoctorReport(instance=inst.name, findings=findings)
 
@@ -626,4 +627,174 @@ def _check_plugins(inst: Instance) -> list[Finding]:
         )
     else:
         out.append(Finding("插件可达性", Severity.INFO, f"{len(targets)} 个目标可达"))
+    return out
+
+
+def _check_systemd_deployment(inst: Instance) -> list[Finding]:
+    """systemd 部署的下游一致性（v0.3.2）：账户还在吗？二进制还可达吗？
+
+    此前 doctor 在"unit 已安装"之后完全失明：服务账户被删除、二进制被移走、
+    路径变化都不会被发现，直到某次 `systemctl start` 才炸。检查以**实际生效
+    值**为准（`systemctl show` 优先，安装留档 `service.json` 回退），未安装
+    任何服务的实例零输出。降级（探测失败）进入 WARN 而不是拖垮 doctor。
+    """
+    from .systemd import (
+        PluginService,
+        Systemd,
+        WebService,
+        _access_problem,
+        _account_ids,
+        _dir_access_problem,
+        _group_record,
+        _protect_home_conflict,
+        _user_record,
+        read_service_manifest,
+        read_template_exec,
+        show_unit_accounts,
+    )
+
+    out: list[Finding] = []
+    manifest, manifest_error = read_service_manifest(inst)
+    if manifest_error:
+        out.append(
+            Finding(
+                "安装记录",
+                Severity.WARN,
+                manifest_error,
+                "重装对应服务会重写它；确认无用也可直接删除该文件",
+            )
+        )
+
+    services = (
+        ("frps", "frps", Systemd(inst), "frpsctl service install"),
+        ("plugin", "插件", PluginService(inst), "frpsctl plugin service install"),
+        ("web", "Web 管理台", WebService(inst), "frpsctl web service install"),
+    )
+    for key, label, service, reinstall in services:
+        record = manifest.get(key)
+        if not isinstance(record, dict):
+            record = {}
+        try:
+            present = service.unit_exists()
+        except FrpsctlError as exc:
+            out.append(
+                Finding(
+                    "systemd 部署",
+                    Severity.WARN,
+                    f"无法探测 {service.unit_name}：{exc.message}",
+                    "确认 systemd 可用后重跑 doctor",
+                )
+            )
+            continue
+        if not present and not record:
+            continue  # 从未安装过这个服务：不是发现
+
+        user: str | None = None
+        group: str | None = None
+        if present:
+            try:
+                user, group = show_unit_accounts(service.unit_name)
+            except FrpsctlError as exc:
+                out.append(
+                    Finding(
+                        "systemd 部署",
+                        Severity.WARN,
+                        f"无法读取 {service.unit_name} 的账户信息：{exc.message}",
+                        "systemd 恢复后重跑 doctor",
+                    )
+                )
+        if user is None:
+            raw_user = record.get("user")
+            user = raw_user if isinstance(raw_user, str) and raw_user else None
+        if group is None:
+            raw_group = record.get("group")
+            group = raw_group if isinstance(raw_group, str) and raw_group else None
+        if user is None:
+            continue  # 既读不到实际值也没有留档：上一条 WARN 已说明
+
+        if _user_record(user) is None:
+            out.append(
+                Finding(
+                    "systemd 部署",
+                    Severity.ERROR,
+                    f"{label} unit 以用户 {user!r} 运行，但该用户不存在——启动必然失败",
+                    f"重建账户（useradd），或重装：{reinstall} --user <账户>",
+                )
+            )
+            continue
+        if group is not None and _group_record(group) is None:
+            out.append(
+                Finding(
+                    "systemd 部署",
+                    Severity.ERROR,
+                    f"{label} unit 使用组 {group!r}，但该组不存在——启动必然失败",
+                    f"重建组（groupadd），或重装：{reinstall} --group <组>",
+                )
+            )
+            continue
+        accounts = _account_ids(user, group or user)
+        if accounts is None:
+            continue
+        uid, gid = accounts
+
+        exec_path = read_template_exec(service.template_path)
+        if exec_path is not None:
+            problem = _access_problem(Path(exec_path), uid=uid, gid=gid)
+            if problem is not None:
+                out.append(
+                    Finding(
+                        "systemd 部署",
+                        Severity.ERROR,
+                        f"{label}：{problem}——unit 启动必然失败",
+                        f"调整该路径权限（或改用共享目录）后重装：{reinstall}",
+                    )
+                )
+        for path_label, path in (("二进制", exec_path), ("实例目录", str(inst.dir))):
+            if path is None:
+                continue
+            prefix = _protect_home_conflict(Path(path))
+            if prefix is not None:
+                out.append(
+                    Finding(
+                        "systemd 部署",
+                        Severity.ERROR,
+                        f"{label} 的{path_label}位于 {prefix} 下（{path}），"
+                        "会被 unit 的 ProtectHome=true 挡住",
+                        f"把 frpsctl 与数据放到系统路径后重装：{reinstall}",
+                    )
+                )
+        if key == "frps":
+            # ReadWritePaths 的可写性（v0.3.2）：日志目录与实例目录缺一不可，
+            # 删除或属主/权限漂移时 unit 启动必然失败。
+            log_value = record.get("log_dir")
+            if isinstance(log_value, str) and log_value:
+                problem = _dir_access_problem(Path(log_value), uid=uid, gid=gid)
+                if problem is not None:
+                    out.append(
+                        Finding(
+                            "systemd 部署",
+                            Severity.ERROR,
+                            f"日志目录不可用：{problem}"
+                            "（unit 的 ReadWritePaths 要求它存在且可写）",
+                            f"修复该目录后重装：{reinstall}",
+                        )
+                    )
+            work_problem = _dir_access_problem(inst.dir, uid=uid, gid=gid)
+            if work_problem is not None:
+                out.append(
+                    Finding(
+                        "systemd 部署",
+                        Severity.ERROR,
+                        f"实例目录对服务用户不可用：{work_problem}",
+                        f"把目录移交服务用户（chown）或重装：{reinstall}",
+                    )
+                )
+        if present:
+            out.append(
+                Finding(
+                    "systemd 部署",
+                    Severity.INFO,
+                    f"{label} unit 就绪（User={user}, Group={group or user}）",
+                )
+            )
     return out
