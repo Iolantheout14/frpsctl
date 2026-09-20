@@ -35,6 +35,7 @@ __all__ = [
     "Instance",
     "HISTORY_KEEP",
     "STARTUP_KEEP",
+    "SERVICE_MANIFEST_NAME",
     "resolve_data_home",
     "resolve_instances_root",
     "list_instances",
@@ -42,6 +43,9 @@ __all__ = [
 
 #: 配置快照保留份数（§9 第 6 步）。
 HISTORY_KEEP = 10
+
+#: systemd 服务安装留档的文件名（见 `Instance.service_manifest`）。
+SERVICE_MANIFEST_NAME = "service.json"
 
 #: 启动日志保留份数（ADR-5）。
 STARTUP_KEEP = 3
@@ -157,6 +161,16 @@ class Instance:
     def log_file(self) -> Path:
         """frp 自己写入的日志（路径来自配置里的 `log.to`，此处是默认约定）。"""
         return self.dir / "frps.log"
+
+    @property
+    def service_manifest(self) -> Path:
+        """systemd 服务的安装留档（渲染参数快照；v0.3.2 起）。
+
+        记录每个已安装服务（frps / plugin / web）实际使用的 user/group 等，
+        供卸载提示与 doctor 部署检查跟随实际配置——此前这些参数只存在于
+        `/etc/systemd/system` 的 unit 文件里，工具在下游完全失明。
+        """
+        return self.dir / SERVICE_MANIFEST_NAME
 
     @property
     def bin_dir(self) -> Path:
