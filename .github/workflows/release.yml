@@ -63,6 +63,7 @@ jobs:
               "frpsctl/core/uninstall.py",
               "frpsctl/core/auditlog.py",
               "frpsctl/core/httpserver.py",
+              "frpsctl/core/serve_runtime.py",
               "frpsctl/core/web_audit.py",
               "frpsctl/report.py",
               "frpsctl/capabilities.py",

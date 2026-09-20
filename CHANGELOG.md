@@ -3,6 +3,56 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.3] - 2026-09-20
+
+**后台服务与 Web 体验（systemd 之外的第二种托管形态 + 管理台视觉/交互大改）**。
+Web 管理台与插件服务新增 `start|stop|restart|status`（direct 后台，与 systemd
+双向互斥）；管理台前端重做设计系统（极光/玻璃/霓虹）、图表 2.0 与交互升级。
+新增 39 条测试（828 → 869；非契约 798 → 839），契约快照 +8 命令。
+
+### 新增
+
+- **`web start|stop|restart|status` / `plugin start|stop|restart|status`**：
+  非 systemd 环境的后台托管（子进程就是 `serve`，与 `ExecStart` 同构）——
+  状态与启动参数落 `<实例>/web|plugin-state.json`（0600），日志落
+  `<实例>/web|plugin.log`（8 MiB 轮转），停止走 SIGTERM → 等待 → SIGKILL。
+  `restart` 复用上次参数（可覆盖）；`status` 统一显示 `systemd / direct /
+  none` 三种归属。
+- **后台进程的三重校验**（`core/serve_runtime.py`）：pid 存活 + 启动时刻 +
+  命令行含 `serve` 标记；状态文件损坏/陈旧/指向外人一律拒绝而不是猜测
+  （ADR-7 同一纪律）。
+- **口令衔接**：`web start` 未给口令来源时默认用/生成实例内 `web-password`
+  （与 `web password set|show` 同一文件）；`--password` 的值也先写文件——
+  后台模式口令可读回，且明文不出现在进程命令行里。
+- **互斥与孤儿防护**：`web/plugin start` 对 active 的 systemd unit 拒绝
+  （反之 `service install|start|restart` 对存活的 direct 进程同样拒绝）；
+  `uninstall` 预检新增 direct 服务（运行中拒绝，`--force` 先停再卸），
+  `doctor` 报告 direct 服务状态（运行中 INFO / 状态损坏 WARN / 身份不符 ERROR）。
+- **管理台 UI 重做**：极光渐变背景 + 玻璃卡片 + 渐变强调色 + 状态呼吸灯 +
+  渐变指标条（首次滚动）；骨架屏与空态；自绘确认弹层（替代原生 confirm，
+  支持 Enter/Esc）；toast 图标与进度条；登录页重做；主题切换平滑过渡。
+- **图表 2.0**：7 天柱状与实时曲线改渐变（CSS 变量驱动，主题即时生效）；
+  实时曲线平滑（Catmull-Rom→贝塞尔）并加面积填充；两者都有悬浮十字线 +
+  自绘 SVG 浮动提示（不引入任何内联 style，CSP 不变）。
+- **交互**：快捷键（`g d/g c/g a` 导航、`r` 刷新、`/` 聚焦过滤、`Esc` 关闭）、
+  客户端/代理/审计表格本地过滤、客户端/代理点表头排序、双击复制名称、
+  日志 ERROR/WARN 着色与一键复制、`prefers-reduced-motion` 全动画关闭。
+
+### 变更
+
+- 仪表盘"概览"卡并入顶部"实时概览"指标条（同一批数字不再重复展示）。
+- npm/构建链保持零引入：仍是单文件前端（CSP nonce、无外部资源、无内联
+  style）；前端守卫新增组件样式/无障碍/原生弹窗禁用 3 条断言。
+
+### 测试
+
+- 新增 39 条（828 → 869；非契约 798 → 839）：serve_runtime 真进程全边界
+  （启动/停止/陈旧/外人/损坏/早退/端口未就绪/SIGKILL 兜底/日志轮转）、
+  **真链路 e2e**（`python -m frpsctl web serve` → HTTP 200 → stop；
+  `plugin serve` → Login 裁决 → stop 后审计刷盘）、CLI 后台命令接线与 JSON、
+  systemd↔direct 互斥（web/plugin 双向）、uninstall 孤儿防护、doctor
+  进程与端口一致性发现、前端守卫扩展 3 条。
+
 ## [0.3.2] - 2026-09-20
 
 **systemd 全用户支持（任何账户都可以作服务用户）**。`frps` 不再是写死的默认：

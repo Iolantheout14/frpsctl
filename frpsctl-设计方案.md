@@ -3531,3 +3531,132 @@ Group` 的**实际生效值**为准（留档仅回退）。探测失败 → WARN
 | 数字 UID 的"无账户"形态（unit `User=1000` 而系统无该 UID） | 不支持：解析要求 UID 已存在——无账户的裸 UID 无法被 `userdel`/`systemctl show` 等下游一致处理，拒绝优于半可用 |
 | `--create-user` 自动建非同名组 | 不做：只随用户建同名组（`--user-group`）；显式 `--group` 要求已存在，避免乱建组 |
 | 服务账户的自动删除 | 不做：账户可能另有用途，卸载只提示（遵循"不确定就拒绝"） |
+
+---
+
+## 26. 第十三轮迭代（v0.3.3：后台服务与 Web 体验）
+
+**systemd 之外的第二种托管形态 + 管理台视觉/交互大改**。此前的现实痛点：
+容器与无 systemd 主机上，Web 管理台与插件服务只能前台运行或 `nohup`（口令进
+日志、无 pid 管理、无法安全停止）；Web UI 自 v0.2.4 以来没有结构性升级。
+
+方法：完整通读 Web/插件前后端（`web/server.py` 571 行、`web/api.py` 861、
+`web/auth.py`、前端 `index.html` 1335 行、`plugin/server.py` 372 等）+ 进程
+原语与 lifecycle 复用面评估 + 前端守卫约束复核。
+
+统计：新增 **1 个 core 模块**（`core/serve_runtime.py`，约 430 行）、**8 个
+叶子命令**（55 → 63）、**前端三大块重构**（设计系统/图表/交互，单文件
+62KB → 84KB）；新增 **39 条测试**（828 → 869；非契约 798 → 839）；契约快照
++8 命令；前端守卫 +3 条（15 → 18）。
+
+### 26.1 后台服务运行时（`core/serve_runtime.py`）
+
+设计决策（与 frps direct 模式同纪律，而非另造 daemon）：
+
+| 决策 | 内容 | 理由 |
+|------|------|------|
+| 启动机制 | `start` = **重新 exec `frpsctl web|plugin serve`**（`start_new_session=True`、stdout/stderr → 日志） | 与 systemd `ExecStart` 逐字同构：优雅退出、审计刷盘等语义零分叉；无需 fork/daemonize 代码 |
+| 早退检测 | 派生后 0.7s 连续存活 + 端口 TCP 探活（3s） | 端口占用/启动即崩当场报告并回显日志尾部，不留半活进程 |
+| 状态文件 | `<实例>/<key>-state.json`（0600）：pid/start_time/binary/argv/args/log/host/port | `restart` 复用参数、`status` 可查、`uninstall` 能发现孤儿 |
+| 三重校验 | pid 存活 + 启动时刻一致 + 命令行含 `serve` 标记 | state 只由本工具写；多一维把"同可执行文件的其它长命进程"排除在外 |
+| 停止 | SIGTERM → 等待 10s → 复核身份 → SIGKILL（5s） | 与 frps `stop` 同型；plugin 的 SIGTERM 会先刷审计 |
+| 日志 | `<实例>/<key>.log`（0600），启动时 >8 MiB 轮转 `.1` | 后台模式的 stderr 不能丢；单份历史足够 |
+| 口令 | `web start` 统一落实例 `web-password`；`--password`/env 先写文件，argv 只出现路径 | 口令可读回；明文不进进程命令行（ps 可见面） |
+
+`probe()` 的五态归属（NONE/DIRECT/FOREIGN/STALE/CORRUPTED）供
+`status`/`uninstall`/`doctor` 三处共用——损坏与"指向外人"都**拒绝操作**而不是
+猜测（ADR-7）。
+
+**互斥（双向）**：`web start` 对 active 的 systemd unit 拒绝（提示
+`service start`）；`service install/start/restart` 对存活的 direct 进程拒绝
+（提示 `stop`）。`service status` 保持 systemd 专项视图，`web status` 提供
+统一 owner 视图（systemd 优先，探测失败降级可见）。
+
+**孤儿防护**：`uninstall` 预检新增 direct 服务——运行中拒绝（`--force` 在
+`_ensure_stopped` 阶段先停再卸）；状态损坏同样拒绝。`doctor` 新增
+`_check_local_services`：运行中 INFO、陈旧 INFO、损坏 WARN、身份不符 ERROR。
+
+### 26.2 Web UI/UX（v0.3.3）
+
+**设计系统（极光 · 玻璃 · 霓虹）**：CSS 令牌扩展（accent 软色/渐变、aurora
+三层径向、glass/glass-border、ring、三档阴影、hero 渐变）；`body` 极光背景
+（fixed 多层 radial-gradient）；卡片玻璃化 + hover 抬升；品牌与导航指示条
+渐变；状态呼吸灯；渐变指标条（Hero，首帧数字滚动）；骨架屏与空态；自绘
+确认弹层（替代原生 `confirm`，Enter/Esc/点击遮罩）；toast 图标 + 进度条 +
+滑入；登录页重做；主题切换过渡。
+
+**图表 2.0**：柱状与折线改 SVG 渐变填充（`<defs>` 渐变 + `stop` 类由 CSS
+变量着色——主题切换即时生效）；实时曲线 Catmull-Rom → 贝塞尔平滑 + 面积
+填充；悬浮十字线 + **SVG 内自绘 tooltip**（位置用 SVG 属性设置，不触碰
+内联 style 禁令）。纯函数 `smoothPath` 可直接被 node 守卫执行。
+
+**交互**：快捷键（`g d/g c/g a`、`r`、`/`、`Esc`）；客户端/代理/审计本地
+过滤（`filterRows` 纯函数）；客户端/代理点表头排序（`sortRows` 纯函数，
+数值列按数值比较）；双击复制名称（clipboard，失败降级 toast）；日志
+ERROR/WARN 着色（按行文本节点渲染）与一键复制；视图切换动画；
+`prefers-reduced-motion` 下全部动画关闭。
+
+**红线保持**（守卫自动核对）：单文件、零外部资源、无 `innerHTML`、无内联
+style 属性、无 JS style 赋值、`__CSP_NONCE__` 恰 3 处、CSS 变量双向对齐、
+图表类有样式。新增守卫：新组件类样式齐全 / reduced-motion 与极光存在 /
+原生 `confirm|alert` 禁用。
+
+### 26.3 测试与验收
+
+- **单元 24 条**（`TestServeRuntime` 16 + `TestUninstallLocalServices` 5，
+  全部真进程）：启动记录与探活、双起拒绝、陈旧清理、外人拒绝、停止与
+  SIGKILL 兜底、早退/端口未就绪清理、损坏/缺字段拒绝、日志轮转与 tail、
+  uninstall 预检/强制停止、doctor 发现。
+- **CLI 12 条**（`TestServeBackgroundCommands`）：start JSON 与口令落盘
+  （argv 无明文）、非回环拒绝、systemd 互斥（两个方向）、stop、status
+  三态、plugin 接线。
+- **前端守卫 +3**：组件类样式齐全、reduced-motion 与极光令牌、原生弹窗禁用。
+- **端到端冒烟（真实进程）**：`web start` → HTTP 200 → `status`（direct）
+  → `stop`（进程确亡）；`plugin start` → `/healthz` 200 → `stop`（审计刷盘）；
+  direct 存活时 `service start` 拒绝（exit 11）。
+- **契约快照**：+8 命令（392 行增量逐行核对：选项/默认/重复性）。
+- **最终验收**：全量 **869 passed / 0 skipped**（非契约 839），覆盖率 **85.94%**（新模块与命令面扩大分母；门禁 80% 通过）。
+
+### 26.5 实施期 review 补正
+
+全部 diff 逐行审查 + 对抗性实测（真实进程）发现并补正 1 处缺陷：
+
+| # | 项 | 问题 | 补正 |
+|---|----|------|------|
+| R-1 | **`restart` 参数复用失效（实测复现）** | `web|plugin restart` 先 `stop_background`（会删除状态文件）再进 `_start_direct` 读旧参数——此时状态文件已不存在，`--bind` 等静默回落默认值 | 改为**先读后停**：restart 命令体先 `read_state` 保存旧参数，经 `fallback_args` 传入启动实现；新增"事件顺序"守卫测试（断言 read 先于 stop）并做反向验证（恢复旧顺序 → 守卫红） |
+
+| R-2 | **测试 flaky：随机口令以 `-` 开头（实测定位）** | `test_config_set_noop_masks_secret` 从配置提取的随机口令（base64url 字符集）约 1.6% 概率以 `-` 开头，被 CLI 解析成选项（`No such option: -e`）——全量运行约 1/60 概率偶发 | 测试改用固定且以 `-e-` 开头的口令并以 `--` 分隔，顺带固化"`--` 之后全是位置参数"的语义；连跑 5 次确定性验证。产品行为本身正确（click 惯例：值以 `-` 开头需 `--`） |
+| R-3 | **`restart` 不复用外部口令文件（最后一轮 review）** | `--password-file` 指向实例外文件时，restart 未显式给该参数会静默回落默认实例口令文件（口令来源发生变化） | `_start_direct` 从持久化 args 复用 `password_file` 路径（外部文件被删时明确报错而不静默生成）；测试断言 argv 路径复用 + 真实端到端验证 |
+| R-4 | **代理表空态被展开集合吞掉（最后一轮 review）** | 过滤无结果但此前展开过代理行时，表格区域空白（没有空态提示） | 空态条件简化为 `if (!rows.length)`（无行即显示，不再受展开集合影响） |
+| R-5 | **插件并发测试 flaky（最后一轮 review 实测）** | `test_exhausted_workers_get_503` 只接受 HTTP 503，而 worker 占满时服务端 close 与客户端发送的竞态会偶发触发内核 TCP 重置（连接层 OSError）——与 v0.3.1 修过的 burst 测试同一条语义，当时漏了这条 | 断言放宽为 `(HTTPError, OSError)` 且 HTTPError 必须 503（两者对 frp 都是"该操作失败"，README 已知边界）；`TestBoundedConcurrency` 连跑 10 次确定性验证 |
+
+其余审查结论：三重校验/互斥/孤儿防护的守护测试均通过反向验证（短路实现即
+变红）；真实进程冒烟覆盖 start→HTTP→restart→stop、损坏状态拒绝（exit 3）、
+uninstall 无 force 拒绝（exit 11）/`--force` 先停。
+
+**方案逐项对账的自检补正**（"所有项是否完整实现"的系统复查）：按 §26 方案
+的 D1–D10、W1–W10 与 UI 验收清单逐条核对，发现 6 处未落地/不到位的项并全部
+补齐：
+
+| # | 方案条目 | 缺口 | 补正 |
+|---|----------|------|------|
+| S-1 | D10 / W5：doctor 的**进程/端口检查（P1）** | 只实现了进程状态，未做端口一致性检查 | RUNNING 服务探测记录端口：连不上 → WARN"可能已半死"（只读 TCP 探针）+ 测试 |
+| S-2 | UI 清单：Hero"趋势箭头" | 指标条无趋势指示 | 与上一次刷新的数值对比，显示 `▲/▼ 增量`（仅纯数字指标） |
+| S-3 | UI 底线："触控目标 ≥40px" | 未实现 | `@media (pointer: coarse)` 下按钮/输入/导航放大到 ≥40px |
+| S-4 | UI 清单："复制（名称/端口…）" | 只做了名称复制 | 代理端口单元格双击复制 |
+| S-5 | 五、测试计划："端到端（真进程）" | 只有 sleeper 进程的原语测试与手工冒烟，缺**真链路自动化** | 新增 `TestServeEndToEnd`：真 `python -m frpsctl web serve` → HTTP 200 → stop；真 `plugin serve` → Login 裁决 → **stop 后审计落盘断言** |
+| S-6 | W4："互斥矩阵 4 场景" | 缺 plugin 侧两个方向 | 补 `plugin start` 拒 systemd active、`plugin service start` 拒 direct 存活 |
+
+（测试计划中"+55~70 条"的预估未达成：实际 +39——e2e 与互斥复用既有基建后
+写得紧凑。预估偏差如实记录，不以凑数补测试。）
+
+### 26.4 未做与边界（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| direct 后台的开机自启 | 不做：systemd 场景用 `service install`；容器用 restart policy。direct 是"进程级后台化"，定位如此 |
+| 容器内 direct 后台 | 不推荐（文档说明）：容器里前台 `serve`（进程即容器主进程）才是正确形态 |
+| 后台服务的 stdout 之外的运行日志 | 不做：`serve` 自身日志（访问日志等）走 `--access-log` 进同一文件；不引入 journald 依赖 |
+| per-instance 多 Web 进程 | 不变：一个 Web 进程服务一个实例 |
+| WebSocket/SSE | 不变：5 秒轮询（既有边界） |
+| 前端 DOM 级测试框架 | 不变：node 纯函数 + 静态守卫 + HTTP 全路由 + 手工点验（记账同上） |

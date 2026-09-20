@@ -87,8 +87,8 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 | 观测与运维 | `clients` / `proxies` / `traffic` / `instances` / `doctor` / `prune` / `capabilities`（能力清单） |
 | 卸载 | `uninstall`（`--all` / `--keep-data` / `--keep-bin` / `--force`） |
 | systemd 集成 | `service install` / `uninstall` / `status` / `logs` |
-| 服务端插件 | `plugin init` / `check` / `serve`、`plugin user set|remove|list`、`plugin audit tail|stats`、`plugin config list|set`、`plugin service install|uninstall|start|stop|restart|status` |
-| Web 管理台 | `web serve`（可选 `--metrics`）、`web service install|uninstall|start|stop|restart|status`、`web password show|set`、`web audit tail|stats` |
+| 服务端插件 | `plugin init` / `check` / `serve`、`plugin start|stop|restart|status`（后台，非 systemd）、`plugin user set|remove|list`、`plugin audit tail|stats`、`plugin config list|set`、`plugin service install|uninstall|start|stop|restart|status` |
+| Web 管理台 | `web serve`（可选 `--metrics`）、`web start|stop|restart|status`（后台，非 systemd）、`web service install|uninstall|start|stop|restart|status`、`web password show|set`、`web audit tail|stats` |
 
 **Web 管理台**——浏览器中的同等能力（`web serve` 启动，默认只绑回环）：
 
@@ -208,7 +208,7 @@ $ ./install.sh
 注册全局命令
  ✓ 已注册：/home/u/.local/bin/frpsctl
 自检
- ✓ 命令可用：frpsctl 0.3.2
+ ✓ 命令可用：frpsctl 0.3.3
 
 frpsctl 安装完成
 ```
@@ -307,7 +307,7 @@ frpsctl install --with-frpc        # frps + frpc
 ### 验证安装
 
 ```bash
-frpsctl --version                  # frpsctl 0.3.2
+frpsctl --version                  # frpsctl 0.3.3
 frpsctl install                    # 下载 frps 二进制
 frpsctl init                       # 生成配置（下一步是五分钟上手）
 ```
@@ -849,6 +849,24 @@ Ctrl-C 停止。
 浏览器打开上面的 URL，输入口令即进入主界面。会话默认 8 小时（只存服务端内存，
 重启即失效）；刷新页面不会掉线（Cookie 还在，前端自动恢复会话）。
 
+**后台运行（非 systemd 环境）**：
+
+```bash
+frpsctl web start                    # 后台启动（direct 模式；口令自动落实例文件）
+frpsctl web status                   # owner=direct；systemd 托管时显示 systemd
+frpsctl web restart                  # 复用上次参数（--bind 等可覆盖）
+frpsctl web stop                     # SIGTERM 优雅退出（等待 → SIGKILL 兜底）
+```
+
+子进程就是 `web serve`（与 systemd 的 `ExecStart` 同构），进程与启动参数记录在
+`<实例>/web-state.json`；日志写到 `<实例>/web.log`（超过 8 MiB 轮转一次）。
+口令统一走实例内 `web-password`（0600，与 `web password set|show` 同一文件）——
+不再"打印一次即丢失"；`--password` 给的值也会先写该文件（避免出现在进程命令行里）。
+
+⚠️ **两种托管模式互斥**：systemd 托管（`web service ...`）与 direct 后台
+（`web start`）双向拒绝同时使用，并给出切换命令。容器场景不要用 `web start`
+——容器里前台 `web serve`（进程即容器主进程）才是正确形态。
+
 **忘了口令？** 分两种情况：
 
 - **systemd 部署**（`web service install` 会把口令写入实例目录的文件）：
@@ -873,14 +891,17 @@ Ctrl-C 停止。
 
 | 区域 | 内容 | 要点 |
 |------|------|------|
+| 实时概览 | 客户端 / 代理总数 / 当前连接 / 今日入站出站 / TLS 强制（渐变指标条） | 数字来自 dashboard 统计；首次进入滚动到位 |
 | 实例状态 | owner / 状态 / pid / 运行时长 / 版本 / 监听地址 / systemd unit | 二进制版本与磁盘版本不一致时显示"重启生效" |
 | 控制面健康 | L1 / L2 / L3 三层 + gate + 详情 | L2 或 L3 失败时详情直接给出原因 |
-| 概览 | 客户端 / 代理总数 / 当前连接 / 今日入站出站 / TLS 强制 | 数字来自 dashboard 统计 |
-| 近 7 天流量 | 按天双色柱状图（蓝=入站 绿=出站） | 悬停看单日数值；标题栏带合计；点下方代理行可下钻该代理曲线 |
-| 实时流量 | 页面打开期间的速率曲线（每 5 秒采样一次，累计值差分） | 显示当前速率与峰值；采样存本地浏览器，刷新不丢 |
-| 客户端 | name / user / hostname / ip / 状态 / 版本 | 在线状态用彩色标签 |
-| 代理 | name / user / 类型 / 端口 / 状态 / 连接 / 今日流量 | **点击任意行展开该代理的 7 天曲线**；右上角"清理离线记录" |
-| 日志 | 最近的日志尾部（复用 `log.to` 解析） | 向上滚动自动暂停跟随（标题栏显示"已暂停"），滚回底部恢复 |
+| 近 7 天流量 | 按天柱状图（渐变蓝=入站 绿=出站） | 悬停显示浮动提示（日期/入出）；标题栏带合计；点下方代理行可下钻该代理曲线 |
+| 实时流量 | 页面打开期间的速率面积图（每 5 秒采样一次，累计值差分） | 平滑曲线 + 悬浮十字线提示；采样存本地浏览器，刷新不丢 |
+| 客户端 | name / user / hostname / ip / 状态 / 版本 | 本地过滤 + 点表头排序；双击 name 复制 |
+| 代理 | name / user / 类型 / 端口 / 状态 / 连接 / 今日流量 | **点击任意行展开该代理的 7 天曲线**；表头排序、本地过滤；右上角"清理离线记录" |
+| 日志 | 最近的日志尾部（复用 `log.to` 解析） | ERROR/WARN 着色；向上滚动自动暂停；"复制"按钮一键复制 |
+
+**交互速查**：快捷键 `g d` / `g c` / `g a` 切换视图、`r` 刷新、`/` 聚焦过滤框、
+`Esc` 关闭弹层；危险操作走自绘确认弹层（可 Enter/Esc）；审计页有独立过滤框。
 
 页面顶部的**横幅**会明确报告异常：
 
@@ -1003,7 +1024,9 @@ frp 的服务端插件是一个 HTTP 回调：frps 在 `Login` / `NewProxy` 等�
 ```bash
 frpsctl plugin init      # 生成策略模板（0600，默认 fail-closed）
 frpsctl plugin check     # 离线校验 + 试算典型裁决
-frpsctl plugin serve     # 启动（只允许绑回环）
+frpsctl plugin serve     # 前台启动（只允许绑回环）
+frpsctl plugin start     # 后台启动（direct 模式，非 systemd；SIGTERM 先刷审计再退出）
+frpsctl plugin status    # 托管状态（systemd / direct / none）
 ```
 
 策略里的用户可以用命令维护——不必手写 JSON（写入前用与 `plugin check` 相同的
@@ -1647,6 +1670,8 @@ fail）——它们是"插件真的接得住 frp 调用"的唯一证明，因此
 | **Web 不做 DOM 级前端测试框架** | 引入 jsdom/构建链会破坏"单文件零依赖"这个安全资产；语法与静态纪律由 CI 守卫，纯函数由 node 动态断言（v0.3.0 覆盖审计渲染等 6 个），DOM 分支仍靠人工点验（残余风险已记账） |
 | **不实现 OIDC 协议** | `auth.method = "oidc"` 的配置完整性与 doctor 提示已支持（v0.3.0）；OIDC 协议本身由 frps 实现——本工具绝不重新实现 frp 已有能力 |
 | **一个 Web 进程服务一个实例** | 多实例请起多个 `web serve`（各自 `--instance` 区分）；管理台不做实例切换器 |
+| **direct 后台无开机自启** | `web start` / `plugin start` 是"进程级后台化"（非 systemd）：机器重启后不自启——systemd 环境用 `service install`，容器用 restart policy（v0.3.3） |
+| **systemd 与 direct 后台互斥** | 同一实例的 Web/插件只能被一种模式托管；两个方向都会拒绝并给出切换命令（v0.3.3）。`uninstall` 对运行中的 direct 服务同样拒绝（`--force` 先停），不留孤儿 |
 
 ---
 
