@@ -107,6 +107,7 @@ def run_doctor(inst: Instance, *, binary: Path | None = None) -> DoctorReport:
     findings.extend(_check_plugins(inst))
     findings.extend(_check_web_password_file(inst))
     findings.extend(_check_systemd_deployment(inst))
+    findings.extend(_check_local_services(inst))
 
     return DoctorReport(instance=inst.name, findings=findings)
 
@@ -627,6 +628,79 @@ def _check_plugins(inst: Instance) -> list[Finding]:
         )
     else:
         out.append(Finding("插件可达性", Severity.INFO, f"{len(targets)} 个目标可达"))
+    return out
+
+
+def _port_open(host: str, port: int, *, timeout: float = 0.5) -> bool:
+    """TCP 可连接？（doctor 的只读探针；不发送任何业务请求）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _check_local_services(inst: Instance) -> list[Finding]:
+    """web/plugin 的 direct 后台状态（v0.3.3）。
+
+    systemd 托管由 `_check_systemd_deployment` 覆盖；这里只看 direct 后台
+    （`web start` / `plugin start`）的状态文件与进程——未启动过零输出。
+    """
+    from . import serve_runtime
+
+    out: list[Finding] = []
+    for spec in (serve_runtime.WEB_SPEC, serve_runtime.PLUGIN_SPEC):
+        status = serve_runtime.probe(inst, spec)
+        if status.owner is serve_runtime.ServeOwner.CORRUPTED:
+            out.append(
+                Finding(
+                    "后台服务",
+                    Severity.WARN,
+                    f"{spec.label}的状态文件已损坏：{status.error}",
+                    "确认该服务没有在跑后删除状态文件（start 会重建）",
+                )
+            )
+        elif status.owner is serve_runtime.ServeOwner.FOREIGN:
+            out.append(
+                Finding(
+                    "后台服务",
+                    Severity.ERROR,
+                    f"{spec.label}的后台状态指向 pid {status.state.pid}，但它不属于本服务",
+                    "该 pid 可能已被复用为无关进程；确认后删除状态文件",
+                )
+            )
+        elif status.running:
+            bind = status.state.args.get("bind") or "-"
+            out.append(
+                Finding(
+                    "后台服务",
+                    Severity.INFO,
+                    f"{spec.label}在后台运行（pid {status.state.pid}，{bind}）",
+                )
+            )
+            # 端口一致性（v0.3.3，P1）：状态说在跑、记录端口却连不上 → 服务
+            # 可能已半死（进程在、监听没了），这正是 doctor 该发现的形态。
+            host, port = status.state.host, status.state.port
+            if host and port:
+                probe_host = "127.0.0.1" if host in ("", "0.0.0.0", "::", "[::]") else host
+                if not _port_open(probe_host, port):
+                    out.append(
+                        Finding(
+                            "后台服务",
+                            Severity.WARN,
+                            f"{spec.label}标记为运行中，但 {host}:{port} 无法连接",
+                            "服务可能已半死：查看其日志，用 stop 后重新 start",
+                        )
+                    )
+        elif status.owner is serve_runtime.ServeOwner.STALE:
+            out.append(
+                Finding(
+                    "后台服务",
+                    Severity.INFO,
+                    f"{spec.label}存在陈旧的后台状态（进程已退出）",
+                    "下次 start 会自动清理",
+                )
+            )
     return out
 
 
