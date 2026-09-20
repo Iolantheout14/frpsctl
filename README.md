@@ -162,6 +162,20 @@ pipx install frpsctl        # 或：pip install frpsctl
 frpsctl --install-completion
 ```
 
+> **要用 systemd 托管时（`service install` / `web service install` /
+> `plugin service install`），frpsctl 必须装到系统路径**：unit 带
+> `ProtectHome=true`，`~/.local/bin`（root 下即 `/root/.local/bin`）对服务用户
+> 不可见，安装时会当场拒绝。
+>
+> ```bash
+> pipx install --global frpsctl     # → /usr/local/bin/frpsctl（推荐）
+> # 或：sudo pip install frpsctl
+> # 或：sudo ./install.sh --system
+> ```
+>
+> 从零开始的完整步骤与常见坑见
+> [systemd 部署速查：从零开始](#systemd-部署速查从零开始)。
+
 ### 方式三：源码安装
 
 **一键脚本**（两种跑法，效果相同）：
@@ -326,6 +340,31 @@ frpsctl uninstall --force      # 运行中的实例先停止再卸载（默认�
   pipx uninstall frpsctl            # 或 pip uninstall frpsctl
   ./install.sh --uninstall          # 源码一键脚本安装的（不动实例数据）
   ```
+
+#### 彻底卸载（systemd 部署，按顺序执行）
+
+```bash
+# 1) 停服务并解除 systemd 托管（停用并删除对应 unit 模板）
+frpsctl web service uninstall      # 若装过
+frpsctl plugin service uninstall   # 若装过
+frpsctl service uninstall          # frps 本体
+
+# 2) 删实例数据与共享二进制（不可恢复；多实例时按需 --all / --keep-bin）
+frpsctl uninstall
+
+# 3) 卸 frpsctl 本体（按安装方式三选一）
+pipx uninstall frpsctl             # uv 安装：uv tool uninstall frpsctl
+# ./install.sh --uninstall
+
+# 4) 清理"不属于本工具、因而不会代删"的东西（确认无用后手工执行）
+sudo rm -rf /var/log/frps          # 日志目录（可能仍被其它实例使用）
+sudo userdel frps                  # 服务账户（可能另有用途）
+sudo rm -rf /opt/frpsctl           # 数据目录残壳（uninstall 已删实例与 bin）
+```
+
+> `frpsctl uninstall` 只处理"实例数据 + 共享二进制 + unit"；服务账户、
+> `/var/log/frps` 与 frpsctl 本体不在它的代删范围（第 3 / 4 步）——这与
+> 第 2 步说明的边界一致。
 
 ---
 
@@ -1114,18 +1153,60 @@ root 换成服务用户）——否则 frps 进程读不到目录里的 `frps.to
 同机其他用户依然读不到。因此 systemd 模式下请统一用 root 执行 frpsctl
 （systemctl 委托本来也需要 root）。
 
-完整流程：
+#### systemd 部署速查：从零开始
+
+> 这一节按"从零到跑起来"排序。**第 0 / 1 步是所有坑的来源**：frpsctl 与数据
+> 目录只要沾了 `/root`、`/home`，unit 的 `ProtectHome=true`（挂载隔离，
+> **改权限无效**）就会让安装被拒或服务起不来。
+
+**第 0 步：frpsctl 装到系统路径 + 创建服务账户**
 
 ```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
-export D=/opt/frpsctl
+pipx install --global frpsctl        # → /usr/local/bin/frpsctl（推荐）
+# 或：sudo pip install frpsctl ／ sudo ./install.sh --system
+hash -r && command -v frpsctl        # 必须解析到 /usr/local/bin，而不是 ~/.local/bin
 
-sudo FRPSCTL_DATA_HOME=$D frpsctl install          # 下载二进制（可加 --mirror）
-sudo FRPSCTL_DATA_HOME=$D frpsctl init --no-input  # 生成配置（会打印 token 与口令）
-sudo FRPSCTL_DATA_HOME=$D frpsctl service install  # 体检 → 渲染 unit → enable
-sudo FRPSCTL_DATA_HOME=$D frpsctl start            # 委托 systemctl
-sudo FRPSCTL_DATA_HOME=$D frpsctl status
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin frps
 ```
+
+**第 1 步：数据目录放到系统路径（并持久化）**
+
+```bash
+export FRPSCTL_DATA_HOME=/opt/frpsctl
+echo 'export FRPSCTL_DATA_HOME=/opt/frpsctl' >> ~/.bashrc   # 后续命令都要用同一路径
+```
+
+> 默认数据目录是 `~/.local/share/frpsctl`——root 下即
+> `/root/.local/share/frpsctl`，会被 `ProtectHome=true` 挡住；`/opt`、`/etc`、
+> `/srv` 均可。普通用户以 `sudo` 执行时环境变量会被 sudo 重置，请写成
+> `sudo FRPSCTL_DATA_HOME=/opt/frpsctl frpsctl …`（或 `sudo -E`）。
+
+**第 2 步：下载二进制 → 生成配置 → 装 unit → 启动**
+
+```bash
+frpsctl install                 # 下载 frps（sha256 强校验）→ /opt/frpsctl/bin
+frpsctl init --no-input         # ⚠️ 打印的 token 与口令只显示这一次，记录下来
+frpsctl service install         # 体检（账户/权限/家目录）→ 渲染 unit → enable
+frpsctl start                   # 委托 systemctl
+frpsctl status                  # owner 应显示 systemd
+```
+
+**第 3 步（可选）：Web 管理台与插件**
+
+```bash
+frpsctl web service install && frpsctl web service start
+frpsctl plugin service install && frpsctl plugin service start
+```
+
+**常见坑（都由第 0 / 1 步提前规避）**
+
+| 报错 | 原因 | 处置 |
+|------|------|------|
+| `系统用户或组不存在：frps/frps` | 服务账户未创建 | 第 0 步的 `useradd`（或 `--user` 指定已有账户） |
+| `服务用户 'frps' 无法执行 frpsctl：目录 /root 对服务用户缺少执行（x）权限` | frpsctl 装在 `/root/.local/bin` | 第 0 步改用系统路径（`pipx install --global` 等） |
+| `frpsctl 位于 /root 下…会被 unit 的 ProtectHome=true 挡住`／`实例目录位于 /home 下…` | 数据目录仍在家目录 | 第 1 步的 `FRPSCTL_DATA_HOME=/opt/frpsctl` |
+| 后续命令报 `实例不存在`／改动不生效 | 新 shell 丢了 `FRPSCTL_DATA_HOME` | 第 1 步的持久化（写进 `~/.bashrc`） |
+| `日志目录对服务用户不可写` | `/var/log/frps` 权限不足 | `service install` 会自动创建并 chown；仍失败用 `--log-dir` 换位置 |
 
 渲染出的 unit（`/etc/systemd/system/frps@.service`）：
 
@@ -1169,18 +1250,22 @@ WantedBy=multi-user.target
 
 ### 用 systemd 托管 Web 管理台与插件
 
-两者的部署要求与 frps 一致（账户 / frpsctl 可达且不在家目录 / 实例目录不在家
-目录），都由安装命令在**安装前**体检：
+两者的部署要求与 frps 一致（frpsctl 在系统路径 / 实例目录不在家目录 / 服务
+账户存在），都由安装命令在**安装前**体检；数据目录也要与 frps 一致（同一
+`FRPSCTL_DATA_HOME`），否则会操作到另一个实例。
 
 ```bash
 # Web 管理台：Restart=on-failure（交互工具，正常停止不自启）
-sudo frpsctl web service install
-sudo systemctl start frpsctl-web@default.service
+frpsctl web service install
+frpsctl web service start          # 即 systemctl start frpsctl-web@<实例>
 
 # 插件：Restart=always（登录单点，退出必须立刻拉起）
-sudo frpsctl plugin service install
-sudo systemctl start frpsctl-plugin@default.service
+frpsctl plugin service install
+frpsctl plugin service start       # 即 systemctl start frpsctl-plugin@<实例>
 ```
+
+> 从零开始的完整步骤（含账户 / 路径坑）见
+> [systemd 部署速查：从零开始](#systemd-部署速查从零开始)。
 
 ### 升级 frps
 
@@ -1393,6 +1478,12 @@ $ frpsctl status
 ```bash
 /path/to/frps --strict_config=true verify -c /path/to/frps.toml
 ```
+
+### `service install` 被拒（服务用户 / 家目录）
+
+报错集中在三类：**服务账户不存在**、**frpsctl 装在 `/root` 或家目录下**、
+**实例目录在家目录下**（后两者是 `ProtectHome=true` 的挂载隔离，改权限无效）。
+逐条处置见 [systemd 部署速查：从零开始](#systemd-部署速查从零开始) 的"常见坑"表格。
 
 ### Web 管理台打不开 / 登录不了
 
