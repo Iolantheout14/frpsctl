@@ -32,17 +32,22 @@ from ..errors import (
 from .instance import Instance, list_instances
 from .lifecycle import Lifecycle, Owner, State
 from .lock import instance_lock
-from .systemd import DEFAULT_SERVICE_USER, PluginService, Systemd, WebService
+from .systemd import (
+    DEFAULT_LOG_DIR,
+    DEFAULT_SERVICE_USER,
+    PluginService,
+    Systemd,
+    WebService,
+    read_service_manifest,
+)
 
 __all__ = [
     "UninstallPlan",
     "UninstallReport",
+    "DEFAULT_LOG_DIR",
     "plan_uninstall",
     "execute_uninstall",
 ]
-
-#: `service install` 默认创建的日志目录（卸载时只提示、不代删：可能仍有用途）。
-DEFAULT_LOG_DIR = Path("/var/log/frps")
 
 
 @dataclass(frozen=True)
@@ -130,7 +135,7 @@ def execute_uninstall(
     *,
     force: bool = False,
     unit_dir: Path | None = None,
-    log_dir: Path = DEFAULT_LOG_DIR,
+    log_dir: Path | None = None,
 ) -> UninstallReport:
     """按计划执行卸载。`force=True` 时运行中的实例会先被停止。
 
@@ -138,6 +143,11 @@ def execute_uninstall(
     之前跑完：所有实例都必须处于"可卸载"状态，否则一个都不动。
     """
     report = UninstallReport()
+
+    # ⚠️ 留档（service.json）必须**在删除数据之前**读取：`_remove_data` 会把
+    # 实例目录整个删掉，之后再读只会得到"文件不存在"——自定义服务账户与
+    # 实际日志路径的提示会静默退化成默认假设（v0.3.2 review 实测复现）。
+    manifest_users, manifest_log_dirs = _collect_manifest_hints(plan.instances)
 
     # 预检（纯检查）：状态不允许就在动手之前拒绝。
     for inst in plan.instances:
@@ -180,7 +190,9 @@ def execute_uninstall(
             ) from None
         report.removed.append(str(plan.bin_dir))
 
-    _courtesy_warnings(report, log_dir=log_dir)
+    _courtesy_warnings(
+        report, users=manifest_users, log_dirs=manifest_log_dirs, log_dir=log_dir
+    )
     return report
 
 
@@ -349,18 +361,61 @@ def _remove_data(inst: Instance, *, report: UninstallReport) -> None:
     report.removed.append(str(inst.dir))
 
 
-def _courtesy_warnings(report: UninstallReport, *, log_dir: Path) -> None:
-    """提示**不属于本工具**、因而不代删的东西。"""
-    if log_dir.exists():
+def _collect_manifest_hints(instances: tuple[Instance, ...]) -> tuple[set[str], set[Path]]:
+    """从安装留档收集"服务账户"与"日志目录"（**必须在删数据之前调用**）。
+
+    留档缺失（旧部署）时返回空集合——调用方回退默认假设。
+    """
+    users: set[str] = set()
+    log_dirs: set[Path] = set()
+    for inst in instances:
+        manifest, _ = read_service_manifest(inst)
+        for key in ("frps", "plugin", "web"):
+            record = manifest.get(key)
+            if not isinstance(record, dict):
+                continue
+            name = record.get("user")
+            if isinstance(name, str) and name:
+                users.add(name)
+            if key == "frps":
+                value = record.get("log_dir")
+                if isinstance(value, str) and value:
+                    log_dirs.add(Path(value))
+    return users, log_dirs
+
+
+def _courtesy_warnings(
+    report: UninstallReport,
+    *,
+    users: set[str],
+    log_dirs: set[Path],
+    log_dir: Path | None = None,
+) -> None:
+    """提示**不属于本工具**、因而不代删的东西（v0.3.2：跟随安装留档）。
+
+    - 服务账户：逐个提示**实际使用过**的账户——此前写死只查 `frps`：用
+      `--user alice` 部署时 alice 的残留不可见，而系统里恰好有 frps 时又
+      会误报（两条都在 v0.3.2 修复）。
+    - 日志目录：优先留档里的实际 `--log-dir`，回退默认路径。
+    - 传空集合（旧部署，无留档）时回退到默认假设，行为与历史版本一致。
+    """
+    if not users:
+        users = {DEFAULT_SERVICE_USER}  # 旧部署（无留档）回退
+    if log_dir is not None:
+        log_dirs = {log_dir}  # 调用方显式注入（测试/特殊场景）
+    elif not log_dirs:
+        log_dirs = {DEFAULT_LOG_DIR}
+
+    for path in sorted(log_dirs):
+        if path.exists():
+            report.warnings.append(
+                f"未清理 {path}（可能仍被其它实例使用；确认无用后：sudo rm -rf {path}）"
+            )
+    for name in sorted(users):
+        try:
+            pwd.getpwnam(name)
+        except KeyError:
+            continue
         report.warnings.append(
-            f"未清理 {log_dir}（可能仍被其它实例使用；确认无用后：sudo rm -rf {log_dir}）"
-        )
-    try:
-        pwd.getpwnam(DEFAULT_SERVICE_USER)
-    except KeyError:
-        pass
-    else:
-        report.warnings.append(
-            f"未删除服务账户 {DEFAULT_SERVICE_USER!r}（可能另有用途；"
-            f"确认无用后：sudo userdel {DEFAULT_SERVICE_USER}）"
+            f"未删除服务账户 {name!r}（可能另有用途；确认无用后：sudo userdel {name}）"
         )
