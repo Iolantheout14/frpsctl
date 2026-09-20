@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
 import typer
 from ...core import config as cfg
+from ...core import healthcheck
+from ...core import serve_runtime
 from ...core.auditlog import (
     DEFAULT_AUDIT_FILE,
     load_view,
@@ -20,6 +23,8 @@ from ...plugin.policy import PluginPolicy
 from ...plugin.server import PluginServer, ServerSettings
 from ...errors import (
     ConfigError,
+    FrpsctlError,
+    OwnershipConflict,
     UsageError,
 )
 from .. import ui
@@ -796,6 +801,7 @@ def plugin_service_install(
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     policy_path, _ = runtime._load_policy(app_ctx, policy)  # 不存在/非法 JSON 在这里就会拒绝
     service = PluginService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
     # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
     exec_start = runtime._frpsctl_executable()
@@ -854,6 +860,7 @@ def plugin_service_start(
     """
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     service.start()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "started": True})
@@ -888,6 +895,7 @@ def plugin_service_restart(
     """重启插件服务（systemd，需要 root）——改完策略后让它载入新配置的常用动作。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     service.restart()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "restarted": True})
@@ -931,3 +939,255 @@ def plugin_service_status(
     ui.emit(f"enabled  : {enabled}（开机自启）")
     if pid:
         ui.emit(f"main pid : {pid}")
+
+
+# ---------------------------------------------------------------------------
+# 后台运行（direct 模式，v0.3.3；非 systemd 环境）
+# ---------------------------------------------------------------------------
+
+
+def _start_direct_plugin(
+    app_ctx,
+    *,
+    policy: Path | None,
+    bind: str | None,
+    handler_path: str | None,
+    access_log: bool | None,
+    fallback_args: dict | None = None,
+) -> tuple[serve_runtime.ServeState, Path, PluginPolicy]:
+    """direct 后台启动插件的共同实现（start 与 restart 共用）。
+
+    `fallback_args`：restart 场景**先读后停**保存下来的旧参数（同 web 的
+    review 修复）。
+    """
+    inst = app_ctx.instance
+    runtime._guard_against_systemd(inst, serve_runtime.PLUGIN_SPEC)
+
+    last, error = serve_runtime.read_state(inst, serve_runtime.PLUGIN_SPEC)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    old = dict(last.args) if last is not None else dict(fallback_args or {})
+
+    resolved_policy = policy
+    if resolved_policy is None and old.get("policy"):
+        resolved_policy = Path(str(old["policy"]))
+    policy_file, loaded = runtime._load_policy(app_ctx, resolved_policy)
+
+    resolved_bind = str(bind if bind is not None else old.get("bind") or "127.0.0.1:8080")
+    resolved_path = str(
+        handler_path if handler_path is not None else old.get("path") or "/handler"
+    )
+    resolved_access = bool(access_log) if access_log is not None else bool(old.get("access_log", False))
+    host, port = healthcheck.parse_bind(resolved_bind, default_port=8080)
+    if not healthcheck.is_loopback(host):
+        # 插件协议没有任何认证：非回环直接拒绝（与 serve/安装体检同一判据）
+        raise UsageError(
+            f"插件拒绝绑定非回环地址：{resolved_bind}",
+            hint="任何能访问该端口的人都能伪造 Login/NewProxy 事件；请绑 127.0.0.1",
+        )
+
+    argv = [
+        str(runtime._frpsctl_executable()),
+        "plugin",
+        "serve",
+        "--policy",
+        str(policy_file),
+        "--bind",
+        resolved_bind,
+        "--path",
+        resolved_path,
+    ]
+    if resolved_access:
+        argv.append("--access-log")
+    args = {
+        "policy": str(policy_file),
+        "bind": resolved_bind,
+        "path": resolved_path,
+        "access_log": resolved_access,
+    }
+    state = serve_runtime.start_background(
+        inst, serve_runtime.PLUGIN_SPEC, argv=argv, args=args, host=host, port=port
+    )
+    return state, policy_file, loaded
+
+
+@plugin_app.command("start")
+def plugin_start(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件（默认复用上次参数，否则实例默认）"),
+    bind: str = typer.Option(None, "--bind", help="绑定地址（默认复用上次参数，否则 127.0.0.1:8080）"),
+    path: str = typer.Option(None, "--path", help="回调路径（默认复用上次参数，否则 /handler）"),
+    access_log: bool = typer.Option(None, "--access-log", help="把每个请求打进日志文件"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """后台启动插件服务（direct 模式；非 systemd 环境使用）。
+
+    子进程就是 `plugin serve`（收到 SIGTERM 会先刷审计再退出），进程与启动
+    参数记录在 `<实例>/plugin-state.json`；停止用 `plugin stop`。
+
+    ⚠️ 与 systemd 托管**互斥**：由 systemd 托管时请用 `plugin service start`。
+    插件是全部客户端登录的单点（fail-closed），变更策略后需 `plugin restart`。
+    """
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    state, policy_file, loaded = _start_direct_plugin(
+        app_ctx, policy=policy, bind=bind, handler_path=path, access_log=access_log
+    )
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "owner": "direct",
+                "pid": state.pid,
+                "bind": state.args.get("bind"),
+                "path": state.args.get("path"),
+                "policy": str(policy_file),
+                "users": sorted(loaded.users),
+                "log": state.log,
+            }
+        )
+        return
+    ui.emit(f"插件服务已在后台启动（pid {state.pid}）")
+    ui.emit(f"监听：http://{state.args.get('bind')}{state.args.get('path')}")
+    ui.emit(f"策略：{policy_file}")
+    ui.emit(f"日志：tail -f {state.log}")
+    ui.emit("⚠ fail-closed：本服务不可达时所有客户端都无法登录，请确保它会随机器恢复")
+
+
+@plugin_app.command("stop")
+def plugin_stop(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停止后台运行的插件服务（SIGTERM 优雅退出并先刷审计）。"""
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    service = PluginService(inst)
+    if service.unit_exists() and service.is_active():
+        raise OwnershipConflict(
+            "插件服务由 systemd 托管且处于 active",
+            hint="用 `plugin service stop`；direct 后台模式没有在运行的实例",
+        )
+    state = serve_runtime.stop_background(inst, serve_runtime.PLUGIN_SPEC)
+    # ⚠ 无条件进 stderr（同 `plugin service stop` 先例）：停止期间不可登录
+    ui.warn("⚠ 插件已停止：期间所有客户端都无法登录（fail-closed），请尽快恢复")
+    if app_ctx.json:
+        ui.emit_json({"owner": "direct", "stopped": True, "pid": state.pid})
+    else:
+        ui.emit(f"已停止插件服务（pid {state.pid}），审计缓冲已随优雅退出刷盘")
+
+
+@plugin_app.command("restart")
+def plugin_restart(
+    ctx: typer.Context,
+    policy: Path = typer.Option(None, "--policy", help="策略文件（默认复用上次参数）"),
+    bind: str = typer.Option(None, "--bind", help="绑定地址（默认复用上次参数）"),
+    path: str = typer.Option(None, "--path", help="回调路径（默认复用上次参数）"),
+    access_log: bool = typer.Option(None, "--access-log", help="把每个请求打进日志文件"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """重启后台运行的插件服务（未在运行时直接启动）。"""
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    # 参数复用必须**先读后停**：stop 会删除状态文件（v0.3.3 review 修复）
+    last, error = serve_runtime.read_state(inst, serve_runtime.PLUGIN_SPEC)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    old_args = dict(last.args) if last is not None else {}
+    with contextlib.suppress(FrpsctlError):
+        serve_runtime.stop_background(inst, serve_runtime.PLUGIN_SPEC)
+    state, policy_file, loaded = _start_direct_plugin(
+        app_ctx,
+        policy=policy,
+        bind=bind,
+        handler_path=path,
+        access_log=access_log,
+        fallback_args=old_args,
+    )
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "owner": "direct",
+                "restarted": True,
+                "pid": state.pid,
+                "policy": str(policy_file),
+                "users": sorted(loaded.users),
+            }
+        )
+        return
+    ui.emit(f"插件服务已重启（pid {state.pid}）：http://{state.args.get('bind')}{state.args.get('path')}")
+    ui.emit(f"日志：tail -f {state.log}")
+
+
+@plugin_app.command("status")
+def plugin_status(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """插件服务的托管状态（systemd / direct / 未运行 的统一视图）。"""
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    service = PluginService(inst)
+
+    probe_error: str | None = None
+    systemd_active = False
+    if service.available:
+        try:
+            systemd_active = service.is_active()
+        except FrpsctlError as exc:
+            probe_error = exc.message
+    direct = serve_runtime.probe(inst, serve_runtime.PLUGIN_SPEC)
+
+    owner = "none"
+    pid: int | None = None
+    main_pid: int | None = None
+    if systemd_active:
+        owner = "systemd"
+        with contextlib.suppress(FrpsctlError):
+            main_pid = service.main_pid()
+        pid = main_pid
+    elif direct.running:
+        owner = "direct"
+        pid = direct.state.pid
+    elif direct.owner is serve_runtime.ServeOwner.CORRUPTED:
+        owner = "corrupted"
+    elif direct.owner is serve_runtime.ServeOwner.FOREIGN:
+        owner = "foreign"
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "owner": owner,
+                "active": systemd_active or direct.running,
+                "pid": pid,
+                "uptime_seconds": direct.uptime_seconds if direct.running else None,
+                "unit": service.unit_name,
+                "main_pid": main_pid,
+                "bind": (direct.state.args.get("bind") if direct.state else None),
+                "path": (direct.state.args.get("path") if direct.state else None),
+                "policy": (direct.state.args.get("policy") if direct.state else None),
+                "log": (direct.state.log if direct.state else None),
+                "error": direct.error or probe_error,
+            }
+        )
+        return
+    if owner == "systemd":
+        ui.emit("owner    : systemd")
+        ui.emit(f"unit     : {service.unit_name}")
+        ui.emit(f"active   : True（MainPID {main_pid if main_pid is not None else '-'}）")
+    elif owner == "direct":
+        ui.emit("owner    : direct（非 systemd 后台）")
+        ui.emit("active   : True")
+        ui.emit(f"pid      : {pid}")
+        ui.emit(f"bind     : {direct.state.args.get('bind')}{direct.state.args.get('path')}")
+        ui.emit(f"policy   : {direct.state.args.get('policy')}")
+        ui.emit(f"log      : {direct.state.log}")
+    elif owner == "corrupted":
+        ui.emit("owner    : direct（状态文件损坏，无法判定是否在运行）")
+        ui.emit(f"error    : {direct.error}")
+        ui.emit("处置     : 确认插件服务没有在跑后，删除状态文件重试")
+    elif owner == "foreign":
+        ui.emit("owner    : direct（状态指向的 pid 存活但不属于本服务）")
+        ui.emit(f"pid      : {direct.state.pid}")
+    else:
+        ui.emit("owner    : none（未运行）")
+    if probe_error:
+        ui.warn(f"⚠ systemd 探测失败（状态按 direct 判定）：{probe_error}")

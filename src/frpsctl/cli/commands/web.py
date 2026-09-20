@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -10,11 +11,13 @@ from ...core import auditlog
 from ...core import config as cfg
 from ...core import web_audit
 from ...core import healthcheck
+from ...core import serve_runtime
 from ...core.systemd import WebService, ensure_service_account, read_template_user
 from ...web import WebServer, WebSettings, build_web_context, generate_password
 from ...errors import (
     ConfigError,
     FrpsctlError,
+    OwnershipConflict,
     UsageError,
 )
 from .. import ui
@@ -156,6 +159,7 @@ def web_service_install(
             hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
         )
     service = WebService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
     # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
     exec_start = runtime._frpsctl_executable()
@@ -216,6 +220,7 @@ def web_service_start(
     """启动 Web 管理台（systemd，需要 root）。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = WebService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     service.start()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "started": True})
@@ -247,6 +252,7 @@ def web_service_restart(
     """重启 Web 管理台（systemd，需要 root）——口令轮换等改动重启后生效。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = WebService(app_ctx.instance)
+    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     service.restart()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "restarted": True})
@@ -498,3 +504,350 @@ def web_audit_stats(
         ui.emit("按来源：")
         for source, count in sorted(summary.by_source.items(), key=lambda item: -item[1]):
             ui.emit(f"  {source or '(未知)'}: {count}")
+
+
+# ---------------------------------------------------------------------------
+# 后台运行（direct 模式，v0.3.3；非 systemd 环境）
+# ---------------------------------------------------------------------------
+
+
+def _background_password(
+    inst, password: str | None, password_file: Path | None
+) -> tuple[Path, str | None, str]:
+    """后台模式的口令统一落**实例口令文件**（argv 只出现路径，明文不进 ps）。
+
+    解析顺序：`--password` > `FRPSCTL_WEB_PASSWORD` > `--password-file` >
+    实例内 `web-password`（不存在则生成）。返回 `(文件, 本次生成的明文, 说明)`。
+    """
+    target = WebService(inst).password_file
+    if password is not None:
+        cfg.atomic_write(target, password + "\n", mode=0o600)
+        return target, None, "口令已从命令行写入口令文件（避免出现在进程命令行里）"
+    env = os.environ.get("FRPSCTL_WEB_PASSWORD")
+    if env:
+        cfg.atomic_write(target, env + "\n", mode=0o600)
+        return target, None, "口令已从环境变量写入口令文件"
+    if password_file is not None:
+        if not password_file.exists():
+            raise ConfigError(
+                f"口令文件不存在：{password_file}",
+                hint="先运行 `frpsctl web password set` 生成，或去掉 --password-file 自动生成",
+            )
+        return password_file, None, "使用指定的口令文件"
+    if target.exists():
+        return target, None, f"沿用实例口令文件 {target}"
+    value = generate_password()
+    cfg.atomic_write(target, value + "\n", mode=0o600)
+    return target, value, "已生成新口令并写入实例口令文件"
+
+
+def _start_direct(
+    app_ctx,
+    *,
+    bind: str | None,
+    allow_non_loopback: bool | None,
+    trusted_proxy: bool | None,
+    access_log: bool | None,
+    metrics: bool | None,
+    password: str | None,
+    password_file: Path | None,
+    fallback_args: dict | None = None,
+) -> tuple[serve_runtime.ServeState, Path, str | None, str, str]:
+    """direct 后台启动的共同实现（start 与 restart 共用）。
+
+    `fallback_args`：restart 场景**先读后停**保存下来的旧参数——此时状态
+    文件已被 stop 删除，不能再从磁盘读（v0.3.3 review 实测复现的缺陷）。
+
+    返回 `(state, 口令文件, 生成的明文或 None, 口令说明, url)`。
+    """
+    inst = app_ctx.instance
+    runtime._guard_against_systemd(inst, serve_runtime.WEB_SPEC)
+
+    last, error = serve_runtime.read_state(inst, serve_runtime.WEB_SPEC)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    old = dict(last.args) if last is not None else dict(fallback_args or {})
+
+    def pick(value, key: str, default):
+        if value is not None:
+            return value
+        return old.get(key, default)
+
+    resolved_bind = str(pick(bind, "bind", "127.0.0.1:8787"))
+    flags = {
+        "allow_non_loopback": bool(pick(allow_non_loopback, "allow_non_loopback", False)),
+        "trusted_proxy": bool(pick(trusted_proxy, "trusted_proxy", False)),
+        "access_log": bool(pick(access_log, "access_log", False)),
+        "metrics": bool(pick(metrics, "metrics", False)),
+    }
+    if not healthcheck.is_loopback(resolved_bind) and not flags["allow_non_loopback"]:
+        raise UsageError(
+            f"拒绝绑定非回环地址：{resolved_bind}",
+            hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
+        )
+
+    if password_file is None and old.get("password_file"):
+        # restart 复用上次的口令文件路径（含 `--password-file` 指向的**外部**
+        # 文件）——否则 restart 会静默回落默认实例文件（v0.3.3 review 补正）。
+        password_file = Path(str(old["password_file"]))
+    pw_file, generated, pw_note = _background_password(inst, password, password_file)
+    argv = [
+        str(runtime._frpsctl_executable()),
+        "web",
+        "serve",
+        "--bind",
+        resolved_bind,
+        "--password-file",
+        str(pw_file),
+    ]
+    if flags["allow_non_loopback"]:
+        argv.append("--allow-non-loopback")
+    if flags["trusted_proxy"]:
+        argv.append("--trusted-proxy")
+    if flags["access_log"]:
+        argv.append("--access-log")
+    if flags["metrics"]:
+        argv.append("--metrics")
+    args = {"bind": resolved_bind, "password_file": str(pw_file), **flags}
+    host, port = healthcheck.parse_bind(resolved_bind, default_port=8787)
+    state = serve_runtime.start_background(
+        inst, serve_runtime.WEB_SPEC, argv=argv, args=args, host=host, port=port
+    )
+    url_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    return state, pw_file, generated, pw_note, f"http://{url_host}:{port}/"
+
+
+@web_app.command("start")
+def web_start(
+    ctx: typer.Context,
+    bind: str = typer.Option(
+        None, "--bind", help="监听地址（默认复用上次参数，否则 127.0.0.1:8787）"
+    ),
+    allow_non_loopback: bool = typer.Option(
+        None, "--allow-non-loopback", help="允许绑定非回环地址（持久化到状态文件）"
+    ),
+    trusted_proxy: bool = typer.Option(
+        None, "--trusted-proxy", help="信任反向代理的 X-Forwarded-For（持久化）"
+    ),
+    access_log: bool = typer.Option(None, "--access-log", help="把逐请求日志写进日志文件"),
+    metrics: bool = typer.Option(None, "--metrics", help="暴露 /metrics（Prometheus）"),
+    password: str = typer.Option(
+        None, "--password", help="登录口令（写入口令文件；不出现在进程命令行里）"
+    ),
+    password_file: Path = typer.Option(
+        None, "--password-file", help="口令文件（默认实例内 web-password，不存在则生成）"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """后台启动 Web 管理台（direct 模式；非 systemd 环境使用）。
+
+    子进程就是 `web serve`（收到 SIGTERM 优雅退出），进程与启动参数记录在
+    `<实例>/web-state.json`；停止用 `web stop`、查询用 `web status`。
+
+    ⚠️ 与 systemd 托管**互斥**：由 systemd 托管时请用 `web service start`。
+    容器场景不要用本命令——容器里前台 `web serve` 才是正确形态。
+
+    口令默认写入/沿用例内 `web-password`（0600，与 `web password set`
+    同一文件）——后台模式不再"打印一次即丢失"。
+    """
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    state, pw_file, generated, pw_note, url = _start_direct(
+        app_ctx,
+        bind=bind,
+        allow_non_loopback=allow_non_loopback,
+        trusted_proxy=trusted_proxy,
+        access_log=access_log,
+        metrics=metrics,
+        password=password,
+        password_file=password_file,
+    )
+    if app_ctx.json:
+        payload: dict = {
+            "owner": "direct",
+            "pid": state.pid,
+            "bind": state.args.get("bind"),
+            "url": url,
+            "log": state.log,
+            "password_file": str(pw_file),
+            "password_generated": generated is not None,
+        }
+        if generated is not None:
+            payload["password"] = generated
+        ui.emit_json(payload)
+        return
+    ui.emit(f"Web 管理台已在后台启动（pid {state.pid}）：{url}")
+    ui.emit(f"日志：tail -f {state.log}")
+    ui.emit(f"口令：{pw_note}")
+    if generated is not None:
+        ui.emit(f"登录口令（仅显示这一次）：{generated}")
+    else:
+        ui.emit(f"口令文件：{pw_file}（`frpsctl web password show` 可读回）")
+
+
+@web_app.command("stop")
+def web_stop(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """停止后台运行的 Web 管理台（direct 模式；SIGTERM → 等待 → SIGKILL 兜底）。"""
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    service = WebService(inst)
+    if service.unit_exists() and service.is_active():
+        raise OwnershipConflict(
+            "Web 管理台由 systemd 托管且处于 active",
+            hint="用 `web service stop`；direct 后台模式没有在运行的实例",
+        )
+    state = serve_runtime.stop_background(inst, serve_runtime.WEB_SPEC)
+    if app_ctx.json:
+        ui.emit_json({"owner": "direct", "stopped": True, "pid": state.pid})
+    else:
+        ui.emit(f"已停止 Web 管理台（pid {state.pid}）")
+
+
+@web_app.command("restart")
+def web_restart(
+    ctx: typer.Context,
+    bind: str = typer.Option(None, "--bind", help="监听地址（默认复用上次启动参数）"),
+    allow_non_loopback: bool = typer.Option(None, "--allow-non-loopback", help="允许绑定非回环地址"),
+    trusted_proxy: bool = typer.Option(None, "--trusted-proxy", help="信任反向代理的 X-Forwarded-For"),
+    access_log: bool = typer.Option(None, "--access-log", help="把逐请求日志写进日志文件"),
+    metrics: bool = typer.Option(None, "--metrics", help="暴露 /metrics"),
+    password: str = typer.Option(None, "--password", help="轮换口令并写入实例口令文件"),
+    password_file: Path = typer.Option(None, "--password-file", help="口令文件"),
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """重启后台运行的 Web 管理台（未给参数时复用上次的启动参数）。
+
+    未在运行时直接启动（与 `frpsctl restart` 的语义一致）。
+    """
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    # 参数复用必须**先读后停**：stop 会删除状态文件（v0.3.3 review 修复）
+    last, error = serve_runtime.read_state(inst, serve_runtime.WEB_SPEC)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    old_args = dict(last.args) if last is not None else {}
+    with contextlib.suppress(FrpsctlError):
+        serve_runtime.stop_background(inst, serve_runtime.WEB_SPEC)
+    state, pw_file, generated, pw_note, url = _start_direct(
+        app_ctx,
+        bind=bind,
+        allow_non_loopback=allow_non_loopback,
+        trusted_proxy=trusted_proxy,
+        access_log=access_log,
+        metrics=metrics,
+        password=password,
+        password_file=password_file,
+        fallback_args=old_args,
+    )
+    if app_ctx.json:
+        payload = {
+            "owner": "direct",
+            "restarted": True,
+            "pid": state.pid,
+            "url": url,
+            "password_generated": generated is not None,
+        }
+        if generated is not None:
+            payload["password"] = generated
+        ui.emit_json(payload)
+        return
+    ui.emit(f"Web 管理台已重启（pid {state.pid}）：{url}")
+    ui.emit(f"日志：tail -f {state.log}")
+    ui.emit(f"口令：{pw_note}")
+    if generated is not None:
+        ui.emit(f"登录口令（仅显示这一次）：{generated}")
+
+
+@web_app.command("status")
+def web_status(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """Web 管理台的托管状态（systemd / direct / 未运行 的统一视图）。"""
+    app_ctx = runtime._ctx(ctx).with_json(json_output)
+    inst = app_ctx.instance
+    service = WebService(inst)
+
+    probe_error: str | None = None
+    systemd_active = False
+    if service.available:
+        try:
+            systemd_active = service.is_active()
+        except FrpsctlError as exc:
+            probe_error = exc.message  # 探测失败降级：如实报告，不猜
+    direct = serve_runtime.probe(inst, serve_runtime.WEB_SPEC)
+
+    owner = "none"
+    pid: int | None = None
+    uptime: float | None = None
+    main_pid: int | None = None
+    if systemd_active:
+        owner = "systemd"
+        with contextlib.suppress(FrpsctlError):
+            main_pid = service.main_pid()
+        pid = main_pid
+    elif direct.running:
+        owner = "direct"
+        pid = direct.state.pid
+        uptime = direct.uptime_seconds
+    elif direct.owner is serve_runtime.ServeOwner.CORRUPTED:
+        owner = "corrupted"
+    elif direct.owner is serve_runtime.ServeOwner.FOREIGN:
+        owner = "foreign"
+
+    if app_ctx.json:
+        ui.emit_json(
+            {
+                "owner": owner,
+                "active": systemd_active or direct.running,
+                "pid": pid,
+                "uptime_seconds": uptime,
+                "unit": service.unit_name,
+                "main_pid": main_pid,
+                "bind": (direct.state.args.get("bind") if direct.state else None),
+                "log": (direct.state.log if direct.state else None),
+                "error": direct.error or probe_error,
+            }
+        )
+        return
+    if owner == "systemd":
+        ui.emit("owner    : systemd")
+        ui.emit(f"unit     : {service.unit_name}")
+        ui.emit(f"active   : True（MainPID {main_pid if main_pid is not None else '-'}）")
+    elif owner == "direct":
+        ui.emit("owner    : direct（非 systemd 后台）")
+        ui.emit("active   : True")
+        ui.emit(f"pid      : {pid}")
+        ui.emit(f"uptime   : {_human_uptime(uptime)}")
+        ui.emit(f"bind     : {direct.state.args.get('bind')}")
+        ui.emit(f"log      : {direct.state.log}")
+    elif owner == "corrupted":
+        ui.emit("owner    : direct（状态文件损坏，无法判定是否在运行）")
+        ui.emit(f"error    : {direct.error}")
+        ui.emit("处置     : 确认管理台没有在跑后，删除状态文件重试")
+    elif owner == "foreign":
+        ui.emit("owner    : direct（状态指向的 pid 存活但不属于本服务）")
+        ui.emit(f"pid      : {direct.state.pid}")
+        ui.emit("处置     : 该 pid 可能已被复用；确认后删除状态文件")
+    else:
+        ui.emit("owner    : none（未运行）")
+    if probe_error:
+        ui.warn(f"⚠ systemd 探测失败（状态按 direct 判定）：{probe_error}")
+
+
+def _human_uptime(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    total = int(seconds)
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    if minutes:
+        return f"{minutes}m{secs}s"
+    return f"{secs}s"

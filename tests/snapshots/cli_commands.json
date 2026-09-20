@@ -1125,6 +1125,70 @@
       }
     ]
   },
+  "plugin restart": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "path",
+        "opts": [
+          "--path"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
   "plugin serve": {
     "params": [
       {
@@ -1366,6 +1430,102 @@
     ]
   },
   "plugin service uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin start": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "path",
+        "opts": [
+          "--path"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "policy",
+        "opts": [
+          "--policy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin status": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "plugin stop": {
     "params": [
       {
         "default": false,
@@ -2177,6 +2337,106 @@
       }
     ]
   },
+  "web restart": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "allow_non_loopback",
+        "opts": [
+          "--allow-non-loopback"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "metrics",
+        "opts": [
+          "--metrics"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password",
+        "opts": [
+          "--password"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password_file",
+        "opts": [
+          "--password-file"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "trusted_proxy",
+        "opts": [
+          "--trusted-proxy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
   "web serve": {
     "params": [
       {
@@ -2454,6 +2714,138 @@
     ]
   },
   "web service uninstall": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web start": {
+    "params": [
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "access_log",
+        "opts": [
+          "--access-log"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "allow_non_loopback",
+        "opts": [
+          "--allow-non-loopback"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "bind",
+        "opts": [
+          "--bind"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "metrics",
+        "opts": [
+          "--metrics"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password",
+        "opts": [
+          "--password"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": false,
+        "kind": "opt",
+        "multiple": false,
+        "name": "password_file",
+        "opts": [
+          "--password-file"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": null,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "trusted_proxy",
+        "opts": [
+          "--trusted-proxy"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web status": {
+    "params": [
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
+        "name": "json_output",
+        "opts": [
+          "--json"
+        ],
+        "required": false,
+        "secondary": []
+      }
+    ]
+  },
+  "web stop": {
     "params": [
       {
         "default": false,

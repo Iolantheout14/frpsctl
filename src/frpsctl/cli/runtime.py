@@ -32,6 +32,7 @@ from ..plugin.policy import PluginPolicy
 from ..errors import (
     AdminUnreachable,
     ConfigError,
+    OwnershipConflict,
     UsageError,
 )
 from .context import AppContext
@@ -144,6 +145,49 @@ def _frpsctl_executable() -> Path:
         "无法确定 frpsctl 可执行文件路径（unit 的 ExecStart 需要绝对路径）",
         hint="请用 PATH 里的 `frpsctl` 命令运行本命令（而不是 python -m frpsctl）",
     )
+
+
+def _guard_against_systemd(inst, spec) -> None:
+    """direct 后台启动前：systemd 托管 active 时拒绝（exit 11）。
+
+    两个托管模式并存会互相打架（端口冲突、重启语义混乱），因此不做"智能
+    选择"——明确拒绝并给出切换到 systemd 的命令（ADR-1 同一精神）。
+    """
+    from ..core.systemd import PluginService, WebService
+
+    service = WebService(inst) if spec.key == "web" else PluginService(inst)
+    if service.unit_exists() and service.is_active():
+        raise OwnershipConflict(
+            f"{spec.label}由 systemd 托管且处于 active，拒绝 direct 后台启动",
+            hint=f"用 `{spec.key} service start|stop|status`；"
+            f"要改用 direct 后台请先 `{spec.key} service uninstall`",
+        )
+
+
+def _guard_against_direct(inst, spec) -> None:
+    """systemd service 安装/启动前：direct 后台存活时拒绝（exit 11）。
+
+    与 `_guard_against_systemd` 对称。状态文件损坏/指向外人时同样拒绝
+    （不猜测，ADR-7）。
+    """
+    from ..core import serve_runtime
+
+    status = serve_runtime.probe(inst, spec)
+    if status.running:
+        raise OwnershipConflict(
+            f"{spec.label}已在后台运行（direct 模式，pid {status.state.pid}）",
+            hint=f"先 `{spec.key} stop`，再安装/启动 systemd 托管",
+        )
+    if status.owner is serve_runtime.ServeOwner.CORRUPTED:
+        raise OwnershipConflict(
+            f"{spec.label}的后台状态文件已损坏，无法确认是否在运行",
+            hint=f"确认后删除 {serve_runtime.state_path(inst, spec)} 再试",
+        )
+    if status.owner is serve_runtime.ServeOwner.FOREIGN:
+        raise OwnershipConflict(
+            f"{spec.label}的后台状态指向 pid {status.state.pid}，但它不属于本服务",
+            hint="该 pid 可能已被复用；确认后删除状态文件重试",
+        )
 
 
 def _identity_summary(identity: ServiceIdentity) -> str:
