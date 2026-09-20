@@ -29,6 +29,7 @@ from ..errors import (
     PermissionRequired,
     UsageError,
 )
+from . import serve_runtime
 from .instance import Instance, list_instances
 from .lifecycle import Lifecycle, Owner, State
 from .lock import instance_lock
@@ -201,12 +202,38 @@ def execute_uninstall(
 # ---------------------------------------------------------------------------
 
 
+def _precheck_local_services(inst: Instance, *, force: bool) -> None:
+    """web/plugin 的 direct 后台必须在卸载前停下（v0.3.3）。
+
+    否则删掉实例目录后服务进程仍是活的——"服务在跑、数据已删"的孤儿状态，
+    与 frps 的顺序安全原则（模块文档第 2 条）完全同一道理。
+    """
+    for spec in (serve_runtime.WEB_SPEC, serve_runtime.PLUGIN_SPEC):
+        status = serve_runtime.probe(inst, spec)
+        if status.owner is serve_runtime.ServeOwner.CORRUPTED:
+            raise ConfigError(
+                f"{spec.label}的后台状态文件已损坏，无法判断是否在运行：{status.error}",
+                hint="确认该服务没有在跑后删除状态文件，再重试卸载",
+            )
+        if status.owner is serve_runtime.ServeOwner.FOREIGN:
+            raise OwnershipConflict(
+                f"{spec.label}的后台状态指向 pid {status.state.pid}，但它不属于本服务，拒绝卸载",
+                hint="该 pid 可能已被复用为无关进程；确认后删除状态文件再重试",
+            )
+        if status.running and not force:
+            raise OwnershipConflict(
+                f"{spec.label}正在后台运行（pid {status.state.pid}），拒绝卸载",
+                hint=f"先 `frpsctl {spec.key} stop`，或加 --force 由本命令先停止",
+            )
+
+
 def _precheck(inst: Instance, *, force: bool) -> None:
     """实例必须处于可卸载状态；任何不确定都拒绝（ADR-7）。
 
     用 `Lifecycle.status()` 而不是自己读 state：status 的承诺是"永不异常、如实
     报告"，且内部已收口了"损坏检查与读取之间"的 TOCTOU。
     """
+    _precheck_local_services(inst, force=force)
     status = Lifecycle(inst).status()
     if status.state_corrupted:
         raise ConfigError(
@@ -254,6 +281,23 @@ def _ensure_stopped(
     因此这里**复核一次**并重新应用同一条授权规则：发现运行态而 `--force` 未给
     就中止（退出码 11），绝不因为"预检时它是停的"就越权停掉一个刚起来的服务。
     """
+    # 先停 direct 后台的 web/plugin（前端服务先于 frps 本体）
+    for spec in (serve_runtime.WEB_SPEC, serve_runtime.PLUGIN_SPEC):
+        probe = serve_runtime.probe(inst, spec)
+        if probe.owner is serve_runtime.ServeOwner.CORRUPTED:
+            raise ConfigError(
+                f"{spec.label}的后台状态文件已损坏，中止卸载：{probe.error}",
+                hint="确认该服务没有在跑后删除状态文件，再重试",
+            )
+        if probe.running:
+            if not force:
+                raise OwnershipConflict(
+                    f"{spec.label}在卸载期间变为运行中（pid {probe.state.pid}），中止卸载",
+                    hint=f"先 `frpsctl {spec.key} stop`，或加 --force 由本命令先停止",
+                )
+            serve_runtime.stop_background(inst, spec)
+            report.stopped.append(f"{inst.name}（{spec.label} direct，pid {probe.state.pid}）")
+
     status = Lifecycle(inst).status()
     if status.systemd_probe_error:
         # 预检与这里之间 systemd 可能刚好无响应——同 `_precheck`：拒绝而非降级。
