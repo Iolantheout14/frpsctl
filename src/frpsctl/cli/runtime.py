@@ -27,6 +27,7 @@ from ..core.auditlog import (
     resolve_policy_path,
 )
 from ..core.lifecycle import Lifecycle
+from ..core.systemd import ServiceIdentity
 from ..plugin.policy import PluginPolicy
 from ..errors import (
     AdminUnreachable,
@@ -143,6 +144,29 @@ def _frpsctl_executable() -> Path:
         "无法确定 frpsctl 可执行文件路径（unit 的 ExecStart 需要绝对路径）",
         hint="请用 PATH 里的 `frpsctl` 命令运行本命令（而不是 python -m frpsctl）",
     )
+
+
+def _identity_summary(identity: ServiceIdentity) -> str:
+    """服务账户解析结果的一行摘要（三个 service install 共用同一口径）。"""
+    if identity.source == "default-frps":
+        return f"服务用户：{identity.user}（默认：系统已有 {identity.user} 用户）"
+    if identity.source == "default-current":
+        return f"服务用户：{identity.user}（默认：无 frps 用户，使用当前用户）"
+    return f"服务用户：{identity.user}"
+
+
+def _identity_warnings(identity: ServiceIdentity) -> list[str]:
+    """账户相关告警（顺序：创建 → 组回退 → root 安全提示）。"""
+    out: list[str] = []
+    if identity.created:
+        out.append(f"已创建系统用户 {identity.user}（--system，无家目录，nologin）")
+    out.extend(f"注：{note}" for note in identity.notes)
+    if identity.uid == 0:
+        out.append(
+            "⚠ 服务用户为 root：unit 的加固仍在，但以 root 运行会扩大风险面；"
+            "建议改用专用账户（--user <名字> --create-user 可自动创建）"
+        )
+    return out
 
 
 def _web_password_from_file(path: Path | None) -> str | None:

@@ -1220,6 +1220,18 @@
         "is_flag": true,
         "kind": "opt",
         "multiple": false,
+        "name": "create_user",
+        "opts": [
+          "--create-user"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
         "name": "force",
         "opts": [
           "--force"
@@ -1276,7 +1288,7 @@
         "secondary": []
       },
       {
-        "default": "frps",
+        "default": null,
         "is_flag": false,
         "kind": "opt",
         "multiple": false,
@@ -1658,6 +1670,18 @@
         "is_flag": true,
         "kind": "opt",
         "multiple": false,
+        "name": "create_user",
+        "opts": [
+          "--create-user"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
         "name": "force",
         "opts": [
           "--force"
@@ -1702,7 +1726,7 @@
         "secondary": []
       },
       {
-        "default": "frps",
+        "default": null,
         "is_flag": false,
         "kind": "opt",
         "multiple": false,
@@ -2284,6 +2308,18 @@
         "is_flag": true,
         "kind": "opt",
         "multiple": false,
+        "name": "create_user",
+        "opts": [
+          "--create-user"
+        ],
+        "required": false,
+        "secondary": []
+      },
+      {
+        "default": false,
+        "is_flag": true,
+        "kind": "opt",
+        "multiple": false,
         "name": "force",
         "opts": [
           "--force"
@@ -2340,7 +2376,7 @@
         "secondary": []
       },
       {
-        "default": "frps",
+        "default": null,
         "is_flag": false,
         "kind": "opt",
         "multiple": false,

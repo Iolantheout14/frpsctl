@@ -15,7 +15,7 @@ from ...core.auditlog import (
     summarize,
 )
 from ...core.lock import instance_lock
-from ...core.systemd import DEFAULT_SERVICE_USER, PluginService
+from ...core.systemd import PluginService, ensure_service_account, read_template_user
 from ...plugin.policy import PluginPolicy
 from ...plugin.server import PluginServer, ServerSettings
 from ...errors import (
@@ -768,8 +768,15 @@ def plugin_service_install(
         "/handler", "--path", help="回调路径（需与 frps 的 httpPlugins.path 一致）"
     ),
     policy: Path = typer.Option(None, "--policy", help="策略文件（默认 <实例>/plugin-policy.json）"),
-    user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行插件的系统用户（需已存在）"),
-    group: str = typer.Option(None, "--group", help="运行插件的系统组（默认与 --user 相同）"),
+    user: str = typer.Option(
+        None, "--user", help="运行插件的系统用户（默认：优先 frps，其次当前用户）"
+    ),
+    group: str = typer.Option(
+        None, "--group", help="运行插件的系统组（默认：同名组，缺失则用户主组）"
+    ),
+    create_user: bool = typer.Option(
+        False, "--create-user", help="服务用户不存在时自动创建系统账户（需 root；须配合 --user）"
+    ),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
     access_log: bool = typer.Option(
         False, "--access-log", help="把逐请求日志写进 journald（排查用；unit 模板为全部实例共享）"
@@ -778,8 +785,9 @@ def plugin_service_install(
 ) -> None:
     """安装 frpsctl-plugin@.service 并 enable（需要 root）。
 
-    注意：unit 模板（frpsctl-plugin@.service）为**全部实例共享**——bind、策略路径
-    与 access-log 等都写在这一个模板里，多实例环境里重装会覆盖这些参数。
+    注意：unit 模板（frpsctl-plugin@.service）为**全部实例共享**——bind、策略
+    路径、access-log 与服务用户等都写在这一个模板里，多实例环境里重装会覆盖
+    这些参数。任何账户都可以作为服务用户（§12.2）。
 
     渲染前体检：服务账户存在、frpsctl 对服务用户可达且不在家目录
     （`ProtectHome=true`）、策略文件存在且合法、绑定地址为回环。
@@ -788,16 +796,30 @@ def plugin_service_install(
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     policy_path, _ = runtime._load_policy(app_ctx, policy)  # 不存在/非法 JSON 在这里就会拒绝
     service = PluginService(app_ctx.instance)
+    # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
+    # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
+    exec_start = runtime._frpsctl_executable()
+    identity = ensure_service_account(user, group, create_user=create_user)
+    if force:
+        existing = read_template_user(service.template_path)
+        if existing is not None and existing != identity.user:
+            ui.warn(
+                f"⚠ unit 模板为全部实例共享：{service.template_path} 的 User= "
+                f"将从 {existing} 改为 {identity.user}（影响所有使用该模板的实例）"
+            )
     path = service.install_template(
-        exec_start=runtime._frpsctl_executable(),
+        exec_start=exec_start,
         policy=policy_path,
         bind=bind,
         handler_path=handler_path,
         force=force,
-        user=user,
-        group=group,
+        user=identity.user,
+        group=identity.group,
         access_log=access_log,
     )
+    # 账户告警（创建/组回退/root 安全）**无条件**进 stderr：JSON 模式也不豁免。
+    for warning in runtime._identity_warnings(identity):
+        ui.warn(warning)
     if app_ctx.json:
         ui.emit_json(
             {
@@ -805,13 +827,16 @@ def plugin_service_install(
                 "template": str(path),
                 "bind": bind,
                 "policy": str(policy_path),
-                "user": user,
-                "group": group or user,
+                "user": identity.user,
+                "group": identity.group,
+                "user_source": identity.source,
+                "created_user": identity.created,
             }
         )
         return
     ui.emit(f"已安装 {path}")
-    ui.emit(f"实例 unit：{service.unit_name}（User={user}, Group={group or user}）")
+    ui.emit(runtime._identity_summary(identity))
+    ui.emit(f"实例 unit：{service.unit_name}（User={identity.user}, Group={identity.group}）")
     ui.emit("")
     ui.emit("启动：frpsctl plugin service start（该命令在此，无需手工 systemctl）")
     ui.emit("已 enable（开机自启）；停止/重启/停用：plugin service stop|restart|uninstall")

@@ -10,7 +10,7 @@ from ...core import auditlog
 from ...core import config as cfg
 from ...core import web_audit
 from ...core import healthcheck
-from ...core.systemd import DEFAULT_SERVICE_USER, WebService
+from ...core.systemd import WebService, ensure_service_account, read_template_user
 from ...web import WebServer, WebSettings, build_web_context, generate_password
 from ...errors import (
     ConfigError,
@@ -127,20 +127,27 @@ def web_service_install(
         "--metrics",
         help="暴露 /metrics（写入 unit 的 serve 参数；unit 模板为全部实例共享）",
     ),
-    user: str = typer.Option(DEFAULT_SERVICE_USER, "--user", help="运行管理台的系统用户（需已存在）"),
-    group: str = typer.Option(None, "--group", help="运行管理台的系统组（默认与 --user 相同）"),
+    user: str = typer.Option(
+        None, "--user", help="运行管理台的系统用户（默认：优先 frps，其次当前用户）"
+    ),
+    group: str = typer.Option(
+        None, "--group", help="运行管理台的系统组（默认：同名组，缺失则用户主组）"
+    ),
+    create_user: bool = typer.Option(
+        False, "--create-user", help="服务用户不存在时自动创建系统账户（需 root；须配合 --user）"
+    ),
     force: bool = typer.Option(False, "--force", help="覆盖已存在的 unit 模板"),
     json_output: bool = typer.Option(False, "--json", help="机器可读输出"),
 ) -> None:
     """安装 frpsctl-web@.service 并 enable（需要 root）。
 
     安装时生成 0600 的登录口令文件（unit 只引用路径，明文不进 unit），
-    并执行与 frps/插件同样的四项体检（账户 / frpsctl 可达且不在家目录 /
-    实例目录不在家目录）。
+    并执行与 frps/插件同样的体检（账户 / frpsctl 可达且不在家目录 /
+    实例目录不在家目录）。任何账户都可以作为服务用户（§12.2）。
 
     注意：unit 模板（frpsctl-web@.service）为**全部实例共享**——bind、
-    trusted-proxy 与 access-log 等都写在这一个模板里，多实例环境里重装会
-    覆盖这些参数。
+    trusted-proxy、access-log 与服务用户等都写在这一个模板里，多实例
+    环境里重装会覆盖这些参数。
     """
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     if not healthcheck.is_loopback(bind) and not allow_non_loopback:
@@ -149,16 +156,30 @@ def web_service_install(
             hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
         )
     service = WebService(app_ctx.instance)
+    # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
+    # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
+    exec_start = runtime._frpsctl_executable()
+    identity = ensure_service_account(user, group, create_user=create_user)
+    if force:
+        existing = read_template_user(service.template_path)
+        if existing is not None and existing != identity.user:
+            ui.warn(
+                f"⚠ unit 模板为全部实例共享：{service.template_path} 的 User= "
+                f"将从 {existing} 改为 {identity.user}（影响所有使用该模板的实例）"
+            )
     path, generated = service.install_template(
-        exec_start=runtime._frpsctl_executable(),
+        exec_start=exec_start,
         bind=bind,
         force=force,
-        user=user,
-        group=group,
+        user=identity.user,
+        group=identity.group,
         trusted_proxy=trusted_proxy,
         access_log=access_log,
         metrics=metrics,
     )
+    # 账户告警（创建/组回退/root 安全）**无条件**进 stderr：JSON 模式也不豁免。
+    for warning in runtime._identity_warnings(identity):
+        ui.warn(warning)
     if app_ctx.json:
         ui.emit_json(
             {
@@ -167,13 +188,16 @@ def web_service_install(
                 "bind": bind,
                 "password_file": str(service.password_file),
                 "password_generated": bool(generated),
-                "user": user,
-                "group": group or user,
+                "user": identity.user,
+                "group": identity.group,
+                "user_source": identity.source,
+                "created_user": identity.created,
             }
         )
         return
     ui.emit(f"已安装 {path}")
-    ui.emit(f"实例 unit：{service.unit_name}（User={user}, Group={group or user}）")
+    ui.emit(runtime._identity_summary(identity))
+    ui.emit(f"实例 unit：{service.unit_name}（User={identity.user}, Group={identity.group}）")
     if generated:
         ui.emit("")
         ui.emit(f"登录口令（仅显示这一次，已写入 {service.password_file}）：{generated}")
