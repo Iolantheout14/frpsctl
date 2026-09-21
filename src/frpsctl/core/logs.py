@@ -15,11 +15,69 @@ from pathlib import Path
 
 from .instance import Instance
 
-__all__ = ["TAIL_BLOCK_BYTES", "resolve_log_target", "tail_lines"]
+__all__ = ["MAX_SINCE_BYTES", "TAIL_BLOCK_BYTES", "resolve_log_target", "tail_lines", "tail_since"]
 
 #: 反向读取的块大小。frp 日志一行几十字节，64KiB 一块通常就覆盖几千行；
 #: 它同时是"超长行"场景下的回扫步长。
 TAIL_BLOCK_BYTES = 65536
+
+#: 增量读取单次上限（字节）：一次拉爆量的防御（积压的日志分段取，
+#: 前端按 offset 继续请求）。
+MAX_SINCE_BYTES = 512 * 1024
+
+
+def tail_since(
+    path: Path, offset: int | None, *, max_lines: int = 2000
+) -> tuple[list[str], int, bool]:
+    """从 `offset` 字节处读增量（v0.3.4：Web 日志面板的增量模式）。
+
+    返回 `(新增行, 新 offset, 是否重置)`。
+
+    重置（`reset=True`，调用方应整段替换而不是追加）的三种情形：
+    - `offset` 为空/负数（首次读取）；
+    - `offset` 大于当前文件大小（日志被轮转或截断——frp 按天轮转）；
+    - 文件不存在/不可读。
+
+    只返回**完整行**：EOF 处的半行不返回，且新 offset 停在最后一个完整行
+    的末尾——下一次请求再取它，避免把半行当完整行显示（与 `tail_lines`
+    多要一个换行的纪律同源）。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], 0, True
+    if offset is None or offset < 0 or offset > size:
+        # 全量分支：与增量分支统一为"不含换行符的行"（调用方不必区分两种形态）
+        return (
+            [line.rstrip("\n").rstrip("\r") for line in tail_lines(path, max_lines)],
+            size,
+            True,
+        )
+    if offset == size:
+        return [], offset, False
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(MAX_SINCE_BYTES)
+    except OSError:
+        return [], 0, True
+    # 末尾半行：丢弃并回退 offset（多字节字符不会跨行边界，offset 总在
+    # 换行之后，因此这里从 offset 解码是安全的）
+    if chunk and not chunk.endswith(b"\n"):
+        cut = chunk.rfind(b"\n")
+        if cut < 0:
+            return [], offset, False   # 连一个完整行都没有：等下次
+        keep = chunk[: cut + 1]
+        new_offset = offset + len(keep)
+    else:
+        keep = chunk
+        new_offset = offset + len(chunk)
+    lines = keep.decode("utf-8", errors="replace").splitlines()
+    if len(lines) > max_lines:
+        # 积压超过请求行数：只给最后 max_lines 行（offset 仍推进到 EOF，
+        # 中间被跳过的行如实丢弃——调用方按"显示行数"语义消费）
+        lines = lines[-max_lines:]
+    return lines, new_offset, False
 
 
 def resolve_log_target(inst: Instance) -> Path:

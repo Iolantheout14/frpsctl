@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import fcntl
+import functools
 import io
 import os
 import platform
@@ -25,8 +28,9 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +38,7 @@ from ..errors import (
     BinaryError,
     ChecksumMismatch,
     ChecksumUnavailable,
+    FrpsctlError,
     UsageError,
 )
 from .diagnostics import trace
@@ -136,16 +141,27 @@ class InstallResult:
 # ---------------------------------------------------------------------------
 
 
-def _fetch(url: str, *, timeout: float = 60.0) -> bytes:
+def _fetch(
+    url: str,
+    *,
+    timeout: float = 60.0,
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> bytes:
     """取回一个 URL 的内容。
 
     优先用 curl——它自带镜像/代理/重定向的成熟处理，并且在终端上会**显示
     下载进度**（14 MB 的二进制在弱网下静默等待，看起来像卡死）。
 
+    `on_progress(received, total)` 存在时**改走 urllib 分块读**：curl 的
+    进度画在 stderr 上、不可解析，而后台任务（Web 版本管理）需要结构化
+    进度（v0.3.4）。
+
     curl 失败时**回退到 urllib**：此前 curl 存在但失败（例如代理配置损坏、
     TLS 太老）会让所有下载直接以一条错误结束，而 urllib 兜底代码永远不会被
     执行。两个通道的错误都保留在最终异常里。
     """
+    if on_progress is not None:
+        return _fetch_with_urllib(url, timeout=timeout, on_progress=on_progress)
     errors: list[str] = []
     curl = shutil.which("curl")
     if curl:
@@ -159,6 +175,30 @@ def _fetch(url: str, *, timeout: float = 60.0) -> bytes:
     except Exception as exc:  # noqa: BLE001 - urllib 的异常种类繁多，统一转成可读错误
         errors.append(f"urllib：{exc}")
     raise OSError("；".join(errors) if errors else "无可用下载方式（未找到 curl 且 urllib 失败）")
+
+
+def _fetch_with_urllib(
+    url: str,
+    *,
+    timeout: float,
+    on_progress: Callable[[int, int | None], None],
+) -> bytes:
+    """urllib 分块下载并回调进度（`total` 取 Content-Length，缺失为 None）。"""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+        try:
+            total: int | None = int(resp.headers.get("Content-Length") or 0) or None
+        except (TypeError, ValueError):
+            total = None
+        chunks: list[bytes] = []
+        received = 0
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+            on_progress(received, total)
+        return b"".join(chunks)
 
 
 def _fetch_with_curl(curl: str, url: str, *, timeout: float) -> bytes:
@@ -180,13 +220,22 @@ def _fetch_with_curl(curl: str, url: str, *, timeout: float) -> bytes:
         tmp_path.unlink(missing_ok=True)
 
 
-def download(asset: str, version: str, mirrors: tuple[str, ...] = DEFAULT_MIRRORS) -> bytes:
-    """按镜像顺序尝试下载资产；全部失败抛 `BinaryError`。"""
+def download(
+    asset: str,
+    version: str,
+    mirrors: tuple[str, ...] = DEFAULT_MIRRORS,
+    *,
+    on_progress: Callable[[int, int | None], None] | None = None,
+) -> bytes:
+    """按镜像顺序尝试下载资产；全部失败抛 `BinaryError`。
+
+    `on_progress` 透传给 `_fetch`（存在时走 urllib 分块进度）。
+    """
     errors: list[str] = []
     for mirror in mirrors:
         url = f"{mirror.rstrip('/')}/v{version}/{asset}"
         try:
-            return _fetch(url)
+            return _fetch(url, on_progress=on_progress)
         except Exception as exc:  # 网络层异常种类繁多，统一记录后继续下一个源
             errors.append(f"{url} → {exc}")
     raise BinaryError(
@@ -265,6 +314,51 @@ def switch_symlink(dest: Path, target: Path) -> None:
         tmp.unlink(missing_ok=True)  # 成功路径上 rename 已把它移走，这里是 no-op
 
 
+@contextlib.contextmanager
+def _install_lock(bin_dir: Path, timeout: float = 5.0):
+    """bin 目录级安装互斥（CLI `install` 与 Web 后台任务共用同一把锁）。
+
+    v0.3.4：此前 CLI 与 Web 的安装可能并发（两个进程同时下载/落盘/换链，
+    互相踩 bin/ 目录）；锁文件 `<bin>/.install.lock` 0600，进程退出自动释放。
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = bin_dir / ".install.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise FrpsctlError(
+                        "另一个安装进程正在操作 bin 目录，拒绝并发安装",
+                        hint="等待其完成后重试（避免两个进程同时换软链）",
+                    ) from None
+                time.sleep(0.1)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _locked_install(func):
+    """给 `install` 套上 bin 目录级互斥（bin_dir 为 keyword-only 参数）。"""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        bin_dir = kwargs.get("bin_dir")
+        if bin_dir is None:
+            return func(*args, **kwargs)
+        with _install_lock(Path(bin_dir)):
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+@_locked_install
 def install(
     *,
     bin_dir: Path,
@@ -274,6 +368,7 @@ def install(
     force: bool = False,
     switch: bool = True,
     with_frpc: bool = False,
+    on_progress: Callable[[str, int, int | None], None] | None = None,
 ) -> InstallResult:
     """下载 → 强校验 → 落盘 → `-v` 复验 → （可选）换软链。
 
@@ -294,6 +389,11 @@ def install(
     asset = asset_name(version)
     dest = bin_dir / f"frps-{version}"
     frpc_dest = bin_dir / f"frpc-{version}"
+
+    def _report(phase: str, received: int = 0, total: int | None = None) -> None:
+        """阶段进度回调（Web 版本管理用；CLI 不传 = 零开销）。"""
+        if on_progress is not None:
+            on_progress(phase, received, total)
 
     place_frps = force or not dest.exists()
     place_frpc = with_frpc and (force or not frpc_dest.exists())
@@ -324,6 +424,7 @@ def install(
     #    把它丢掉——既慢，又让 `--insecure` 的判断发生在下载之后，读起来像
     #    "下载完了才发现不该装"。
     expected: str | None = None
+    _report("checksum")
     try:
         expected = expected_sha256(download_checksums(version, mirrors), asset)
     except BinaryError:
@@ -333,15 +434,23 @@ def install(
         raise ChecksumUnavailable(version)
 
     # 2) 下载（frps 与 frpc 同一个资产，因此只下一次）
-    blob = download(asset, version, mirrors)
+    _report("download")
+    blob = download(
+        asset,
+        version,
+        mirrors,
+        on_progress=lambda received, total: _report("download", received, total),
+    )
 
     # 3) 强校验——不通过绝不落盘
+    _report("verify")
     actual = hashlib.sha256(blob).hexdigest()
     if expected is not None and actual != expected:
         raise ChecksumMismatch(asset, expected, actual)
 
     # 4) 解包 → 先落到临时文件，复验通过后才原子就位
     if place_frps:
+        _report("place")
         _place_binary(blob, member="frps", dest=dest)
 
     # 4b) 可按需附带 frpc（供插件契约测试使用）。它与 frps 的落盘判定互相独立，
@@ -356,6 +465,7 @@ def install(
     # 5) 切换（不影响运行中的进程）。`--only-download` 时 place_frps 只由 force 决定，
     #    此时不该动链，因此这里再判一次 switch。
     if switch and place_frps:
+        _report("switch")
         switch_symlink(bin_dir / "frps", dest)
     return InstallResult(
         version=version,
