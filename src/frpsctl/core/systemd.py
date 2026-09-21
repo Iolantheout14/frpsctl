@@ -156,7 +156,7 @@ class ServiceIdentity:
 #: 插件是全部客户端登录的单点且 fail-closed，它挂掉 = 所有人登录不了）。
 PLUGIN_UNIT_TEMPLATE = """\
 [Unit]
-Description=frpsctl server plugin (%i)
+Description=frpsctl plugin serve (%i)
 After=network-online.target
 Wants=network-online.target
 
@@ -187,7 +187,7 @@ WantedBy=multi-user.target
 #: 口令从 `--password-file`（0600）读取，绝不写进 unit 命令行（unit 文件 0644）。
 WEB_UNIT_TEMPLATE = """\
 [Unit]
-Description=frpsctl web console (%i)
+Description=frpsctl web serve (%i)
 After=network-online.target
 Wants=network-online.target
 

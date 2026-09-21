@@ -82,7 +82,7 @@ class _AnywhereGroup(typer.core.TyperGroup):
 
 app = typer.Typer(
     # 开启 shell 补全（`--install-completion` / `--show-completion`）。
-    # 关闭它会让 `frpsctl conf<TAB>` 这类日常操作永远不可用——没有理由关。
+    # 关闭它会让 `frpsctl config<TAB>` 这类日常操作永远不可用——没有理由关。
     add_completion=True,
     # 关掉 Click 的自动帮助：缺子命令属于**用法错误**，应当走退出码 2（§7.3），
     # 而不是打印帮助后退出 0 —— 那会让脚本误判为成功。
