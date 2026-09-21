@@ -278,6 +278,10 @@ def _print_status(app_ctx: AppContext, *, compact: bool = False, lc=None) -> Non
         ui.warn(
             f"⚠ systemd 探测失败（所有权暂按 state.json 降级判定）：{report.systemd_probe_error}"
         )
+    if report.config_pending_restart:
+        ui.warn(
+            "⚠ 配置文件已被修改但尚未生效（frps 没有热重载）：运行 `frpsctl restart` 使其生效"
+        )
     ui.emit(f"instance : {report.instance:<18} owner : {report.owner.value}")
     if report.systemd_unit:
         ui.emit(f"unit     : {report.systemd_unit} (MainPID {report.systemd_main_pid})")

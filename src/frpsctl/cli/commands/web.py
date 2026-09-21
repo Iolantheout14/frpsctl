@@ -11,6 +11,7 @@ from ...core import auditlog
 from ...core import config as cfg
 from ...core import web_audit
 from ...core import healthcheck
+from ...core import serve_guard
 from ...core import serve_runtime
 from ...core.systemd import WebService, ensure_service_account, read_template_user
 from ...web import WebServer, WebSettings, build_web_context, generate_password
@@ -159,7 +160,7 @@ def web_service_install(
             hint="如确需远程访问，请加 --allow-non-loopback（并建议反向代理 + TLS）",
         )
     service = WebService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
     # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
     exec_start = runtime._frpsctl_executable()
@@ -220,7 +221,7 @@ def web_service_start(
     """启动 Web 管理台（systemd，需要 root）。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = WebService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     service.start()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "started": True})
@@ -252,7 +253,7 @@ def web_service_restart(
     """重启 Web 管理台（systemd，需要 root）——口令轮换等改动重启后生效。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = WebService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.WEB_SPEC)
     service.restart()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "restarted": True})
@@ -561,7 +562,7 @@ def _start_direct(
     返回 `(state, 口令文件, 生成的明文或 None, 口令说明, url)`。
     """
     inst = app_ctx.instance
-    runtime._guard_against_systemd(inst, serve_runtime.WEB_SPEC)
+    serve_guard.guard_against_systemd(inst, serve_runtime.WEB_SPEC)
 
     last, error = serve_runtime.read_state(inst, serve_runtime.WEB_SPEC)
     if error is not None:
@@ -591,23 +592,16 @@ def _start_direct(
         # 文件）——否则 restart 会静默回落默认实例文件（v0.3.3 review 补正）。
         password_file = Path(str(old["password_file"]))
     pw_file, generated, pw_note = _background_password(inst, password, password_file)
-    argv = [
-        str(runtime._frpsctl_executable()),
-        "web",
-        "serve",
-        "--bind",
-        resolved_bind,
-        "--password-file",
-        str(pw_file),
-    ]
-    if flags["allow_non_loopback"]:
-        argv.append("--allow-non-loopback")
-    if flags["trusted_proxy"]:
-        argv.append("--trusted-proxy")
-    if flags["access_log"]:
-        argv.append("--access-log")
-    if flags["metrics"]:
-        argv.append("--metrics")
+    argv = serve_runtime.build_serve_argv(
+        runtime._frpsctl_executable(),
+        subcommand="web",
+        bind=resolved_bind,
+        password_file=pw_file,
+        allow_non_loopback=flags["allow_non_loopback"],
+        trusted_proxy=flags["trusted_proxy"],
+        access_log=flags["access_log"],
+        metrics=flags["metrics"],
+    )
     args = {"bind": resolved_bind, "password_file": str(pw_file), **flags}
     host, port = healthcheck.parse_bind(resolved_bind, default_port=8787)
     state = serve_runtime.start_background(

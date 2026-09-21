@@ -28,6 +28,14 @@ from ... import report as report_mod
 from .lifecycle import _status_payload
 
 
+def _warn_truncated(noun: str, page, count: int) -> None:
+    """截断告警的统一文案（区分"服务端声明总数"与"总数未知"两种诚实表达）。"""
+    if page.total_known:
+        ui.warn(f"⚠ {noun}列表被截断：服务端声明共 {page.total} 条，仅取回 {count} 条")
+    else:
+        ui.warn(f"⚠ {noun}列表可能被截断：已取回 {count} 条（服务端未提供总数，翻页上限用尽）")
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -105,13 +113,18 @@ def clients(
     items = page.items
 
     if app_ctx.json:
-        ui.emit_json({"clients": items, "total": page.total, "truncated": page.truncated})
+        ui.emit_json({
+            "clients": items,
+            "total": page.total,
+            "truncated": page.truncated,
+            "total_known": page.total_known,
+        })
         return
     if not items:
         ui.emit("没有在线客户端")
         return
     if page.truncated:
-        ui.warn(f"⚠ 客户端列表被截断：服务端声明共 {page.total} 条，仅取回 {len(items)} 条")
+        _warn_truncated("客户端", page, len(items))
     ui.emit(f"{'name':<28} {'user':<10} {'hostname':<20} {'online':<7} {'ip':<16} version")
     for item in items:
         ui.emit(
@@ -119,7 +132,7 @@ def clients(
             f"{_text(item.get('hostname')):<20} {str(bool(item.get('online'))):<7} "
             f"{_text(item.get('clientIP')):<16} {_text(item.get('version'))}"
         )
-    ui.emit(f"共 {page.total} 条")
+    ui.emit(f"共 {page.total} 条" if page.total_known else f"至少 {page.total} 条（服务端未提供总数）")
 
 
 @app.command()
@@ -166,6 +179,7 @@ def proxies(
                 ],
                 "total": page.total,
                 "truncated": page.truncated,
+                "total_known": page.total_known,
             }
         )
         return
@@ -173,7 +187,7 @@ def proxies(
         ui.emit("没有代理")
         return
     if page.truncated:
-        ui.warn(f"⚠ 代理列表被截断：服务端声明共 {page.total} 条，仅取回 {len(page.items)} 条")
+        _warn_truncated("代理", page, len(page.items))
     header = (
         f"{'name':<28} {'user':<10} {'type':<7} {'port':<6} "
         f"{'phase':<8} {'up':<8} {'conns':<6} traffic(in/out)"

@@ -9,6 +9,7 @@ from pathlib import Path
 import typer
 from ...core import config as cfg
 from ...core import healthcheck
+from ...core import serve_guard
 from ...core import serve_runtime
 from ...core.auditlog import (
     DEFAULT_AUDIT_FILE,
@@ -801,7 +802,7 @@ def plugin_service_install(
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     policy_path, _ = runtime._load_policy(app_ctx, policy)  # 不存在/非法 JSON 在这里就会拒绝
     service = PluginService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     # 先定位 frpsctl 可执行文件（unit 的 ExecStart），再解析/创建账户——
     # 避免"账户已建、安装却因 ExecStart 路径不可用失败"（review 收口）。
     exec_start = runtime._frpsctl_executable()
@@ -860,7 +861,7 @@ def plugin_service_start(
     """
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     service.start()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "started": True})
@@ -895,7 +896,7 @@ def plugin_service_restart(
     """重启插件服务（systemd，需要 root）——改完策略后让它载入新配置的常用动作。"""
     app_ctx = runtime._ctx(ctx).with_json(json_output)
     service = PluginService(app_ctx.instance)
-    runtime._guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
+    serve_guard.guard_against_direct(app_ctx.instance, serve_runtime.PLUGIN_SPEC)
     service.restart()
     if app_ctx.json:
         ui.emit_json({"unit": service.unit_name, "restarted": True})
@@ -961,7 +962,7 @@ def _start_direct_plugin(
     review 修复）。
     """
     inst = app_ctx.instance
-    runtime._guard_against_systemd(inst, serve_runtime.PLUGIN_SPEC)
+    serve_guard.guard_against_systemd(inst, serve_runtime.PLUGIN_SPEC)
 
     last, error = serve_runtime.read_state(inst, serve_runtime.PLUGIN_SPEC)
     if error is not None:
@@ -972,6 +973,10 @@ def _start_direct_plugin(
     if resolved_policy is None and old.get("policy"):
         resolved_policy = Path(str(old["policy"]))
     policy_file, loaded = runtime._load_policy(app_ctx, resolved_policy)
+    # 绝对化后写入 state：相对路径（`--policy ./p.json`）原样记录会在
+    # **不同 CWD** 的 restart（CLI 换目录 / Web 进程）解析到错误位置
+    # （最后一轮 review 复审发现）
+    policy_file = policy_file.resolve()
 
     resolved_bind = str(bind if bind is not None else old.get("bind") or "127.0.0.1:8080")
     resolved_path = str(
@@ -986,19 +991,14 @@ def _start_direct_plugin(
             hint="任何能访问该端口的人都能伪造 Login/NewProxy 事件；请绑 127.0.0.1",
         )
 
-    argv = [
-        str(runtime._frpsctl_executable()),
-        "plugin",
-        "serve",
-        "--policy",
-        str(policy_file),
-        "--bind",
-        resolved_bind,
-        "--path",
-        resolved_path,
-    ]
-    if resolved_access:
-        argv.append("--access-log")
+    argv = serve_runtime.build_serve_argv(
+        runtime._frpsctl_executable(),
+        subcommand="plugin",
+        bind=resolved_bind,
+        policy=policy_file,
+        handler_path=resolved_path,
+        access_log=resolved_access,
+    )
     args = {
         "policy": str(policy_file),
         "bind": resolved_bind,
