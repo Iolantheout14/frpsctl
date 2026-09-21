@@ -37,14 +37,19 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: 前端模块（ESM 语法 + 纯逻辑真单测）
         run: |
           # v0.3.4：前端从单文件拆为 ESM 多模块——逐模块语法检查 +
           # node --test 直接 import 生产模块跑纯逻辑断言（tests/frontend/）。
-          find src/frpsctl/web/static/js -name "*.js" -print0 \
-            | xargs -0 -n1 node --input-type=module --check
+          # ⚠️ `--input-type` 只能配 stdin/eval（不能带文件参数）；`js/package.json`
+          # 的 `"type": "module"` 让 Node 把该目录的 .js 当 ESM（--test 的
+          # import 也依赖它）。两者都是 CI 绿的必要条件（发布后 CI 红的教训）。
+          find src/frpsctl/web/static/js -name "*.js" -print0 |
+            while IFS= read -r -d '' file; do
+              node --input-type=module --check < "$file" || exit 1
+            done
           node --test tests/frontend/*.test.mjs
 
       - name: 拉取真实 frps + frpc（契约层用）

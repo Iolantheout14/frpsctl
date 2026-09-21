@@ -307,6 +307,17 @@ class TestStaticLayout:
                 continue
             assert path.suffix in _ALLOWED_STATIC_SUFFIXES, f"静态目录出现意外文件：{path}"
 
+    def test_js_dir_is_declared_as_esm(self) -> None:
+        """`js/package.json` 的 `"type": "module"` 是 Node 侧（CI 的 --check/--test）
+        把 `.js` 当 ESM 解析的必要条件——删掉它 CI 立刻红（发布后发现并修复
+        的教训）。浏览器不请求它（静态路由白名单拒绝 .json），因此对部署无影响。
+        """
+        import json as _json
+
+        manifest = STATIC_DIR / "js" / "package.json"
+        assert manifest.is_file(), "缺少 js/package.json（Node 将按 CJS 解析 .js）"
+        assert _json.loads(manifest.read_text("utf-8"))["type"] == "module"
+
     def test_every_css_and_module_is_referenced_or_imported(self) -> None:
         """CSS 必须被 index 引用；JS 模块必须被 import（防漏挂）。"""
         html = _index_html()

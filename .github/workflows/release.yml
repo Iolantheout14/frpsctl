@@ -82,6 +82,7 @@ jobs:
               "frpsctl/web/static/css/components.css",
               "frpsctl/web/static/css/charts.css",
               "frpsctl/web/static/css/views.css",
+              "frpsctl/web/static/js/package.json",
               "frpsctl/web/static/js/main.js",
               "frpsctl/web/static/js/api.js",
               "frpsctl/web/static/js/state.js",
