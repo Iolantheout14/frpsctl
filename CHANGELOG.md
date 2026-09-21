@@ -3,6 +3,126 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.4] - 2026-09-21
+
+**Web 管理台结构性重构：单文件 → ESM 同源多模块 + 赛博朋克设计系统 + 八项新功能**。
+前端从 1865 行单文件拆为 26 个模块（零构建链——ESM 是浏览器原生能力），
+新增服务视图 / 版本管理（后台安装任务）/ 命令面板 / 详情抽屉等能力；
+CLI 与 Web 的共享逻辑第三次下沉（互斥守卫与 serve argv 进 core）。
+新增 71 条 Python 测试（全量 869 → 940；非契约 839 → 910）与 26 条前端模块单测
+（`node --test` 直接 import 生产模块），新增 10 个 API 端点（契约零破坏：命令面/
+选项/退出码/既有 JSON 字段不变）。
+
+### 新增
+
+- **前端模块化（零构建链）**：`index.html`（shell，11.9KB）+ 5 个 CSS +
+  26 个 ESM 模块（`js/lib` 纯逻辑 / `js/ui` 组件 / `js/views` 视图）；
+  新增静态资源路由 `/static/*`（白名单扩展名 + 防穿越 + ETag 条件请求 +
+  `no-cache`——不做 immutable/版本串，避免升级后混用旧模块）。
+  CSP 保持 **nonce-only**（外链 script/link 同样带每请求 nonce 注入）。
+- **赛博朋克设计系统**：赛博暗为默认（网格底纹 + 扫描线 + 青/品红霓虹描边 +
+  HUD 四角刻度 + 切角装饰 + 等宽数据 + 品牌 glitch），亮色为"白昼 HUD"
+  降饱和映射；双主题令牌全量对齐（守卫强制）。
+- **服务视图（新页）**：frps / Web 管理台 / 服务端插件的托管状态一屏可见；
+  插件 `start|stop|restart` 可在页面操作（systemd 优先、direct 次之）；
+  Web 管理台自身只读（启停会断开当前会话，给 CLI 提示）。
+- **版本管理（新页）**：运行中/磁盘版本与一致性、最低与建议版本；
+  表单提交安装任务（后台线程执行：下载进度 / 校验 / 落盘 / 换链），
+  1 秒轮询进度；"重启使新版本生效"一键入口。
+  Web 不暴露 `--insecure/--mirror`（始终强校验 + 默认镜像）。
+- **后台任务模型**（`web/tasks.py`）：单飞行（同时只允许一个安装）+ 有界
+  （最近 8 条）+ clock 可注入；安装经 `core.release` 的
+  `bin/.install.lock`（CLI 与 Web 共用一把锁，杜绝并发换链）。
+- **命令面板（Ctrl+K）**：视图切换 / 实例动作 / 主题切换 / 复制实例名的
+  统一入口（↑↓ 选择、Enter 执行、Esc 关闭）。
+- **详情抽屉**：客户端与代理行 → 侧滑抽屉（v2 详情端点透传：
+  `/api/clients/{key}`、`/api/proxies/{name}`）。
+- **代理类型分布环图 + 今日流量 Top 5 排行**（颜色走 CSS 类，主题即时生效）；
+  **Hero 增强**：会话入站/出站累计与**速率峰值/均值**（来自本地采样基线）。
+- **审计时间窗**：`?since=1h/24h/7d`（与 CLI `--since` 同一解析器），
+  插件与 Web 两个 scope 都支持；非法值 400。
+- **诊断导出**（`/api/diagnostics`）：状态 + 体检 + **打码后**配置 + 日志尾部
+  200 行的文本附件（日志不脱敏，页面与文档都提示自行检查）。
+- **增量日志**：`/api/logs?since=<offset>` 只返回新增完整行（不再每 5 秒
+  整段重传与重渲染）；轮转/截断返回 `reset=true`；前端 DOM 节点有界（4000）。
+- **配置"待重启"提示**（CLI + Web）：配置文件 mtime > 进程启动时刻的只读
+  推导（`--no-restart`、手工编辑、外部工具都会命中）——CLI `status` 告警、
+  Web 横幅 + 一键重启。
+- **`allowPorts` 结构化编辑器**：`single`/`start-end` 表格行编辑（含即时
+  校验与"+"增行），序列化为 TOML 内联数组后走同一条预览/应用事务。
+
+### 变更
+
+- **共享逻辑下沉 core（第三次）**：`core/serve_guard.py`（systemd ↔ direct
+  双向互斥——Web 的插件启停此前会绕过 CLI 层守卫）、
+  `serve_runtime.build_serve_argv()`（web/plugin 后台命令行的单点，
+  含跨服务选项白名单校验）、`serve_runtime.frpsctl_executable()`
+  （CLI 与 Web 共用的可执行文件定位）。
+- `install()`（core.release）新增 `on_progress` 回调（阶段：checksum /
+  download / verify / place / switch；回调存在时改走 urllib 分块下载以取得
+  结构化进度）与 `bin/.install.lock` 互斥。
+- 前端行为测试升级：`tests/frontend/*.test.mjs` 用 `node --test`
+  **直接 import 生产模块**断言纯逻辑（format / table / audit-format /
+  chart-math / port-ranges，24 条）——取代"从单文件抽取源码再 eval"的旧法；
+  CI 增加显式 `setup-node` 与前端模块语法检查。
+- README 已知边界改写：单文件 → "同源多文件 + 零外部域 + 零构建链"。
+
+### 修复
+
+- **`PageResult` 静默截断**（v0.3.1 遗留）：v2 信封缺 `total` 时旧实现把
+  `total = len(items)` → 只取第一页且 `truncated=False`；现在缺 total 时
+  按"页是否满"续拉，翻页上限用尽如实标记 `truncated` 且新增
+  `total_known=False`（CLI 说"至少 N 条"、Web 列表同口径）。
+- **`clear_offline_proxies` 裸 httpx 异常**：唯一未收口的请求路径——
+  网络错误此前冒到 CLI/Web 变"未分类错误(1)"，现在收口 `AdminUnreachable(7)`。
+- **`is_locked` 假阴性**：锁文件存在但当前用户读不到（root 建的 0600）时
+  旧实现静默判 `False` → doctor 漏报并发操作；改为三态
+  （True/False/**None**），doctor 对 None 报 INFO（降级可见）。
+- **Web 审计的凭据防线**：`params` 落盘前经标量白名单 + 敏感键打码
+  （`config.is_secret_key` 判据）+ 长度截断；审计文件显式 `0600`
+  （此前权限跟随 umask，配置/快照/口令文件都是显式 0600）。
+- **插件审计文件权限**：写入后同样显式 `0600`。
+- **代理类型 3 环图的颜色**：改用 CSS 类驱动（SVG `fill` 属性会被同选择器
+  CSS 覆盖——与 v0.3.3 柱状图渐变静默失效同一根因，柱状图一并改为
+  CSS 引用的 `url(#渐变)`）。
+- **`theme-anim` 死样式接通**：v0.3.3 定义的"主题切换过渡"类从未被 JS
+  激活（声称实现但实际不生效），现在 `applyTheme` 添加并 300ms 后移除。
+- **会话流量基线永不生效**（交付前对账发现）：`samples.length === 0` 判断——
+  采样持久化在 localStorage，**刷新页面后基线永不设置、Hero 的会话入站/出站
+  永远显示 "-"**；改为"本次页面加载的第一次采样"（内存态，语义即"本次会话"）。
+- **亮色主题次要文本对比度不足**（交付前对账实测）：`--muted` 在浅卡片上仅
+  **4.23:1**（低于 WCAG AA 的 4.5）→ 调深到 `#4b647c`（实测 5.1+）；新增
+  `TestContrast` 对双主题的主文本（≥7）/次要文本（≥4.5）/状态色（≥3）做
+  WCAG 2.1 **实测**守卫（此前只有"声称 ≥ AA"）。
+
+### 发布前全量回归 review（14 项修复，7 项真实缺陷）
+
+全部 diff 逐行审查 + 对抗性实测 + 反向验证，修复：systemd 托管下"配置待重启"
+永不提示（判据依赖 systemd 分支为 None 的 uptime 字段 → 改为进程启动时刻直判）；
+任务提交的"单飞行检查→插入"竞态（移入同一把锁）；Web 插件 restart 不读旧参数
+里的自定义 `--policy` 路径（会静默换策略 → 旧参数优先 + 与 `plugin check` 同
+判据）；Web 日志读取失败把错误文本写进日志体（永久污染 DOM → toast + 重置
+offset）；`allowPorts` 编辑器在表单重建时静默丢弃未预览编辑（草稿文本优先 +
+新增 `parsePortText`）；详情端点 404 语义、任务失败审计、淘汰跳过运行中、
+诊断导出 filename 消毒、日志 offset 边界等。审查同时确认三处"看似可疑但
+安全"的项（UTF-8 截断边界、total 虚高的截断语义、运行中淘汰不可达性），
+并诚实记录一处测试局限（GIL 下窄窗口竞态无法可靠复现，原子性由代码审查
+保证）。最后一轮复审再补 3 项（含 1 项修复引入的 TypeError 逃逸路径、相对
+policy 路径的跨 CWD 解析、结构化编辑器草稿清除基准），并完成发布产物验证
+（干净 venv 安装 wheel：26/26 前端模块与全部新 API 可用）。最终全量
+940 passed / 覆盖率 85.89% / `node --test` 26。
+
+### 测试
+
+- Python 新增 71 条（全量 869 → 940；非契约 839 → 910）：增量日志 8、锁三态 2、
+  审计参数与权限 2、守卫下沉 2、argv 单点 3、安装锁与进度 2、翻页无 total 3、
+  服务/版本/任务/详情/审计 since/增量日志/诊断导出 17、静态路由 4。
+- 前端新增 26 条（`tests/frontend/*.test.mjs`：25 条纯逻辑真 import + 1 条**模块加载冒烟**——顶层 DOM 访问与循环依赖在 CI 直接暴露）；
+  守卫重写为多模块版（模块语法 / **import 图（路径存在 + 符号有导出 +
+  无孤儿模块）** / 纪律 / CSS 双向 / id 双向 / 静态布局）。
+- 既有测试同步：报告形状 +`config_pending_restart`、`fake_download` 接受
+  `on_progress`。
+
 ## [0.3.3] - 2026-09-20
 
 **后台服务与 Web 体验（systemd 之外的第二种托管形态 + 管理台视觉/交互大改）**。

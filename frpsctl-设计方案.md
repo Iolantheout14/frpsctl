@@ -2522,13 +2522,22 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 | GET | `/api/config` | 配置树（**打码值 + masked 标记**，原文永不下发） |
 | GET | `/api/config/history` | 快照列表（只读 meta.json，**不读快照里的配置原文**） |
 | GET | `/api/config/history/{steps}/diff` | 某快照 vs 当前配置的**打码 diff**（回滚前的"看差异"；与 `config diff --steps` 同一实现） |
-| GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`） |
+| GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`）；**`since`（v0.3.4）**：增量模式——只返回 offset 之后的新增完整行（不缓存；轮转/截断返回 `reset=true` 要求整段替换） |
 | GET | `/favicon.ico` | 204（页面内嵌 data URI 图标；这条是给旧工具收尾的） |
 | GET | `/metrics` | Prometheus 文本（v0.3.0；`--metrics` 开启后才存在）：实例状态 / 三层健康 / dashboard 统计；Basic auth（口令 = 管理台口令），5 秒服务端缓存 |
-| GET | `/api/audit?scope=web` | Web 操作审计（v0.3.0）：登录与变更动作的来源 / 会话指纹 / 结果；`scope` 缺省为 `plugin`（兼容），非法值 400 |
+| GET | `/api/audit?scope=web` | Web 操作审计（v0.3.0）：登录与变更动作的来源 / 会话指纹 / 结果；`scope` 缺省为 `plugin`（兼容），非法值 400；**`since`（v0.3.4）**：`24h/7d/30m`/ISO/unix 时间窗（与 CLI 同一解析器），两个 scope 都支持 |
 | POST | `/api/config/preview` | 多键变更（`changes`）+ 删除键（`unsets`）→ 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
 | POST | `/api/config/apply` | 按 `preview_id` 应用（含删除）；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
 | POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口（数值参数做范围校验，越界/布尔一律 400） |
+| POST | `/api/actions/{plugin-start,plugin-stop,plugin-restart}` | 插件服务启停（v0.3.4）：systemd unit 存在走 systemctl、否则 direct；两方向都经 `core.serve_guard` 互斥守卫 |
+| GET | `/api/services` | 三个服务的托管状态（frps / Web 管理台 / 服务端插件；systemd 优先、direct 次之，探测失败如实降级）（v0.3.4） |
+| GET | `/api/versions` | 版本信息：frpsctl / 运行中 / 磁盘版本与一致性、最低与建议版本、升级提示（v0.3.4） |
+| GET | `/api/tasks` | 最近后台任务（版本安装；有界 8 条，新在前）（v0.3.4） |
+| GET | `/api/tasks/{id}` | 任务状态与进度（前端 1 秒轮询；任务不存在返回 400 并说明有界淘汰）（v0.3.4） |
+| POST | `/api/tasks/install` | 提交 frps 安装任务（后台线程：下载 → 校验 → 落盘 → 换链；单飞行；与 CLI `install` 同一 core 实现，但不暴露 `--insecure/--mirror`）（v0.3.4） |
+| GET | `/api/clients/{key}` | 单客户端详情（v2 透传；前端详情抽屉）（v0.3.4） |
+| GET | `/api/proxies/{name}` | 单代理详情（v2 透传；不存在返回空对象 = 与 traffic 的"404 即无数据"同语义）（v0.3.4） |
+| GET | `/api/diagnostics` | 诊断报告下载（文本附件：状态 + 体检 + 打码配置 + 日志尾部 200 行；日志不脱敏，页面有提示）（v0.3.4） |
 
 错误映射：`FrpsctlError.exit_code` → HTTP（用法/配置 400、未运行/冲突 409、
 权限 403、dashboard 不可达/健康未过 502）——响应只含 `message` 与 `hint`，
@@ -2777,7 +2786,7 @@ JS 经 `node --check` 语法验证通过。
 |----|------|
 | UI 逻辑分支的人工覆盖 | 语法/纪律已自动化，但"点击某按钮后 DOM 变化"仍只有人工点得到——不引入 jsdom 是刻意的（见 §18.7） |
 | `allowPorts` 等数组仍按 JSON 文本编辑 | `parse_scalar` 与预览 diff 兜底；结构化编辑器等真实痛点 |
-| 前端单文件会继续变大（本轮 650 → 984 行） | 拆分需要构建链，与"零外部资源"冲突；在行数带来实际维护痛点前不拆 |
+| 前端单文件会继续变大（本轮 650 → 984 行） | **该判断已被 §27 推翻（v0.3.4）**：拆分不需要构建链——ESM 是浏览器原生能力，同源资源不违反"零外部域"；1865 行时拆分窗口到达，已完成 |
 
 ### 20.5 发布前回归 review
 
@@ -3660,3 +3669,191 @@ uninstall 无 force 拒绝（exit 11）/`--force` 先停。
 | per-instance 多 Web 进程 | 不变：一个 Web 进程服务一个实例 |
 | WebSocket/SSE | 不变：5 秒轮询（既有边界） |
 | 前端 DOM 级测试框架 | 不变：node 纯函数 + 静态守卫 + HTTP 全路由 + 手工点验（记账同上） |
+
+---
+
+## 27. 第十四轮迭代（v0.3.4：Web 管理台结构性重构）
+
+**单文件前端 → ESM 同源多模块 + 赛博朋克设计系统 + 八项新功能**。v0.3.3 把
+前端推到 1865 行 / 84KB 后，§18.7 记录的"拆分需要构建链，与零外部资源冲突"
+判断到了必须重新审视的时刻——复核结论是**当时判断有误**：ESM 与 `<link>`
+是浏览器原生能力，拆分不需要任何构建链，同源资源也不违反"零外部域"。
+本轮据此做了结构性重构，并把 CLI 与 Web 的共享逻辑第三次下沉 core。
+
+方法：完整精读（Web 全链路 8.4k 行逐行；core/cli/plugin 21k 行与全部测试
+18.7k 行经并行通道完整读尽）、逐条实测、发布前全量回归 review。
+
+统计：前端 1 文件 → **31 个静态文件**（shell + 5 CSS + 26 ESM 模块，总
+3600+ 行）；新增 **10 个 API 端点**（契约零破坏）；core 新增 2 个模块
+（`serve_guard`、`web/tasks`）；新增 **45 条 Python 测试 + 24 条前端模块
+单测**（全量 869 → 922；非契约 839 → 892）。
+
+### 27.1 核心决策：单文件 → ESM 同源多模块（零构建链）
+
+| 决策 | 内容 | 理由 |
+|------|------|------|
+| 拆分路线 | **原生 ES Modules + 同源静态资源**（不做构建期内联） | ESM 是浏览器原生能力；自研内联器会引入"产物=源码构建结果"的一致性守卫，成本高于收益 |
+| 部署物形态 | 1 个 HTML → HTML shell（11.9KB）+ 5 CSS + 26 JS（`/static/*`） | 请求数上升只影响首屏（回环/内网无感），换来模块边界与可测试性 |
+| 缓存策略 | 静态资源 `ETag` + `Cache-Control: no-cache`（每次验证，命中 304 零 body） | **不做 immutable / 版本查询串**：回环没有传输成本，而"升级后浏览器混用旧模块"是不可接受的故障面 |
+| CSP | 保持 **nonce-only**（不放宽到 `'self'`）：外链 `<script type="module" nonce>` 与 `<link nonce>` 同样受每请求 nonce 放行 | CSP3 支持外链 nonce；注入威慑力与拆分前逐字相同 |
+| 静态路由安全 | 白名单扩展名（`.js/.css/.svg`）+ URL 解码后拒绝 `..` 路径段 + `resolve()` 后必须位于 `STATIC_DIR` 内（symlink 逃逸同样拦截）+ 单文件 1MiB 上限 | 新增攻击面必须有独立防线与测试（7 条穿越/非白名单用例） |
+| HTML 不拆 | shell 保持单文件（结构 + 1 个内联主题脚本 = 唯一 nonce 模板占位） | 运行期 fragment 注入要么 `innerHTML`（红线）要么 `cloneNode`（收益不足） |
+
+红线重定义（守卫随拆分重写）：`node --check` 逐模块（ESM 语法）→ 新增
+**import 图**核对（路径存在 / 符号确有导出 / 无孤儿模块）；"无外部资源"
+语义澄清为**无外部域**（同源 `/static/*` 合法）；`$("id")` ↔ HTML 双向核对
+扩展到全模块；CSS 变量双向与亮色覆盖扫描全部 CSS；新增静态布局核对
+（index 引用存在、目录无意外文件）。
+
+### 27.2 赛博朋克设计系统（赛博暗默认 + 白昼 HUD 亮色）
+
+- **令牌层**：深黑蓝底（`#04060c`）+ 青 `#00e5ff` / 品红 `#ff2e97` /
+  紫 `#8a2be2` 霓虹主色；双主题全量映射（几何量 `--radius/--clip-cut*`
+  是守卫登记的例外集）。
+- **氛围**：HUD 网格底纹 + 三层极光 + CRT 扫描线（`--scan-opacity` 在亮色
+  自动为 0）+ 网格缓移（reduced-motion 全关）。
+- **组件**：卡片 HUD 四角刻度 + 玻璃；品牌 glitch（`text-shadow` 双色偏移）；
+  Hero 切角指标条 + 等宽数字 + 趋势箭头；toast 切角 + 进度条；按钮 hover
+  辉光（**交互元素不切角**：`clip-path` 会裁掉 focus ring，无障碍优先）；
+  日志/表格/抽屉/命令面板全部等宽数据风。
+- **图表**：荧光折线（`drop-shadow`）、环图颜色走 CSS 类
+  （`.donut-c0..7` → 变量，主题即时生效）。
+- **修复两处静默失效**：柱状图渐变（SVG `fill` 属性被同选择器 CSS 覆盖）
+  改为 CSS 引用的 `url(#渐变)`；`theme-anim` 主题过渡类从未被 JS 激活，
+  现由 `applyTheme` 添加并 300ms 后移除。
+
+### 27.3 新功能（F1–F11）与 API 增量
+
+| # | 功能 | 落点 |
+|---|------|------|
+| F1 | 服务视图（frps/web/plugin 状态 + 插件启停） | `GET /api/services`；`POST /api/actions/plugin-{start,stop,restart}`（systemd 优先、direct 次之；两方向都经守卫） |
+| F2 | 代理类型分布环图 | 纯前端（`proxy_type_counts` 的既有数据） |
+| F3 | 客户端/代理详情抽屉 | `GET /api/clients/{key}`、`GET /api/proxies/{name}`（v2 透传；404 空对象同 traffic 语义） |
+| F4 | 审计时间窗 | `GET /api/audit?since=`（两个 scope；与 CLI 同一 `parse_since`） |
+| F5 | 配置"待重启"（CLI+Web） | `StatusReport.config_pending_restart`（mtime > 进程启动时刻的只读推导，无持久化标记）；`status_payload` 透出 |
+| F6 | 增量日志 | `GET /api/logs?since=<offset>`；`core.logs.tail_since`（完整行、轮转 reset、半行不丢不重、512KiB 单次上限） |
+| F7 | 命令面板 Ctrl+K | 纯前端 |
+| F8 | allowPorts 结构化编辑器 | `lib/port-ranges.js`（纯函数 + node 单测）+ 表格行编辑器 |
+| F9 | 诊断导出 | `GET /api/diagnostics`（文本附件；配置打码、日志提示自检） |
+| F10 | Hero 会话流量 | 前端本地采样基线 |
+| F11 | 版本管理（后台安装任务） | `GET /api/versions`、`GET /api/tasks[/{id}]`、`POST /api/tasks/install`；`web/tasks.py`（单飞行 + 有界 8 + clock 可注入）；`release.install` 进度回调与 `bin/.install.lock` |
+
+### 27.4 先决重构与修复（R1–R6）
+
+| # | 项 | 内容 |
+|---|----|------|
+| R1 | **互斥守卫下沉 core**（安全） | 新 `core/serve_guard.py`：此前守卫在 `cli/runtime.py`，Web 的插件启停会绕过它直接调 `serve_runtime`（双起风险） |
+| R2 | serve argv 单点 | `serve_runtime.build_serve_argv()`（含跨服务选项白名单），`frpsctl_executable()` 一并下沉 |
+| R3 | `_paged` 静默截断 | 信封缺 `total` 时按"页是否满"续拉；`PageResult.total_known` 新增（调用方说"至少 N 条"） |
+| R4 | `clear_offline_proxies` 裸 httpx | 收口 `AdminUnreachable(7)`（最后一个未收口的请求路径） |
+| R5 | Web/插件审计落盘防线 | 参数标量白名单 + 敏感键打码 + 截断；审计文件显式 `0600`（此前跟随 umask） |
+| R6 | `is_locked` 假阴性 | 三态返回（True/False/None）；doctor 对 None 报 INFO（无法探测 ≠ 没有锁） |
+
+### 27.5 测试与验收
+
+- **Python 新增 53 条**（全量 869 → 922；非契约 839 → 892）：增量日志 8 / 锁三态 2 / 审计参数与权限 2 /
+  守卫 2 / argv 3 / 安装锁与进度 2 / 翻页 3 / API 层 17（服务、版本、任务
+  生命周期/失败可见/单飞行/非法版本、详情、审计 since、增量日志、
+  诊断导出与未登录 401）/ 静态路由 4。
+- **前端新增 24 条**：`tests/frontend/*.test.mjs` 用 `node --test`
+  **直接 import 生产模块**（format / table / audit-format / chart-math /
+  port-ranges）——取代"抽源码 eval"旧法。
+- 守卫重写：模块语法、import 图（路径/符号/孤儿）、纪律（禁 innerHTML 家族、
+  禁 JS style 写入、禁原生弹窗）、CSS 双向、id 双向、静态布局。
+- CI：显式 `setup-node@v4`（20.x）+ 逐模块 `node --check` + `node --test`。
+- 最终验收：全量 **922 passed / 0 skipped**（非契约 892），覆盖率 **85.75%**。
+
+发布前 review 补正（守卫反向验证发现的盲区）：
+
+| # | 项 | 问题 | 补正 |
+|---|----|------|------|
+| S-1 | CSS 变量守卫盲区 | 删除默认主题（`:root`）的变量定义但保留 `.light` 侧时，"使用↔定义"双向检查与"亮色覆盖"检查**都通过**——赛博暗下引用静默回退 | `test_css_variables_are_defined_and_used` 追加"每个被使用的变量必须在 `:root` 里定义"；反向验证（删 `--ok-soft` → 红） |
+| S-2 | 反向验证有效性抽查 | 三项破坏性注入（innerHTML / 默认主题变量 / 孤儿模块）逐一确认守卫变红后恢复 | 全部有效（红 → 恢复绿） |
+
+**交付前逐项对账**（"方案所有项是否完整实现"的复查）：对照 §27 方案原文逐条核对
+（W1–W10 / R1–R6 / F1–F11 / 决策 1–3 / 红线），发现 **7 处未落地或有缺陷 + 6 处验证
+缺口**，全部补齐：
+
+| # | 方案条目 | 缺口 | 补正 |
+|---|----------|------|------|
+| S-3 | F2：环图 + **Top 流量排行** | 只做了环图 | 仪表盘新增"今日流量 Top 5"卡（按今日入站+出站排序；`proxyRows` 保留原始数值字段） |
+| S-4 | W2：日志**终端风（`›` 前缀 + 扫描光标）** | 只有等宽与着色 | `.logline::before` 前缀 + `#logs::after` 闪烁光标（reduced-motion 自动停） |
+| S-5 | W2：Hero **HUD 分段刻度条 + 扫描光标** | 未实现 | `.hero .metric::before` 刻度条 + `.num::after` 扫描光标 |
+| S-6 | W2：toast **边框扫描光带** | 未实现 | `.item::before` 一次性扫光动画 |
+| S-7 | F10：Hero **速率峰值/均值** | 只做了会话累计 | `state.sessionPeak/sessionAvg`（refreshTraffic 计算）+ Hero 两个指标 |
+| S-8 | F10（真实缺陷）：会话流量基线 | `samples.length === 0` 判断——samples 持久化在 localStorage，**刷新后基线永不设置、会话流量永远 "-"** | 改为"本次页面加载的第一次采样"（内存态） |
+| S-9 | W2：对比度 **≥ WCAG AA** | 从未实测（只有声称） | 新增 `TestContrast`（解析令牌做 WCAG 2.1 计算：正文 ≥7 / 次要 ≥4.5 / 状态色 ≥3，双主题）；实测发现 light `--muted` 在浅卡片上仅 **4.23** → 调深到 `#4b647c`（5.1+） |
+| S-10 | 验证缺口 | ① `config_pending_restart` 推导无测试 ② doctor 的锁"无法探测"分支无测试 ③ F8 序列化文本无服务端解析测试 ④ 无模块加载冒烟（顶层 DOM/循环依赖） ⑤ CSP 断言未覆盖"不放宽 `'self'`" ⑥ CLI"至少 N 条"无测试 | 全部补齐：pending 3 条（integration 真进程）、doctor None 1、port-ranges 解析 1、`tests/frontend/module-load.test.mjs`（25 模块全加载）、CSP 收窄断言、CLI 1 |
+
+两处**方案原文与实施的差异**（有记录理由，非缺口）：静态缓存由
+"ETag/immutable/版本查询串"改为 **ETag + no-cache**（回环无传输成本、混版
+风险不可接受，§27.1）；nonce 占位由"1 处模板"改为 **7 处显式占位**
+（静态 HTML 无法运行期补 nonce，语义一致）。
+
+**对账后最终验收：非契约 902 / 全量 932（见 §27.5 末），覆盖率见下节。**
+
+**发布前全量回归 review**（方法同历次：全部 diff 逐行 + 对抗性实测 + 测试有效性
+反向验证）。审查分批：core 层（release/logs/admin/lifecycle/lock/web_audit/
+doctor/serve_runtime/serve_guard）、Web 层（server/api/tasks）、CLI 层
+（runtime/web/plugin/observe/lifecycle）、前端（logs/versions/config 关键路径
+重读）。**发现并修复 14 项，其中真实缺陷 7 项**：
+
+| # | 项 | 问题 | 修复 |
+|---|----|------|------|
+| RV-1 | 详情端点 404 语义 | `client_detail` 未处理 404 → 502 + 误导信息（与 `proxy_detail`/traffic 的"404 = 无数据"不一致） | 404 返回空对象 + 单测 |
+| RV-2 | **systemd 下"待重启"永不提示（真实缺陷）** | 判据依赖 `StatusReport.uptime_seconds`，而它在 systemd 分支为 None | 抽 `_config_pending_restart(config, pid)`：用 `/proc/<pid>/stat` 启动时刻直判，**direct 与 systemd 两种 owner 都覆盖**；补单测 |
+| RV-3 | **任务提交竞态（真实缺陷）** | "单飞行检查 → 插入任务"非原子：并发提交可双跑（GIL 下窗口窄但真实；no-GIL/未来更宽） | 检查+插入+淘汰移入同一把锁 |
+| RV-4 | 淘汰策略 | 淘汰"最旧"可能命中运行中任务（当前业务下不可达，防御性） | `_evict_locked()` 只淘汰已结束 |
+| RV-5 | 诊断导出 filename | 头部注入纵深防御 | 过滤引号/换行 |
+| RV-6 | 文案 | `frpsctl_executable` 报错只说"后台子进程"（service install 略偏） | 兼容表述 |
+| RV-7 | **插件 restart 换策略（真实缺陷）** | Web 侧 restart 不读旧参数里的自定义 `--policy` 路径（静默改用默认策略）且不做内容校验 | 旧参数优先 + `PluginPolicy.load` 同判据 + 2 条测试 |
+| RV-8 | 审计一致性 | `POST /api/tasks/install` 失败不留痕（config-apply 留） | 失败也写审计 |
+| RV-9 | 日志 offset | 全量分支 stat 失败给 offset=0 → 下次增量重复投递整文件 | offset=None（前端走全量） |
+| RV-10 | 路由 | `GET /api/tasks/install` 走"任务不存在"400 | 精确排除（404） |
+| RV-11 | **日志错误污染（真实缺陷·前端）** | 读取失败把错误文本写进日志体 → 永久混入 DOM 且破坏后续增量追加 | toast 提示 + offset 置空（保留现场） |
+| RV-15 | **结构化编辑器丢编辑（真实缺陷·前端）** | 表单重建（搜索过滤/切视图）时 `allowPorts` 编辑器从磁盘值重建，静默丢弃未预览编辑 | 草稿文本优先（新增 `parsePortText` 解析单点 + node 往返测试） |
+| RV-16 | 删除/恢复交互 | 对结构化编辑器"恢复"会把 JSON 文本塞进行输入框 | 删除/恢复走整段重建 |
+
+**审查确认无缺陷的项**（记入以防重复排查）：日志增量的 UTF-8 截断边界安全
+（`
+` 是 ASCII 自同步边界，保留到最后一个 `
+` 的内容必在字符边界）；
+`_paged` 在服务端 total 虚高时报 `truncated` 是诚实语义；单飞行下
+"淘汰运行中任务"实际不可达（防御性保留）。
+
+**测试有效性反向验证（诚实记录）**：RV-3 的并发测试在临时拆回非原子实现后
+**依旧通过**——GIL 下"检查→插入"的窄窗口无法被可靠复现。该测试守住的是
+"第二个提交被拒"语义，原子性本身是结构性修复（检查+插入同锁，代码审查
+保证）；测试 docstring 已注明这一边界。
+
+**review 后最终验收：全量 939 passed / 0 skipped（非契约 909），覆盖率 85.91%；
+`node --test` 26/26。**
+
+**最后一轮发布前 review（对 review 修复本身的复审）**：复审 RV-1..RV-16 的修复
+代码 + 针对性对抗实测 + 发布产物验证，再发现并修复 **3 项**（其中 1 项为修复
+引入的真实缺陷）：
+
+| # | 项 | 问题 | 修复 |
+|---|----|------|------|
+| RV-20 | **修复引入的缺陷（真实）** | `_config_pending_restart` 未处理 `_uptime_from_ticks` 的 `None` 返回 → `time.time() - None` 抛 **TypeError**，而它不在 `suppress(OSError)` 内 → 击穿 `status` 的"永不异常"承诺 | 显式判 None 降级为"不提示" + 单测（monkeypatch 换算失败路径） |
+| RV-22 | state 记录相对 policy 路径 | `--policy ./p.json` 原样写入 state → 不同 CWD 的 restart（CLI 换目录 / Web 进程）解析到错误位置 → 找不到或换策略 | CLI 启动时 `.resolve()` 写入（Web 侧同样绝对化）；端到端实测（相对路径启动 → state 绝对 → 跨 CWD 可用） |
+| RV-23 | 结构化编辑器的草稿清除基准 | `commit()` 用 `entryValue(entry)`（JSON 字符串）与 TOML 序列化文本比较 → 永不相等，改回原值也不消"待应用"计数 | 用"磁盘值的同形态序列化文本"作基准 |
+
+**发布产物最终验证（干净 venv 安装 wheel）**：版本 0.3.4；`index` 引用
+6/6 与 **JS 模块 26/26** 全 200（package data 完整）；新 API
+（services/versions/tasks/diagnostics）全 200；63 命令 help 0 失败。
+
+**最后一轮最终验收：全量 940 passed / 0 skipped（非契约 910），覆盖率 85.89%；
+`node --test` 26/26。**
+
+### 27.6 未做与边界（明确记账）
+
+| 项 | 结论 |
+|----|------|
+| 任务取消 | 需要 core 级协作式取消协议；页面提示等待完成（F11 记账） |
+| 版本列表拉取（GitHub API） | 不做：限速与可用性把简单功能变复杂；手工输入 + 预填建议版本 |
+| 静态资源 immutable / 版本串 | 不做：回环无传输成本，混版风险不可接受（见 27.1） |
+| HTML 片段化 | 不做（红线：禁止 innerHTML 注入路径） |
+| 截图/视觉回归测试 | 不变：不引浏览器测试框架；DOM 分支人工点验（结构与纪律守卫做厚） |
+| 前端 DOM 级测试框架 | 不变（边界不变，纯逻辑已由 node --test 覆盖） |
+| 浏览器双主题/键盘/抽屉的人工点验 | 记账：结构、纪律、纯逻辑全部自动化；视觉与交互手感仍人工 |

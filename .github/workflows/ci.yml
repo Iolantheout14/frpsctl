@@ -35,6 +35,18 @@ jobs:
       - name: 静态分析
         run: .venv/bin/ruff check src/ tests/
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 前端模块（ESM 语法 + 纯逻辑真单测）
+        run: |
+          # v0.3.4：前端从单文件拆为 ESM 多模块——逐模块语法检查 +
+          # node --test 直接 import 生产模块跑纯逻辑断言（tests/frontend/）。
+          find src/frpsctl/web/static/js -name "*.js" -print0 \
+            | xargs -0 -n1 node --input-type=module --check
+          node --test tests/frontend/*.test.mjs
+
       - name: 拉取真实 frps + frpc（契约层用）
         run: |
           # 用我们自己的 install 下载 + sha256 强校验 —— 顺带验证 §8.6 的信任模型。
