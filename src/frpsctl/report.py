@@ -98,6 +98,8 @@ def status_payload(
     )
     payload["systemd_unit"] = report.systemd_unit
     payload["systemd_main_pid"] = report.systemd_main_pid
+    # v0.3.4：配置已改但未重启（CLI status 与 Web 横幅共用同一判据）
+    payload["config_pending_restart"] = report.config_pending_restart
     payload["health"] = health_payload(report.health)
     if include_paths:
         payload["clients"] = clients

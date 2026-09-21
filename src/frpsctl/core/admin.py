@@ -73,14 +73,17 @@ class PageResult(Generic[_T]):
     `truncated` 为真说明翻页被 `max_pages` 上限截断（服务端 total 异常大时的
     防御）——调用方应当如实展示"还有 N 条未加载"，而不是假装拿到了全量
     （旧实现对上限截断完全静默）。
+
+    v0.3.4：`total_known=False` 表示服务端未提供 total（裸数组/缺字段），
+    此时 `total` 只是"已取回条数"的下界，调用方必须说"至少 N 条"而不是
+    "共 N 条"（旧实现把未知 total 当成已拉全 → 只取第一页且 truncated=False
+    的静默截断，本字段是为修复该缺陷引入）。
     """
 
     items: list[_T]
     total: int
-
-    @property
-    def truncated(self) -> bool:
-        return self.total > len(self.items)
+    truncated: bool = False
+    total_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -499,6 +502,31 @@ class AdminClient:
             if isinstance(item, dict)
         ]
 
+    def client_detail(self, key: str) -> dict:
+        """单个客户端详情（v2 `/api/v2/clients/{key}`，v0.3.4）。
+
+        形状由 frp 定义，这里原样透传给展示层（CLI/Web 只读字段）——
+        不在此建模的原因：它是低频只读视图，字段随版本演进的成本不落在
+        契约层（与 `page_clients` 的列表形状不同，后者驱动业务判断）。
+        """
+        from urllib.parse import quote
+
+        resp = self._get(f"/api/v2/clients/{quote(key, safe='')}")
+        if resp.status_code == 404:
+            return {}   # 不存在 = 无数据（与 proxy_detail / traffic 的 404 语义一致）
+        payload = self._unwrap(resp)
+        return payload if isinstance(payload, dict) else {}
+
+    def proxy_detail(self, name: str) -> dict:
+        """单个代理详情（v2 `/api/v2/proxies/{name}`，v0.3.4）；404 = 不存在。"""
+        from urllib.parse import quote
+
+        resp = self._get(f"/api/v2/proxies/{quote(name, safe='')}")
+        if resp.status_code == 404:
+            return {}
+        payload = self._unwrap(resp)
+        return payload if isinstance(payload, dict) else {}
+
     def _paged(
         self,
         path: str,
@@ -507,14 +535,16 @@ class AdminClient:
         page_size: int = 200,
         max_pages: int = 100,
     ) -> PageResult[dict]:
-        """逐页拉取直到 total 满足；带页数上限防止服务端异常时死循环。
+        """逐页拉取直到 total 满足；**缺 total 时按"页是否满"续拉**。
 
-        返回的 `total` 取自信封（第一页即可得）；若循环耗尽 `max_pages` 仍未
-        拉全，`PageResult.truncated` 会如实为真——旧实现只返回 items，调用方
-        无从知道"还有多少没拿到"（静默截断）。
+        v0.3.4 修复：旧实现在信封缺 `total` 时把 `total = len(items)` →
+        循环立即 break → 只取第一页且 `truncated=False`（静默截断）。
+        现在：缺 total 时满页续拉；翻页上限用尽如实标记 `truncated` 且
+        `total_known=False`（调用方据此说"至少 N 条"）。
         """
         items: list[dict] = []
-        total = 0
+        known_total: int | None = None
+        truncated = False
         for page in range(1, max_pages + 1):
             query = dict(params or {})
             query.update({"page": str(page), "page_size": str(page_size)})
@@ -522,10 +552,23 @@ class AdminClient:
             batch = _page_items(payload)
             items.extend(batch)
             raw_total = payload.get("total") if isinstance(payload, dict) else None
-            total = int(raw_total) if isinstance(raw_total, int) else len(items)
-            if not batch or len(items) >= total:
+            if isinstance(raw_total, int):
+                known_total = raw_total
+                if not batch or len(items) >= known_total:
+                    break
+            elif not batch or len(batch) < page_size:
                 break
-        return PageResult(items=items, total=total)
+        else:
+            truncated = True   # for 未 break：页数上限用尽，可能仍有数据
+        if not truncated and known_total is not None:
+            truncated = len(items) < known_total
+        total = known_total if known_total is not None else len(items)
+        return PageResult(
+            items=items,
+            total=total,
+            truncated=truncated,
+            total_known=known_total is not None,
+        )
 
     def proxy_count_for_user(self, user: str) -> int:
         """某用户当前的代理数（插件 `max_proxies` 配额用）。
@@ -547,7 +590,17 @@ class AdminClient:
         无参数时返回 `400 status only support offline`）。此前把它当作
         "kick（下线代理）"是一个**从未真正工作过**的功能。
         """
-        resp = self._client.delete("/api/proxies", params={"status": "offline"})
+        import httpx  # 惰性：见模块顶部说明
+
+        try:
+            resp = self._client.delete("/api/proxies", params={"status": "offline"})
+        except httpx.HTTPError as exc:
+            # v0.3.4 修复：此前裸 httpx 异常冒到 CLI/Web 变成"未分类错误(1)"，
+            # 与其余请求（全部经 _get 收口成 AdminUnreachable(7)）不一致
+            raise AdminUnreachable(
+                f"清理离线代理记录失败（{self._base_url}/api/proxies）：{exc}",
+                hint="确认 dashboard 可达后在 CLI 重试 `frpsctl prune`",
+            ) from None
         if resp.status_code >= 400:
             raise AdminUnreachable(
                 f"清理离线代理记录失败：HTTP {resp.status_code}",

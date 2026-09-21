@@ -106,11 +106,15 @@ def instance_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
         os.close(fd)
 
 
-def is_locked(path: Path) -> bool:
+def is_locked(path: Path) -> bool | None:
     """只探测不获取：用于 `doctor` 判断"是否有并发操作正在进行"。
 
-    本进程自己持有锁时返回 True——那确实意味着"有操作在进行"，而 doctor
-    通常从另一个进程跑，所以这个语义在两种情形下都成立。
+    返回三态：`True`（有锁）/ `False`（无锁）/ **`None`（无法探测）**。
+
+    v0.3.4 修复：旧实现把"锁文件存在但当前用户读不到"（root 建的 0600 文件
+    对普通用户不可读的 `PermissionError`）静默判成 `False` —— doctor 因此
+    漏报"有并发操作正在进行"（假阴性）。无法探测 ≠ 没有锁，调用方必须能
+    区分（降级必须可见）。
 
     ⚠️ 这是**瞬时采样**：探测与释放之间锁状态随时可能变化（TOCTOU）。
     调用方只能把它当"体检那一刻的线索"，绝不能用作任何决策依据——
@@ -128,6 +132,8 @@ def is_locked(path: Path) -> bool:
         # 跑 doctor 时因 PermissionError 整个体检崩掉）。flock 在只读 fd 上
         # 同样可用。
         fd = os.open(path, os.O_RDONLY)
+    except PermissionError:
+        return None
     except OSError:
         return False
     try:

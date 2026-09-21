@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -194,6 +196,10 @@ class AuditLog:
                     for item in pending:
                         handle.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
                     handle.flush()
+                # 显式 0600：审计含用户/代理等操作细节，与配置/快照同一纵深
+                # 纪律；umask 不是安全边界（v0.3.4）
+                with contextlib.suppress(OSError):
+                    os.chmod(self.path, 0o600)
             except OSError:
                 # 写不进去也不能让登录链路失败：把记录放回缓冲区，等下次再试。
                 # 这是"审计可用性"与"服务可用性"之间的取舍——服务优先。

@@ -547,7 +547,18 @@ def _check_ownership(
 
 
 def _check_lock(inst: Instance) -> list[Finding]:
-    if is_locked(inst.lock):
+    locked = is_locked(inst.lock)
+    if locked is None:
+        # 降级必须可见：读不到锁文件不等于"没有并发操作"（v0.3.4）
+        return [
+            Finding(
+                "实例锁",
+                Severity.INFO,
+                f"{inst.lock} 存在但当前权限无法探测（可能被其他用户的进程持有）",
+                "以具备读权限的用户运行 doctor；该检查是瞬时采样，仅作线索",
+            )
+        ]
+    if locked:
         return [
             Finding(
                 "实例锁",

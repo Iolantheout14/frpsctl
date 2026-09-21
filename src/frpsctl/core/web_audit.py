@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -62,6 +64,29 @@ def session_fingerprint(token: str | None) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
 
 
+def _sanitize_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    """审计参数只保留标量、截断长度、敏感键打码（v0.3.4）。
+
+    调用方（web/api）已过滤标量，但审计是**落盘**动作——core 层再防一道：
+    结构/超长值降级为类型占位，敏感键（`config.is_secret_key` 判据）一律
+    `***`，绝不让凭据进审计文件。
+    """
+    from .config import is_secret_key
+
+    out: dict[str, Any] = {}
+    for key, value in (params or {}).items():
+        name = str(key)[:64]
+        if is_secret_key(name):
+            out[name] = "***"
+        elif isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+            out[name] = value
+        elif isinstance(value, str):
+            out[name] = value[:200]
+        else:
+            out[name] = f"<{type(value).__name__}>"
+    return out
+
+
 def record(
     inst: Instance,
     *,
@@ -79,7 +104,7 @@ def record(
         "at_unix": round(now, 3),
         "action": action,
         "target": target,
-        "params": params or {},
+        "params": _sanitize_params(params),
         "result": result,
         "source": source,
         "session_id": session_id,
@@ -100,6 +125,10 @@ def record(
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 handle.flush()
+            # 显式 0600：审计含操作轨迹与来源，与配置/快照同一纵深纪律；
+            # umask 不是安全边界（v0.3.4 修复：此前权限完全跟随 umask）
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
     except (OSError, TypeError, ValueError):
         # OSError：磁盘/权限；TypeError/ValueError：params 里有不可序列化或
         # 非法值（承诺"绝不抛异常"必须覆盖它们，v0.3.0 最终 review N6）。

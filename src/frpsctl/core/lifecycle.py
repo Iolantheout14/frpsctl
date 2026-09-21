@@ -192,6 +192,10 @@ class StatusReport:
     systemd_probe_error: str | None = None
     #: 控制连接监听（`bindAddr:bindPort`，附录 A 默认 0.0.0.0:7000）。
     listen: ListenInfo | None = None
+    #: 配置文件比进程更新（v0.3.4）：frps 没有热重载，说明"已改但未重启"。
+    #: 只读推导（config mtime vs 进程启动时刻），不需要任何持久化标记——
+    #: `--no-restart` 的变更也会被如实识别。
+    config_pending_restart: bool = False
 
     @property
     def binary_matches_disk(self) -> bool:
@@ -921,6 +925,11 @@ class Lifecycle:
             with contextlib.suppress(OSError):
                 mode = oct(self.inst.config.stat().st_mode & 0o777)[2:].zfill(4)
 
+        # v0.3.4：配置待重启（只读推导；direct 与 systemd 两种 owner 都覆盖）
+        pending_restart = _config_pending_restart(
+            self.inst.config, ref.pid if ref is not None else unit_pid
+        )
+
         return StatusReport(
             instance=self.inst.name,
             owner=owner,
@@ -939,6 +948,7 @@ class Lifecycle:
             state_corrupted=corrupted,
             systemd_probe_error=probe_error,
             listen=listen,
+            config_pending_restart=pending_restart,
         )
 
     def _indeterminate_report(
@@ -965,6 +975,34 @@ class Lifecycle:
             systemd_probe_error=probe_error,
             listen=listen,
         )
+
+
+def _config_pending_restart(config: Path, pid: int | None) -> bool:
+    """配置文件是否比进程新（"已改但未重启"，v0.3.4 F5 的判定单点）。
+
+    只看 pid（direct 的 ref.pid 或 systemd 的 MainPID）与文件系统事实：
+    `/proc/<pid>/stat` 的启动时刻 vs config mtime。**不依赖
+    `StatusReport.uptime_seconds`**——它在 systemd 分支为 None，若依赖它，
+    systemd 托管下永远不会提示待重启（v0.3.4 review 修复）。
+
+    容差 1 秒覆盖"同秒内启动 + 变更"的边界（mtime 精度与启动耗时）。
+    """
+    if pid is None or not config.exists():
+        return False
+    with contextlib.suppress(OSError):
+        start_ticks = plat.proc_start_time(pid)
+        if start_ticks is None:
+            return False
+        uptime_seconds = _uptime_from_ticks(start_ticks)
+        if uptime_seconds is None:
+            # 换算基准不可得（读不到自身 /proc 或 hz 非法）：按"不提示"降级。
+            # 必须显式判 None——它会让 `time.time() - None` 抛 TypeError，
+            # 而 TypeError 不在 suppress(OSError) 内，会击穿 status 的
+            # "永不异常"承诺（最后一轮 review 对修复本身的复审发现）。
+            return False
+        boot_epoch = time.time() - uptime_seconds
+        return config.stat().st_mtime > boot_epoch + 1.0
+    return False
 
 
 def _uptime_from_ticks(start_ticks: int) -> float | None:
