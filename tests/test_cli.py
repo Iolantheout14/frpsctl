@@ -3284,3 +3284,35 @@ class TestBestEffortSystemdProbes:
         payload = _json.loads(result.stdout)
         assert payload["service_active"] is None
         assert payload["restart_required"] is True
+
+
+class TestClientsUnknownTotal:
+    """信封缺 total 时列表文案的诚实表达（R3 的 CLI 侧）："至少 N 条"。"""
+
+    def test_unknown_total_says_at_least(self, cli_env, monkeypatch) -> None:
+        from frpsctl.core.admin import PageResult
+
+        runner.invoke(app, ["init", "--no-input"])
+
+        class _Admin:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def page_clients(self):
+                return PageResult(
+                    items=[{"key": "alice", "user": "alice", "clientIP": "127.0.0.1"}],
+                    total=1,
+                    truncated=False,
+                    total_known=False,
+                )
+
+        monkeypatch.setattr("frpsctl.cli.runtime.AdminClient", _Admin)
+        result = runner.invoke(app, ["clients"])
+        assert result.exit_code == 0, result.output
+        assert "至少 1 条" in result.stdout

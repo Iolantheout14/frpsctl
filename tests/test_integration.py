@@ -1652,3 +1652,24 @@ class TestAuditFollowWaitsForFile:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+
+
+class TestPendingRestart:
+    """配置"待重启"的只读推导（v0.3.4 F5）：config mtime > 进程启动时刻。"""
+
+    def test_not_pending_right_after_start(self, running) -> None:
+        lc, _report, _port = running
+        assert lc.status().config_pending_restart is False
+
+    def test_pending_after_config_touched(self, running, inst) -> None:
+        import os as _os
+
+        lc, _report, _port = running
+        stat = inst.config.stat()
+        _os.utime(inst.config, (stat.st_atime, stat.st_mtime + 5))  # 越过 1 秒容差
+        assert lc.status().config_pending_restart is True
+
+    def test_not_pending_when_stopped(self, inst, write_config) -> None:
+        write_config(BASIC_CONFIG.replace("17500", str(free_port())))
+        lc = make_lifecycle(inst, make_fake_frps(inst.bin_dir))
+        assert lc.status().config_pending_restart is False

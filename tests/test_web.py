@@ -1326,6 +1326,76 @@ class TestWebOperationAudit:
         assert status == 400 and "审计范围" in payload["error"]
 
 
+class TestStaticAssets:
+    """v0.3.4 静态资源路由：白名单扩展名 + 防穿越 + ETag 条件请求。"""
+
+    def _base(self, web) -> str:
+        return f"http://127.0.0.1:{web.address[1]}"
+
+    def _raw_get(self, web, path: str):
+        """用 http.client 发**原始请求行**（urllib 会规范化 `..`，测不出穿越）。"""
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", web.address[1], timeout=5)
+        try:
+            conn.request("GET", path)
+            return conn.getresponse()
+        finally:
+            pass  # 响应读完后由调用方关闭
+
+    def test_serves_js_module_with_etag(self, web) -> None:
+        req = urllib.request.Request(self._base(web) + "/static/js/main.js")  # noqa: S310
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/javascript")
+            etag = resp.headers["ETag"]
+        assert "import" in body and etag
+
+    def test_css_and_module_served(self, web) -> None:
+        for path, ctype in (
+            ("/static/css/tokens.css", "text/css"),
+            ("/static/js/views/dashboard.js", "text/javascript"),
+        ):
+            req = urllib.request.Request(self._base(web) + path)  # noqa: S310
+            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                assert resp.status == 200
+                assert resp.headers["Content-Type"].startswith(ctype)
+
+    def test_conditional_request_returns_304(self, web) -> None:
+        req = urllib.request.Request(self._base(web) + "/static/css/base.css")  # noqa: S310
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            etag = resp.headers["ETag"]
+        req2 = urllib.request.Request(  # noqa: S310
+            self._base(web) + "/static/css/base.css", headers={"If-None-Match": etag}
+        )
+        try:
+            urllib.request.urlopen(req2, timeout=5)  # noqa: S310
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 304
+        else:
+            pytest.fail("条件请求（If-None-Match 命中）应返回 304")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/static/../server.py",
+            "/static/%2e%2e/server.py",
+            "/static/js/../../server.py",
+            "/static/index.html",          # 主入口不通过静态目录暴露
+            "/static/js/main.js.map",      # 白名单外扩展名
+            "/static/js/nope.js",          # 不存在
+            "/static/",
+        ],
+    )
+    def test_rejects_traversal_and_non_whitelisted(self, web, path: str) -> None:
+        resp = self._raw_get(web, path)
+        try:
+            assert resp.status == 404, f"{path} 应 404（实际 {resp.status}）"
+        finally:
+            resp.close()
+
+
 class TestCspNonce:
     """CSP nonce 化：每请求 nonce、无 unsafe-inline、无内联 style 属性。"""
 
@@ -1338,12 +1408,17 @@ class TestCspNonce:
             csp = resp.headers["Content-Security-Policy"]
 
         assert "unsafe-inline" not in csp, csp
+        # v0.3.4 拆分后 script/style 仍是 nonce-only（不放宽到 'self'）；
+        # connect-src 的 'self' 是 fetch 同源 API 的必需项
+        assert "'self'" not in re.search(r"script-src ([^;]+)", csp).group(1), csp
+        assert "'self'" not in re.search(r"style-src ([^;]+)", csp).group(1), csp
         match = re.search(r"script-src 'nonce-([^']+)'", csp)
         assert match, csp
         nonce = match.group(1)
         assert f'style-src \'nonce-{nonce}\'' in csp
-        # 两个 <script> + 一个 <style> 都必须带同一个 nonce
-        assert html.count(f'nonce="{nonce}"') == 3
+        # v0.3.4：内联主题脚本 + 5 个 CSS link + 1 个 module script = 7 处
+        # 同一 nonce（CSP 保持 nonce-only：外链资源同样带 nonce 占位注入）
+        assert html.count(f'nonce="{nonce}"') == 7
         assert "__CSP_NONCE__" not in html
         # 无内联 style 属性（CSP 去掉 unsafe-inline 的前提）
         assert not re.search(r"\sstyle=\"", html), "还有内联 style 属性"
@@ -1696,3 +1771,319 @@ class TestStatusResponseCache:
         client.call("/api/actions/prune", method="POST", body={})
         client.call("/api/status")
         assert calls["n"] == base + 1, "写操作后 status 必须重新计算"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.4 新增 API：服务 / 版本 / 任务 / 详情 / 审计时间窗 / 增量日志 / 诊断导出
+# ---------------------------------------------------------------------------
+
+
+class TestServicesApi:
+    def test_services_shape(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/services")
+        assert status == 200
+        assert set(payload["services"]) == {"frps", "web", "plugin"}
+        assert payload["services"]["web"]["owner"] == "none"
+        assert payload["instance"]
+
+    def test_plugin_stop_when_not_running_is_conflict(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/plugin-stop", method="POST", body={})
+        assert status == 409, payload
+
+    def test_plugin_start_without_policy_is_actionable_error(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/plugin-start", method="POST", body={})
+        assert status == 400
+        assert "策略文件不存在" in payload["error"]
+        assert "plugin init" in payload["hint"]
+
+    def test_plugin_start_direct_with_policy(self, web, monkeypatch) -> None:
+        import types as _types
+
+        from frpsctl.core import serve_runtime
+        from frpsctl.core.auditlog import resolve_policy_path
+
+        resolve_policy_path(web.ctx.inst).write_text('{"users": {}}', "utf-8")
+        captured: dict = {}
+
+        def fake_start(inst, spec, *, argv, args, host, port):
+            captured.update({"argv": argv, "args": args, "host": host, "port": port})
+            return _types.SimpleNamespace(pid=999, log="/tmp/fake-plugin.log", args=args)
+
+        monkeypatch.setattr(serve_runtime, "start_background", fake_start)
+        monkeypatch.setattr(serve_runtime, "frpsctl_executable", lambda: "/usr/local/bin/frpsctl")
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/plugin-start", method="POST", body={})
+        assert status == 200, payload
+        assert payload["owner"] == "direct" and payload["pid"] == 999
+        assert captured["argv"][:3] == ["/usr/local/bin/frpsctl", "plugin", "serve"]
+        assert captured["args"]["policy"].endswith("plugin-policy.json")
+
+
+class TestVersionsApi:
+    def test_versions_shape(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/versions")
+        assert status == 200
+        assert payload["frpsctl"]
+        assert payload["minimum"] == "0.70.0"
+        assert payload["binary"]["running"] is None
+        assert payload["binary"]["match"] is False
+
+
+class TestTasksApi:
+    def _fake_install(self, monkeypatch, *, delay: float = 0.0, fail: bool = False) -> list[str]:
+        import time as _time
+
+        from frpsctl.core import release
+
+        calls: list[str] = []
+
+        def fake_install(**kwargs):
+            calls.append(kwargs["version"])
+            if kwargs.get("on_progress") is not None:
+                kwargs["on_progress"]("download", 5, 10)
+            if delay:
+                _time.sleep(delay)
+            if fail:
+                from frpsctl.errors import BinaryError
+
+                raise BinaryError("下载失败（测试注入）")
+            return release.InstallResult(
+                version=kwargs["version"],
+                binary=Path("/x/frps-0.71.0"),
+                switched=True,
+                downloaded=True,
+            )
+
+        monkeypatch.setattr(release, "install", fake_install)
+        return calls
+
+    def _wait_task(self, client: Client, task_id: str, timeout: float = 5.0) -> dict:
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        task: dict = {}
+        while _time.monotonic() < deadline:
+            _, task, _ = client.call(f"/api/tasks/{task_id}")
+            if task.get("state") in ("done", "failed"):
+                return task
+            _time.sleep(0.05)
+        return task
+
+    def test_install_task_lifecycle(self, web, monkeypatch) -> None:
+        calls = self._fake_install(monkeypatch)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call(
+            "/api/tasks/install", method="POST", body={"version": "0.71.0"}
+        )
+        assert status == 200
+        task = self._wait_task(client, payload["task_id"])
+        assert task["state"] == "done", task
+        assert task["result"]["switched"] is True
+        assert task["progress"]["phase"] == "完成"
+        assert calls == ["0.71.0"]
+        _, listing, _ = client.call("/api/tasks")
+        assert listing["tasks"] and listing["tasks"][0]["version"] == "0.71.0"
+
+    def test_install_task_failure_is_visible(self, web, monkeypatch) -> None:
+        self._fake_install(monkeypatch, fail=True)
+        client = Client(web)
+        client.login()
+        _, payload, _ = client.call("/api/tasks/install", method="POST", body={"version": "0.71.0"})
+        task = self._wait_task(client, payload["task_id"])
+        assert task["state"] == "failed"
+        assert "下载失败" in task["error"]
+
+    def test_invalid_version_is_400(self, web) -> None:
+        client = Client(web)
+        client.login()
+        for version in ("latest", "0.71", "", "v0.71.0"):
+            status, payload, _ = client.call(
+                "/api/tasks/install", method="POST", body={"version": version}
+            )
+            assert status == 400, (version, payload)
+
+    def test_single_flight(self, web, monkeypatch) -> None:
+        self._fake_install(monkeypatch, delay=0.5)
+        client = Client(web)
+        client.login()
+        first, _, _ = client.call("/api/tasks/install", method="POST", body={"version": "0.71.0"})
+        assert first == 200
+        second, payload, _ = client.call(
+            "/api/tasks/install", method="POST", body={"version": "0.72.0"}
+        )
+        assert second == 400
+        assert "进行中" in payload["error"]
+
+    def test_missing_task_is_400(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/tasks/nope")
+        assert status == 400
+        assert "任务不存在" in payload["error"]
+
+
+class TestDetailApi:
+    def test_client_and_proxy_detail_passthrough(self, web, monkeypatch) -> None:
+        class _Admin:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def client_detail(self, key):
+                return {"key": key, "user": "alice", "online": True}
+
+            def proxy_detail(self, name):
+                return {} if name == "gone" else {"name": name, "type": "tcp"}
+
+        monkeypatch.setattr("frpsctl.web.api._admin", lambda _ctx: _Admin())
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/clients/alice")
+        assert status == 200 and payload["detail"]["user"] == "alice"
+        status, payload, _ = client.call("/api/proxies/gone")
+        assert status == 200 and payload["detail"] == {}
+        status, payload, _ = client.call("/api/proxies/alice-ssh")
+        assert status == 200 and payload["detail"]["type"] == "tcp"
+
+    def test_empty_name_is_400(self, web) -> None:
+        client = Client(web)
+        client.login()
+        import urllib.parse as _parse
+
+        status, _, _ = client.call("/api/proxies/" + _parse.quote("   "))
+        assert status == 400
+
+
+class TestAuditSince:
+    def test_since_window_and_invalid(self, web) -> None:
+        import time as _time
+
+        from frpsctl.core import web_audit
+
+        path = web_audit.resolve_path(web.ctx.inst)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({
+                    "at": "2026-01-01T00:00:00",
+                    "at_unix": _time.time(),
+                    "action": "login",
+                    "result": "ok",
+                    "source": "10.0.0.1",
+                    "params": {},
+                    "session_id": "",
+                }) + "\n"
+            )
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit?scope=web&since=24h")
+        assert status == 200 and payload["stats"]["total"] >= 1
+        status, payload, _ = client.call("/api/audit?scope=web&since=bogus")
+        assert status == 400
+        status, payload, _ = client.call("/api/audit?scope=plugin&since=24h")
+        assert status == 200  # 插件 scope 同样接受 since（策略缺失也只是 available=false）
+
+
+class TestLogsSince:
+    def test_incremental_logs(self, web) -> None:
+        client = Client(web)
+        client.login()
+        log_file = web.ctx.inst.dir / "frps.log"
+        log_file.write_text("a\nb\n", "utf-8")
+        _, first, _ = client.call("/api/logs?lines=10")
+        assert first["reset"] is True
+        assert first["lines"] == ["a\n", "b\n"]   # 全量保持历史契约（含换行）
+        with log_file.open("a", encoding="utf-8") as handle:
+            handle.write("c\n")
+        _, second, _ = client.call(f"/api/logs?lines=10&since={first['offset']}")
+        assert second["reset"] is False
+        assert second["lines"] == ["c"]           # 增量：无换行
+        _, third, _ = client.call(f"/api/logs?lines=10&since={second['offset']}")
+        assert third["lines"] == [] and third["reset"] is False
+
+    def test_rotation_triggers_reset(self, web) -> None:
+        client = Client(web)
+        client.login()
+        log_file = web.ctx.inst.dir / "frps.log"
+        log_file.write_text("old-old-old\n", "utf-8")
+        _, first, _ = client.call("/api/logs?lines=10")
+        log_file.write_text("new\n", "utf-8")   # 轮转后的新文件（更小）
+        _, second, _ = client.call(f"/api/logs?lines=10&since={first['offset']}")
+        assert second["reset"] is True
+        assert second["lines"] == ["new"]
+
+
+class TestDiagnosticsExport:
+    def _fetch(self, web, cookie: str | None = None):
+        client = Client(web)
+        if cookie is None:
+            client.login()
+        req = urllib.request.Request(  # noqa: S310 - 固定回环地址
+            client.base + "/api/diagnostics",
+            headers={"Cookie": cookie if cookie is not None else (client.cookie or "")},
+        )
+        return urllib.request.urlopen(req, timeout=10)  # noqa: S310
+
+    def test_download_report_masks_secrets(self, web) -> None:
+        with self._fetch(web) as resp:
+            body = resp.read().decode("utf-8")
+            assert resp.status == 200
+            assert "attachment" in resp.headers["Content-Disposition"]
+            assert resp.headers["Content-Type"].startswith("text/plain")
+        assert "# frpsctl 诊断报告" in body
+        assert "## 体检" in body and "## 配置" in body and "## 日志" in body
+        assert "test-token" not in body          # 配置口令/token 原文绝不出现
+        assert "token = " in body                # 打码后的行仍可见（诊断价值）
+
+    def test_requires_login(self, web) -> None:
+        try:
+            self._fetch(web, cookie="")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401
+        else:
+            pytest.fail("未登录应 401")
+
+
+class TestPluginStartPolicyReuse:
+    """Web 侧插件启动的策略解析（RV-7）：旧参数优先 + 同 `plugin check` 判据。"""
+
+    def test_custom_policy_from_args_is_reused(self, web, monkeypatch, tmp_path) -> None:
+        import types as _types
+
+        from frpsctl.core import serve_runtime
+        from frpsctl.web import api as api_mod
+
+        custom = tmp_path / "custom-policy.json"
+        custom.write_text('{"users": {}}', "utf-8")
+        captured: dict = {}
+
+        def fake_start(*args, **kwargs):
+            captured.update(kwargs)
+            return _types.SimpleNamespace(pid=1, log="/x/plugin.log", args=kwargs["args"])
+
+        monkeypatch.setattr(serve_runtime, "start_background", fake_start)
+        monkeypatch.setattr(serve_runtime, "frpsctl_executable", lambda: "/usr/bin/frpsctl")
+        api_mod._plugin_direct_start(web.ctx, fallback_args={"policy": str(custom)})
+        assert captured["args"]["policy"] == str(custom)
+        assert str(custom) in captured["argv"]
+
+    def test_invalid_policy_is_rejected(self, web, monkeypatch, tmp_path) -> None:
+        from frpsctl.errors import ConfigError
+
+        from frpsctl.web import api as api_mod
+
+        bad = tmp_path / "bad-policy.json"
+        bad.write_text('{"allow_unknown_user": "false"}', "utf-8")  # 类型错误（fail-closed 判据）
+        with pytest.raises(ConfigError):
+            api_mod._plugin_direct_start(web.ctx, fallback_args={"policy": str(bad)})

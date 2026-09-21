@@ -1141,8 +1141,10 @@ class TestWithFrpc:
 
         calls: list[str] = []
 
-        def fake_download(asset, version, mirrors=None):
+        def fake_download(asset, version, mirrors=None, *, on_progress=None):
             calls.append(asset)
+            if on_progress is not None:
+                on_progress(0, None)
             return asset_path.read_bytes()
 
         digest = hashlib.sha256(asset_path.read_bytes()).hexdigest()
@@ -5009,3 +5011,552 @@ class TestConfigureStreams:
         monkeypatch.setattr(_sys, "stdout", _Boom())
         monkeypatch.setattr(_sys, "stderr", _Boom())
         configure_streams()  # 不抛即可
+
+
+# ---------------------------------------------------------------------------
+# v0.3.4 新增：增量日志 / 锁三态 / 审计参数 / 守卫 / argv / 安装锁 / 翻页
+# ---------------------------------------------------------------------------
+
+
+class TestTailSince:
+    """增量日志 tail（F6）：完整行、offset 推进、轮转重置、半行不丢不重。"""
+
+    def test_first_read_is_full_with_reset(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("l1\nl2\nl3\n", "utf-8")
+        lines, offset, reset = tail_since(log, None, max_lines=2)
+        assert reset is True
+        assert lines == ["l2", "l3"]
+        assert offset == log.stat().st_size
+
+    def test_incremental_only_new_lines(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("l1\n", "utf-8")
+        _, offset, reset = tail_since(log, None)
+        assert reset is True and offset == 3
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("l2\nl3\n")
+        lines, new_offset, reset = tail_since(log, offset)
+        assert reset is False
+        assert lines == ["l2", "l3"]
+        assert new_offset == log.stat().st_size
+
+    def test_no_new_content_returns_empty(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("l1\n", "utf-8")
+        size = log.stat().st_size
+        lines, offset, reset = tail_since(log, size)
+        assert (lines, offset, reset) == ([], size, False)
+
+    def test_rotation_resets(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("very-long-old-line\n", "utf-8")
+        old_offset = log.stat().st_size
+        log.write_text("new\n", "utf-8")   # 模拟轮转后的新文件（变小）
+        lines, offset, reset = tail_since(log, old_offset)
+        assert reset is True
+        assert lines == ["new"]
+        assert offset == 4
+
+    def test_partial_line_not_returned_then_delivered(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("l1\n", "utf-8")
+        offset = log.stat().st_size
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("half")   # 无换行
+        lines, new_offset, reset = tail_since(log, offset)
+        assert lines == []
+        assert reset is False
+        assert new_offset == offset       # 等完整行到来
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("-done\n")
+        lines, new_offset, _reset = tail_since(log, new_offset)
+        assert lines == ["half-done"]
+        assert new_offset == log.stat().st_size
+
+    def test_unicode_and_crlf(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_bytes("你好\n".encode())
+        size = log.stat().st_size
+        with log.open("ab") as handle:
+            handle.write("世界\r\n".encode())
+        lines, new_offset, _ = tail_since(log, size)
+        assert lines == ["世界"]
+        assert new_offset == log.stat().st_size
+
+    def test_max_lines_truncates_but_advances(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        log = tmp_path / "a.log"
+        log.write_text("l1\n", "utf-8")
+        offset = log.stat().st_size
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("".join(f"x{i}\n" for i in range(10)))
+        lines, new_offset, reset = tail_since(log, offset, max_lines=3)
+        assert reset is False
+        assert lines == ["x7", "x8", "x9"]
+        assert new_offset == log.stat().st_size   # 中间被跳过的行不重复投递
+
+    def test_missing_file_resets(self, tmp_path: Path) -> None:
+        from frpsctl.core.logs import tail_since
+
+        lines, offset, reset = tail_since(tmp_path / "nope.log", 100)
+        assert (lines, offset, reset) == ([], 0, True)
+
+
+class TestLockTriState:
+    """is_locked 三态（R6）：无法探测 ≠ 没有锁（历史假阴性修复）。"""
+
+    def test_unlocked_and_locked(self, tmp_path: Path) -> None:
+        lock = tmp_path / ".lock"
+        assert is_locked(lock) is False
+        with instance_lock(lock):
+            assert is_locked(lock) is True
+        assert is_locked(lock) is False
+
+    def test_unreadable_lock_file_reports_unknown(self, tmp_path: Path, monkeypatch) -> None:
+        lock = tmp_path / ".lock"
+        lock.write_text("", "utf-8")
+        real_open = os.open
+
+        def fake_open(path, flags, *args, **kwargs):
+            if Path(path) == lock and flags == os.O_RDONLY:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fake_open)
+        assert is_locked(lock) is None
+
+
+class TestAuditParamSanitize:
+    """Web 审计落盘的参数闸门（R5）：标量白名单 / 敏感打码 / 0600。"""
+
+    def test_params_are_sanitized(self, tmp_path: Path) -> None:
+        import json
+
+        from frpsctl.core import web_audit
+        from frpsctl.core.instance import Instance
+
+        inst = Instance(name="default", instances_root=tmp_path, data_home=tmp_path)
+        inst.ensure_dirs()
+        assert web_audit.record(
+            inst,
+            action="config-apply",
+            params={
+                "password": "super-secret",
+                "webServer.password": "super-secret",
+                "value": "x" * 500,
+                "nested": {"a": 1},
+                "count": 3,
+                "flag": True,
+            },
+        )
+        record = json.loads(web_audit.resolve_path(inst).read_text("utf-8").strip())
+        params = record["params"]
+        assert params["password"] == "***"
+        assert params["webServer.password"] == "***"
+        assert len(params["value"]) == 200
+        assert params["nested"] == "<dict>"
+        assert params["count"] == 3 and params["flag"] is True
+
+    def test_file_mode_is_0600(self, tmp_path: Path) -> None:
+        from frpsctl.core import web_audit
+        from frpsctl.core.instance import Instance
+
+        inst = Instance(name="default", instances_root=tmp_path, data_home=tmp_path)
+        inst.ensure_dirs()
+        assert web_audit.record(inst, action="login")
+        mode = web_audit.resolve_path(inst).stat().st_mode & 0o777
+        assert mode == 0o600, oct(mode)
+
+
+class TestServeGuard:
+    """互斥守卫下沉 core（R1）：direct ↔ systemd 双向拒绝（Web 启停也走这里）。"""
+
+    def _spec(self):
+        from frpsctl.core.serve_runtime import WEB_SPEC
+
+        return WEB_SPEC
+
+    def test_guard_against_direct_rejects_running(self, tmp_path: Path, monkeypatch) -> None:
+        from frpsctl.core import serve_guard, serve_runtime
+        from frpsctl.core.instance import Instance
+        from frpsctl.errors import OwnershipConflict
+
+        inst = Instance(name="default", instances_root=tmp_path, data_home=tmp_path)
+        inst.ensure_dirs()
+        import types
+
+        status = serve_runtime.ServeStatus(
+            spec=self._spec(),
+            owner=serve_runtime.ServeOwner.DIRECT,
+            state=types.SimpleNamespace(pid=4242),  # type: ignore[arg-type]
+        )
+        monkeypatch.setattr(serve_runtime, "probe", lambda *_a, **_k: status)
+        with pytest.raises(OwnershipConflict):
+            serve_guard.guard_against_direct(inst, self._spec())
+
+    def test_guard_against_systemd_rejects_active(self, tmp_path: Path, monkeypatch) -> None:
+        from frpsctl.core import serve_guard
+        from frpsctl.core.instance import Instance
+        from frpsctl.errors import OwnershipConflict
+
+        inst = Instance(name="default", instances_root=tmp_path, data_home=tmp_path)
+        inst.ensure_dirs()
+
+        class _Service:
+            def unit_exists(self):
+                return True
+
+            def is_active(self):
+                return True
+
+        monkeypatch.setattr(serve_guard, "_service_for", lambda *_a, **_k: _Service())
+        with pytest.raises(OwnershipConflict):
+            serve_guard.guard_against_systemd(inst, self._spec())
+
+
+class TestBuildServeArgv:
+    """serve argv 单点（R2）：两种服务各自的选项集与白名单校验。"""
+
+    def test_web_argv(self) -> None:
+        from frpsctl.core.serve_runtime import build_serve_argv
+
+        argv = build_serve_argv(
+            "/usr/local/bin/frpsctl",
+            subcommand="web",
+            bind="127.0.0.1:8787",
+            password_file="/x/web-password",
+            trusted_proxy=True,
+        )
+        assert argv[:6] == [
+            "/usr/local/bin/frpsctl", "web", "serve", "--bind", "127.0.0.1:8787", "--password-file",
+        ]
+        assert "--trusted-proxy" in argv
+        assert "--policy" not in argv
+
+    def test_plugin_argv(self) -> None:
+        from frpsctl.core.serve_runtime import build_serve_argv
+
+        argv = build_serve_argv(
+            "/usr/local/bin/frpsctl",
+            subcommand="plugin",
+            bind="127.0.0.1:8080",
+            policy="/x/plugin-policy.json",
+            handler_path="/handler",
+            access_log=True,
+        )
+        assert argv[:4] == ["/usr/local/bin/frpsctl", "plugin", "serve", "--bind"]
+        assert argv[5:7] == ["--policy", "/x/plugin-policy.json"]
+        assert "--path" in argv and "/handler" in argv and "--access-log" in argv
+
+    def test_cross_service_options_rejected(self) -> None:
+        from frpsctl.core.serve_runtime import build_serve_argv
+        from frpsctl.errors import UsageError
+
+        with pytest.raises(UsageError):
+            build_serve_argv("/x", subcommand="web", bind="127.0.0.1:1", policy="/p")
+        with pytest.raises(UsageError):
+            build_serve_argv("/x", subcommand="plugin", bind="127.0.0.1:1", metrics=True)
+        with pytest.raises(UsageError):
+            build_serve_argv("/x", subcommand="bogus", bind="127.0.0.1:1")
+
+
+class TestInstallLockAndProgress:
+    """安装互斥与进度回调（F11 core）：并发取锁拒绝、阶段序列、进度推进。"""
+
+    def test_install_lock_is_exclusive(self, tmp_path: Path) -> None:
+        from frpsctl.core.release import _install_lock
+        from frpsctl.errors import FrpsctlError
+
+        with (
+            _install_lock(tmp_path, timeout=0.2),
+            pytest.raises(FrpsctlError),
+            _install_lock(tmp_path, timeout=0.2),
+        ):
+            pass
+
+    def test_progress_callback_sequence(self, tmp_path: Path, monkeypatch) -> None:
+        import hashlib
+        import io
+        import tarfile
+
+        from frpsctl.core import release as rel
+
+        blob = io.BytesIO()
+        with tarfile.open(fileobj=blob, mode="w:gz") as tar:
+            data = b"#!/bin/sh\necho 0.71.0\n"
+            info = tarfile.TarInfo("frp_0.71.0/frps")
+            info.size = len(data)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(data))
+        payload = blob.getvalue()
+        digest = hashlib.sha256(payload).hexdigest()
+
+        def fake_download(asset, version, mirrors=None, *, on_progress=None):
+            if on_progress is not None:
+                on_progress(len(payload), len(payload))
+            return payload
+
+        monkeypatch.setattr(rel, "download", fake_download)
+        monkeypatch.setattr(
+            rel,
+            "download_checksums",
+            lambda version, mirrors=None: f"{digest}  {rel.asset_name(version)}\n",  # noqa: ARG005
+        )
+        monkeypatch.setattr(rel, "_verify_binary", lambda path: None)  # noqa: ARG005
+
+        phases: list[str] = []
+        result = rel.install(
+            bin_dir=tmp_path,
+            version="0.71.0",
+            mirrors=("https://example.invalid",),
+            switch=False,
+            on_progress=lambda phase, received=0, total=None: phases.append(phase),  # noqa: ARG005
+        )
+        assert result.downloaded is True
+        assert phases[0] == "checksum"
+        assert phases.count("download") >= 1
+        assert "verify" in phases and phases[-1] == "place"
+
+
+class TestPageResultUnknownTotal:
+    """翻页在信封缺 total 时的行为（R3）：满页续拉、total_known、如实截断。"""
+
+    def _client(self, pages: list[dict]):
+        from frpsctl.core.admin import AdminClient
+
+        client = AdminClient("http://127.0.0.1:1", "u", "p")
+
+        class _Resp:
+            def __init__(self, payload):
+                self.status_code = 200
+                self._payload = payload
+
+        def fake_get(path, *, params=None):
+            page = int(params["page"])
+            return _Resp(pages[page - 1] if page <= len(pages) else {"items": []})
+
+        client._get = fake_get  # type: ignore[method-assign]
+        client._unwrap = lambda resp: resp._payload
+        return client
+
+    def test_missing_total_pulls_until_short_page(self) -> None:
+        client = self._client([
+            {"items": [{"n": i} for i in range(3)]},
+            {"items": [{"n": i} for i in range(3, 4)]},
+        ])
+        result = client._paged("/api/v2/x", page_size=3)
+        assert len(result.items) == 4
+        assert result.total_known is False
+        assert result.total is False or result.total == 4
+        assert result.truncated is False
+
+    def test_explicit_total_still_wins(self) -> None:
+        client = self._client([{"items": [{"n": 1}], "total": 1}])
+        result = client._paged("/api/v2/x", page_size=3)
+        assert result.total == 1 and result.total_known is True and result.truncated is False
+
+    def test_max_pages_marks_truncated(self) -> None:
+        from frpsctl.core.admin import AdminClient
+
+        client = AdminClient("http://127.0.0.1:1", "u", "p")
+
+        class _Resp:
+            status_code = 200
+            _payload = {"items": [{"n": 1}, {"n": 2}]}   # 永远满页
+
+        client._get = lambda path, *, params=None: _Resp()   # noqa: ARG005
+        client._unwrap = lambda resp: resp._payload
+        result = client._paged("/api/v2/x", page_size=2, max_pages=3)
+        assert result.truncated is True
+        assert result.total_known is False
+        assert len(result.items) == 6
+
+
+class TestDoctorLockUnreadable:
+    """doctor 对"锁文件无法探测"的可见降级（R6 的对侧：None → INFO 而非静默）。"""
+
+    def test_unreadable_lock_reports_info(self, inst, monkeypatch) -> None:
+        from frpsctl.core import doctor as doc
+
+        inst.lock.write_text("", "utf-8")
+        real_open = os.open
+        lock_path = inst.lock
+
+        def fake_open(path, flags, *args, **kwargs):
+            if Path(path) == lock_path and flags == os.O_RDONLY:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fake_open)
+        report = doc.run_doctor(inst)
+        findings = [item for item in report.findings if item.check == "实例锁"]
+        assert findings, "无法探测锁时必须产生发现项（降级可见）"
+        assert findings[0].severity is doc.Severity.INFO
+        assert "无法探测" in findings[0].message
+
+
+class TestPortRangesTextPlannable:
+    """F8 的序列化文本必须能被服务端 TOML 解析（前后端边界契约）。"""
+
+    def test_serialized_text_is_plannable(self, tmp_path: Path) -> None:
+        path = tmp_path / "frps.toml"
+        path.write_text("bindPort = 7000\n", "utf-8")
+        text = "[ { single = 6000 }, { start = 7000, end = 7100 } ]"
+        plan = cfg.plan_change_many(path, [("allowPorts", text)])
+        assert not plan.is_noop
+        value = plan.after["allowPorts"]
+        value = value.unwrap() if hasattr(value, "unwrap") else value
+        assert value == [{"single": 6000}, {"start": 7000, "end": 7100}]
+
+
+class TestConfigPendingRestartHelper:
+    """待重启判定单点（RV-2）：不依赖 uptime 字段，pid 与文件系统事实直判。"""
+
+    def test_none_pid_or_missing_config(self, tmp_path: Path) -> None:
+        from frpsctl.core.lifecycle import _config_pending_restart
+
+        config = tmp_path / "frps.toml"
+        assert _config_pending_restart(config, None) is False
+        assert _config_pending_restart(config, os.getpid()) is False  # 文件不存在
+
+    def test_uptime_conversion_none_degrades_safely(self, tmp_path: Path, monkeypatch) -> None:
+        """`_uptime_from_ticks` 返回 None 时按"不提示"降级（不得抛 TypeError）。
+
+        最后一轮 review 对修复本身的复审发现：`time.time() - None` 的 TypeError
+        不在 suppress(OSError) 内，会击穿 status 的"永不异常"承诺。
+        """
+        import frpsctl.core.lifecycle as lc_mod
+        from frpsctl.core import platform as plat_mod
+        from frpsctl.core.lifecycle import _config_pending_restart
+
+        config = tmp_path / "frps.toml"
+        config.write_text("x", "utf-8")
+        monkeypatch.setattr(plat_mod, "proc_start_time", lambda pid: 12345)  # noqa: ARG005
+        monkeypatch.setattr(lc_mod, "_uptime_from_ticks", lambda ticks: None)  # noqa: ARG005
+        assert _config_pending_restart(config, os.getpid()) is False
+
+    def test_mtime_compared_with_process_start(self, tmp_path: Path) -> None:
+        import time as _time
+
+        from frpsctl.core.lifecycle import _config_pending_restart
+
+        config = tmp_path / "frps.toml"
+        config.write_text("bindPort = 7000\n", "utf-8")
+        now = _time.time()
+        os.utime(config, (now, now + 3600))     # 未来 mtime = 明确比进程新
+        assert _config_pending_restart(config, os.getpid()) is True
+        os.utime(config, (now, now - 3600))     # 过去的 mtime
+        assert _config_pending_restart(config, os.getpid()) is False
+
+
+class TestTaskRegistryConcurrency:
+    """任务注册表（RV-3/RV-4）：单飞行的检查+插入原子、淘汰不碰运行中。"""
+
+    def _inst(self, tmp_path: Path):
+        from frpsctl.core.instance import Instance
+
+        inst = Instance(name="t", instances_root=tmp_path, data_home=tmp_path)
+        inst.ensure_dirs()
+        return inst
+
+    def _fake_install(self, monkeypatch, tmp_path: Path, *, delay: float = 0.0):
+        import time as _time
+
+        from frpsctl.core import release as rel
+
+        def fake(**kwargs):
+            if delay:
+                _time.sleep(delay)
+            return rel.InstallResult(
+                version=kwargs["version"],
+                binary=tmp_path / "frps-x",
+                switched=True,
+                downloaded=True,
+            )
+
+        monkeypatch.setattr(rel, "install", fake)
+
+    def test_concurrent_submits_only_one_wins(self, tmp_path: Path, monkeypatch) -> None:
+        """并发提交只有一个成功。
+
+        ⚠️ 语义边界（review 反向验证的诚实记账）：GIL 下"检查→插入"的窄窗口
+        无法被这个测试**可靠复现**——临时把检查移出锁，本测试依旧通过。
+        它守住的是"第二个提交被拒"这一语义；原子性本身是结构性修复
+        （检查+插入同锁），由代码审查保证（§27.5）。
+        """
+        import threading as _threading
+
+        from frpsctl.errors import UsageError
+        from frpsctl.web.tasks import TaskRegistry
+
+        inst = self._inst(tmp_path)
+        self._fake_install(monkeypatch, tmp_path, delay=0.3)
+        registry = TaskRegistry()
+        results: list[str] = []
+        barrier = _threading.Barrier(2)
+
+        def submit(version: str) -> None:
+            barrier.wait()
+            try:
+                registry.submit_install(inst, version=version, only_download=False)
+                results.append("ok")
+            except UsageError:
+                results.append("busy")
+
+        threads = [
+            _threading.Thread(target=submit, args=(version,))
+            for version in ("0.71.0", "0.72.0")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sorted(results) == ["busy", "ok"]
+
+    def test_eviction_skips_running(self) -> None:
+        from frpsctl.web.tasks import Task, TaskRegistry
+
+        registry = TaskRegistry(clock=lambda: 1000.0, max_entries=2)
+        registry._tasks["running"] = Task(
+            id="running", kind="install", version="0.70.0", state="running", started_at=0.0
+        )
+        registry._tasks["done0"] = Task(
+            id="done0", kind="install", version="0.71.0", state="done", started_at=1.0
+        )
+        registry._tasks["done1"] = Task(
+            id="done1", kind="install", version="0.71.0", state="done", started_at=2.0
+        )
+        registry._evict_locked()
+        assert "running" in registry._tasks      # 运行中的任务绝不被淘汰
+        assert "done0" not in registry._tasks    # 最旧的已结束任务被淘汰
+        assert "done1" in registry._tasks
+        assert len(registry._tasks) == 2
+
+
+class TestAdminDetail404:
+    """详情端点的 404 语义（RV-1）：不存在 = 无数据（与 traffic 一致），不是 502。"""
+
+    def test_client_detail_404_is_empty(self) -> None:
+        from frpsctl.core.admin import AdminClient
+
+        client = AdminClient("http://127.0.0.1:1", "u", "p")
+
+        class _Resp:
+            status_code = 404
+
+        client._get = lambda path, params=None: _Resp()  # type: ignore[method-assign]  # noqa: ARG005
+        assert client.client_detail("gone") == {}
