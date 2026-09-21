@@ -28,7 +28,12 @@ export async function api(path, { method = "GET", body = null } = {}) {
   return data;
 }
 
-/** 下载接口（诊断导出）：返回 {blob, filename}。 */
+/** 下载接口（诊断/审计导出）：返回 {blob, filename, headers}。
+ *
+ *  `headers` 用于读取导出元信息（如审计导出的 `X-Export-Truncated`）——截断
+ *  提示放响应头、正文保持严格可解析，前端必须消费它，否则"导出被截断"对用户
+ *  不可见（v0.3.5 复审发现）。
+ */
 export async function apiDownload(path) {
   const resp = await fetch(path);
   if (!resp.ok) {
@@ -39,7 +44,11 @@ export async function apiDownload(path) {
   const blob = await resp.blob();
   const disposition = resp.headers.get("Content-Disposition") || "";
   const match = /filename="?([^";]+)"?/.exec(disposition);
-  return { blob, filename: match ? match[1] : "frpsctl-diagnostics.txt" };
+  return {
+    blob,
+    filename: match ? match[1] : "frpsctl-diagnostics.txt",
+    headers: resp.headers,
+  };
 }
 
 /** 触发浏览器下载。 */

@@ -10,7 +10,7 @@ export function registerView(name, onShow) {
   showHooks.set(name, onShow);
 }
 
-const VIEWS = ["dash", "config", "audit", "services", "versions"];
+const VIEWS = ["dash", "config", "audit", "services", "versions", "commands"];
 
 /** 视图名 → (视图容器 id, 导航按钮 id)：全部字面量，便于守卫静态核对。 */
 const VIEW_IDS = {
@@ -19,6 +19,7 @@ const VIEW_IDS = {
   audit: ["view-audit", "nav-audit"],
   services: ["view-services", "nav-services"],
   versions: ["view-versions", "nav-versions"],
+  commands: ["view-commands", "nav-commands"],
 };
 
 /** 切换视图（含入场动画与首展钩子）。 */

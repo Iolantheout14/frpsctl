@@ -172,7 +172,11 @@ function renderDonut(typeCounts) {
 
 async function refreshLists() {
   try {
-    const [clients, proxies] = await Promise.all([api("/api/clients"), api("/api/proxies")]);
+    const [clients, proxies, users] = await Promise.all([
+      api("/api/clients"),
+      api("/api/proxies"),
+      api("/api/users"),
+    ]);
     state.clientsCache = clients.clients || [];
     state.clientsTotal = clients.total || state.clientsCache.length;
     renderClients(state.clientsCache, state.clientsTotal, clients.total_known !== false);
@@ -180,10 +184,33 @@ async function refreshLists() {
     state.proxiesTotal = proxies.total || state.proxiesCache.length;
     renderProxies(state.proxiesCache, proxies.total_known !== false);
     renderTopProxies(state.proxiesCache);
+    renderUsers(users);
   } catch (err) {
     $("clients-table").textContent = "（dashboard 不可用：" + err.message + "）";
     $("proxies-table").textContent = "（dashboard 不可用：" + err.message + "）";
   }
+}
+
+/** 按用户聚合卡片（v0.3.5 F3）：客户端数 / 代理数（dashboard 的 users 口径）。 */
+function renderUsers(data) {
+  const box = $("users-table");
+  const items = (data && data.users) || [];
+  if (!items.length) {
+    box.replaceChildren(emptyState("暂无按用户数据"));
+    return;
+  }
+  const rows = items.map((item) =>
+    el("tr", {}, [
+      el("td", { text: item.user || "(未声明)" }),
+      el("td", { class: "num", text: String(item.client_count) }),
+      el("td", { class: "num", text: String(item.proxy_count) }),
+    ]),
+  );
+  const nodes = [tableOf(["用户", "客户端", "代理"], rows)];
+  if (data.truncated) {
+    nodes.push(el("div", { class: "muted", text: `（仅显示前 ${data.limit} 个用户）` }));
+  }
+  box.replaceChildren(...nodes);
 }
 
 function renderClients(items, total, totalKnown = true) {

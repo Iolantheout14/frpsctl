@@ -21,14 +21,15 @@ export function initShortcuts() {
     if (!$("modal-backdrop").classList.contains("hidden")) return;  // 弹层自己处理
     if (e.key === "g") { state.gPrefix = Date.now(); return; }
     if (Date.now() - state.gPrefix < 1200) {
-      const nav = { d: "dash", c: "config", a: "audit", s: "services", v: "versions" }[e.key];
+      const nav = { d: "dash", c: "config", a: "audit", s: "services", v: "versions", k: "commands" }[e.key];
       if (nav) { switchView(nav); state.gPrefix = 0; return; }
     }
     if (e.key === "r" && !e.metaKey && !e.ctrlKey) { refresh(); }
     if (e.key === "/") {
       const target = !$("view-config").classList.contains("hidden") ? $("cfg-search")
         : (!$("view-audit").classList.contains("hidden") ? $("audit-filter")
-        : $("proxies-filter"));
+        : (!$("view-commands").classList.contains("hidden") ? $("cmd-search")
+        : $("proxies-filter")));
       e.preventDefault();
       if (target) target.focus();
     }

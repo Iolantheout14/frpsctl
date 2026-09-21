@@ -8,7 +8,6 @@ export const state = {
   timer: null,
   lastStatus: null,
   busy: false,
-  refreshing: false,
   // 列表（客户端 / 代理）
   clientsCache: [],
   clientsTotal: 0,
@@ -35,23 +34,22 @@ export const state = {
   deletes: new Set(),
   addedKeys: [],
   // 历史回滚
-  historyLoaded: false,
   // 审计
   auditLoaded: false,
   auditScope: "plugin",
+  auditFilterScope: "",   // 过滤控件当前对应的 scope（变化时才重建字段选项）
+  auditRecords: [],       // 已加载的记录（显示顺序：新 → 旧）
   lastAuditData: null,
   auditSince: "",
   // 体检
   doctorRunning: false,
   // 服务视图（v0.3.4）
-  servicesData: null,
   // 版本管理（v0.3.4）
   versionTaskId: null,
   versionTaskTimer: null,
   // 快捷键
   gPrefix: 0,
   // 详情抽屉（客户端 / 代理）
-  drawer: null,
 };
 
 /** 主题本地存储键。 */

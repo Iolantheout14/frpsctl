@@ -7,6 +7,8 @@ import { doAction } from "./views/actions.js";
 import { refresh } from "./views/dashboard.js";
 import { applyTheme, isLight } from "./theme.js";
 import { copyText } from "./ui/toast.js";
+import { COMMAND_SURFACE } from "./data/commands.js";
+import { commandText } from "./lib/command-text.js";
 
 let filtered = [];
 let cursor = 0;
@@ -18,12 +20,22 @@ function commandList() {
     { label: "审计", hint: "视图", run: () => switchView("audit") },
     { label: "服务", hint: "视图", run: () => switchView("services") },
     { label: "版本管理", hint: "视图", run: () => switchView("versions") },
+    { label: "命令参考", hint: "视图", run: () => switchView("commands") },
     { label: "刷新数据", hint: "动作", run: () => refresh() },
     { label: "启动 frps", hint: "动作", run: () => doAction("start") },
     { label: "重启 frps", hint: "动作", run: () => doAction("restart") },
     { label: "停止 frps", hint: "动作", run: () => doAction("stop") },
     { label: "切换明暗主题", hint: "界面", run: () => applyTheme(!isLight()) },
     { label: "复制实例名", hint: "界面", run: () => copyText((state.lastStatus && state.lastStatus.instance) || "", "实例名") },
+    // CLI 命令面（v0.3.5）：数据由代码派生（与 shell 补全同源），Enter = 复制命令。
+    ...COMMAND_SURFACE.commands.map((entry) => ({
+      label: `frpsctl ${entry.path}`,
+      hint: entry.readonly ? "命令 · 只读" : "命令 · 变更",
+      run: () => {
+        switchView("commands");
+        copyText(commandText(entry), " 命令");
+      },
+    })),
   ];
 }
 

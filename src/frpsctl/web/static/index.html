@@ -22,20 +22,29 @@
 </head>
 <body>
 <div id="login" class="hidden">
-  <div class="card">
-    <div class="login-logo" aria-hidden="true">
-      <svg width="30" height="30" viewBox="0 0 32 32">
-        <path d="M10 22V10h9v3.2h-5.4v1.6h4.6v3.1h-4.6V22z" fill="white"/>
-      </svg>
+  <div class="card login-card">
+    <div class="login-scan" aria-hidden="true"></div>
+    <div class="login-head">
+      <div class="login-logo" aria-hidden="true">
+        <svg width="30" height="30" viewBox="0 0 32 32">
+          <path d="M10 22V10h9v3.2h-5.4v1.6h4.6v3.1h-4.6V22z" fill="white"/>
+        </svg>
+      </div>
+      <h1 class="login-title" data-text="frpsctl 管理台">frpsctl 管理台</h1>
     </div>
-    <h1>frpsctl 管理台</h1>
     <p>输入启动时显示的管理口令（或口令文件里的值）。</p>
-    <input id="password" type="password" placeholder="口令" autocomplete="current-password">
+    <label class="login-label" for="password">管理口令</label>
+    <div class="login-field">
+      <input id="password" type="password" placeholder="口令" autocomplete="current-password">
+      <button class="iconbtn pw-toggle" id="password-toggle" type="button" aria-pressed="false">显示</button>
+    </div>
+    <p class="muted login-caps" id="login-caps" hidden>⚠ 大写锁定已开启（CapsLock）</p>
     <div class="row mt-12">
       <button class="primary flex-1" id="login-btn">登录</button>
     </div>
-    <p class="muted mt-10" id="login-error"></p>
+    <p class="muted mt-10" id="login-error" role="alert"></p>
     <p class="muted note-12">连续登录失败会被暂时限制（限速与口令错误的提示相同）。</p>
+    <div class="login-meta" id="login-meta"></div>
   </div>
 </div>
 
@@ -50,6 +59,7 @@
       <button id="nav-audit">审计</button>
       <button id="nav-services">服务</button>
       <button id="nav-versions">版本</button>
+      <button id="nav-commands">命令</button>
     </nav>
     <span class="spacer"></span>
     <button id="menu-toggle" title="展开菜单">菜单</button>
@@ -62,6 +72,7 @@
       <button id="act-start">启动</button>
       <button id="act-restart">重启</button>
       <button class="danger" id="act-stop">停止</button>
+      <button id="sessions-btn" title="查看与管理登录会话">会话</button>
       <button id="logout" title="退出登录">登出</button>
     </div>
   </header>
@@ -103,6 +114,11 @@
         <h2>今日流量 Top 5</h2>
         <div class="tablewrap" id="top-proxies"><div class="skeleton"></div></div>
         <p class="chart-note">按今日入站+出站合计排序（双击代理名复制）。</p>
+      </section>
+      <section class="card">
+        <h2>按用户</h2>
+        <div class="tablewrap" id="users-table"><div class="skeleton"></div></div>
+        <p class="chart-note">来自 dashboard 的按用户聚合（客户端数 / 代理数）。</p>
       </section>
       <section class="card span-all">
         <h2>本次会话实时流量（Δ/区间）</h2>
@@ -195,9 +211,23 @@
             <button data-since="7d">7 天</button>
           </span>
           <button id="audit-refresh">刷新</button>
-          <input type="search" id="audit-filter" placeholder="过滤记录…" autocomplete="off" class="w-340">
+          <input type="text" id="audit-from" placeholder="自定义起（ISO / 时间戳 / 24h）" autocomplete="off" class="w-340" aria-label="时间窗起点">
+          <input type="text" id="audit-to" placeholder="自定义止（ISO / 时间戳）" autocomplete="off" class="w-340" aria-label="时间窗终点">
           <span class="muted small">只读视图：打开本页或点刷新时读取一次（不自动轮询）</span>
         </div>
+        <div class="row mb-8">
+          <select id="audit-field" title="服务端过滤字段"></select>
+          <input type="search" id="audit-value" placeholder="服务端过滤值（回车生效，支持子串）" autocomplete="off" class="w-340" aria-label="服务端过滤值">
+          <button id="audit-clear">清除过滤</button>
+          <button id="audit-more" hidden>加载更多</button>
+          <select id="audit-format" title="导出格式">
+            <option value="jsonl">JSONL</option>
+            <option value="csv">CSV</option>
+          </select>
+          <button id="audit-export">导出</button>
+          <input type="search" id="audit-filter" placeholder="过滤当前页…" autocomplete="off" class="w-340">
+        </div>
+        <p class="muted small mb-0" id="audit-page"></p>
         <div class="stats" id="audit-stats"></div>
         <p class="muted small pre-wrap mb-0" id="audit-note"></p>
       </section>
@@ -255,6 +285,34 @@
         <div class="tablewrap"><div id="versions-tasks" class="muted">加载中…</div></div>
       </section>
     </div>
+
+    <div id="view-commands" class="hidden view">
+      <section class="card">
+        <h2>版本与门槛</h2>
+        <div class="kv" id="cmd-info"></div>
+      </section>
+      <section class="card">
+        <h2>命令参考 <span class="muted sub-note">（数据由 CLI 代码派生，与 shell 补全同源）</span></h2>
+        <p class="muted mt-0 small">
+          覆盖全部命令及其参数：徽章标记只读/变更与 root/systemd 要求，命令可一键复制到终端执行；
+          界面上有对应能力的命令会给出跳转按钮。点击命令名展开参数表。
+        </p>
+        <div class="toolbar">
+          <input type="search" id="cmd-search" placeholder="搜索命令 / 参数 / 说明" autocomplete="off" aria-label="搜索命令">
+          <span class="muted small" id="cmd-count"></span>
+          <button id="cmd-expand">全部展开</button>
+        </div>
+        <div id="cmd-tree"></div>
+      </section>
+      <section class="card">
+        <h2>退出码</h2>
+        <div class="tablewrap" id="cmd-exit-codes"></div>
+      </section>
+      <section class="card">
+        <h2>环境变量</h2>
+        <div class="tablewrap" id="cmd-env-vars"></div>
+      </section>
+    </div>
   </main>
 </div>
 <div id="modal-backdrop" class="hidden">
@@ -282,7 +340,14 @@
     <ul id="cmdk-list"></ul>
   </div>
 </div>
-<div id="toast"></div>
+<div id="restart-overlay" class="hidden" role="alertdialog" aria-modal="true" aria-label="管理台正在重启">
+  <div class="overlay-card">
+    <div class="overlay-scan" aria-hidden="true"></div>
+    <p class="overlay-title">管理台正在重启…</p>
+    <p class="muted small mb-0" id="restart-note" aria-live="polite">等待服务恢复，恢复后将自动重新加载</p>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script type="module" src="/static/js/main.js" nonce="__CSP_NONCE__"></script>
 </body>

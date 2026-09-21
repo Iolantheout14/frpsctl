@@ -148,9 +148,63 @@ tr.detail pre { max-height: 260px; }
   display: flex; align-items: center; justify-content: center;
   box-shadow: var(--shadow-md), 0 0 30px -10px var(--accent); margin-bottom: 12px;
 }
-#login .card { width: 360px; }
+#login .card { width: min(380px, 100%); }
 #login h1 { margin: 0 0 4px; font-size: 20px; }
 #login p { color: var(--muted); margin: 0 0 16px; }
+/* v0.3.5 登录页 2.0：HUD 扫描线 + 口令可见性 + CapsLock 提示 + 元信息带。 */
+.login-card { position: relative; overflow: hidden; }
+.login-scan {
+  position: absolute; left: 0; right: 0; height: 2px; top: 0;
+  background: var(--accent-grad); opacity: 0; pointer-events: none;
+  animation: login-scan-move 3.2s ease-in-out infinite;
+}
+@keyframes login-scan-move {
+  0%, 100% { top: 0; opacity: 0; }
+  50% { top: calc(100% - 2px); opacity: .65; }
+}
+/* 切角头部横幅：与主界面 header 的品牌区同款语言（渐变 + glitch 文本）。 */
+.login-head {
+  margin: -16px -16px 14px; padding: 18px 16px 14px;
+  clip-path: var(--clip-cut); background: var(--hero-grad);
+  border-bottom: 1px solid var(--glass-border);
+}
+.login-title {
+  position: relative; margin: 0; font-size: 20px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-weight: 750; letter-spacing: .04em;
+  background: var(--accent-grad); -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  animation: brand-glitch 4.2s steps(1) infinite;
+}
+/* glitch 叠层：主标题是渐变文字（color: transparent），叠层用独立颜色做
+ * 周期性 RGB 偏移——`data-text` 属性的消费方（此前它是死属性）。 */
+.login-title::before {
+  content: attr(data-text); position: absolute; left: 0; top: 0;
+  color: var(--magenta); opacity: 0; pointer-events: none;
+  animation: login-glitch 4.2s steps(1) infinite;
+}
+@keyframes login-glitch {
+  0%, 91%, 100% { opacity: 0; transform: none; }
+  92% { opacity: .65; transform: translate(-2px, 0); }
+  94% { opacity: .5; transform: translate(2px, 1px); }
+  96% { opacity: 0; }
+}
+.login-label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+.login-field { display: flex; gap: 8px; align-items: center; }
+.login-field input { flex: 1; }
+.pw-toggle { flex: 0 0 auto; }
+#login .login-caps { color: var(--warn); margin: 8px 0 0; font-size: 12px; }
+.login-meta {
+  margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 11.5px; display: flex; flex-wrap: wrap; gap: 4px 12px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.login-shake { animation: login-shake-kf .32s ease; }
+@keyframes login-shake-kf {
+  0%, 100% { transform: none; }
+  25% { transform: translateX(-6px); }
+  75% { transform: translateX(6px); }
+}
 
 /* ---------- 工具条与徽标 ---------- */
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -209,6 +263,8 @@ tr.detail pre { max-height: 260px; }
 .cmdk-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
 .cmdk-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .cmdk-empty { padding: 12px; text-align: center; }
+.cmdk-label { color: var(--text); }
+.cmdk-hint { font-size: 11.5px; }
 
 /* ---------- 服务卡 ---------- */
 .service-card .service-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
@@ -263,3 +319,48 @@ main::-webkit-scrollbar-thumb:hover, pre::-webkit-scrollbar-thumb:hover, .tablew
     transition-duration: .001ms !important;
   }
 }
+
+/* ---------- 重启等待覆盖层（v0.3.5 F4） ---------- */
+#restart-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  background: var(--glass); backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+}
+.overlay-card {
+  position: relative; overflow: hidden; width: min(340px, 100%);
+  background: var(--panel2); border: 1px solid var(--glass-border);
+  border-radius: var(--radius); padding: 22px 18px; text-align: center;
+  box-shadow: var(--shadow-lg);
+}
+.overlay-title { margin: 0 0 6px; font-weight: 650; letter-spacing: .04em; }
+.overlay-scan {
+  position: absolute; left: 0; right: 0; height: 2px;
+  background: var(--accent-grad);
+  animation: login-scan-move 2.4s ease-in-out infinite;
+}
+
+/* ---------- 命令参考视图（v0.3.5） ---------- */
+.cmd-group { margin-bottom: 8px; }
+.cmd-item {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel2); margin-bottom: 6px; overflow: hidden;
+  transition: border-color .18s ease;
+}
+.cmd-item.open { border-color: var(--accent-soft); }
+.cmd-item-head {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  padding: 8px 10px; cursor: pointer;
+}
+.cmd-item-head:hover { background: var(--accent-soft); }
+.cmd-code {
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 12.5px; color: var(--text);
+}
+.cmd-badges { display: flex; gap: 6px; flex: 1; }
+.cmd-buttons { display: flex; gap: 6px; }
+.cmd-item-body { display: none; padding: 0 10px 10px; }
+.cmd-item.open .cmd-item-body { display: block; }
+.tag-ro { color: var(--ok); border-color: var(--tag-online-border); }
+.tag-mut { color: var(--warn); }
+.tag-root { color: var(--err); border-color: var(--danger-border); }
+.tag-sys { color: var(--accent2); border-color: var(--glass-border); }
