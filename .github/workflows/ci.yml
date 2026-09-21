@@ -35,6 +35,13 @@ jobs:
       - name: 静态分析
         run: .venv/bin/ruff check src/ tests/
 
+      - name: 命令面生成物（与 CLI 命令面同源，无漂移）
+        run: |
+          # v0.3.5：Web"命令"视图的数据由 cli/introspect.py 从 Typer app 反射生成
+          # （静态 JS 模块，与命令面契约快照、shell 补全同源）。这里断言重新生成
+          # 后无 diff——界面展示的命令面不允许落后于 CLI。
+          .venv/bin/python -m frpsctl.cli.introspect --check
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -180,7 +187,52 @@ jobs:
               raise AssertionError("实例未运行时 /api/traffic 应当 502")
           except urllib.error.HTTPError as exc:
               assert exc.code == 502, exc.code
-          print("web 冒烟通过：login / session / status / config / history / diff / doctor / audit / traffic-502 / favicon / 静态页")
+          # v0.3.5：免认证的登录页信息（键集合固定）与会话列表（脱敏）
+          info = json.load(urllib.request.urlopen(base + "/api/login-info", timeout=10))
+          assert set(info) == {"instance", "frpsctl", "frps_minimum", "frps_reckoned", "non_loopback"}, info
+          sessions = call("/api/sessions")
+          assert sessions["count"] >= 1 and sessions["sessions"][0]["current"] is True, sessions
+          # v0.3.5：审计自定义起止（until 从 core 打通到接口）
+          until_audit = call("/api/audit?scope=web&until=1")
+          assert until_audit["page"]["matched"] == 0, until_audit["page"]
+          # v0.3.5：审计导出（附件）+ 截断元信息在响应头、正文严格可解析
+          export_req = urllib.request.Request(
+              base + "/api/audit/export?scope=web&format=jsonl", headers={"Cookie": cookie}
+          )
+          with urllib.request.urlopen(export_req, timeout=10) as resp:
+              assert "attachment" in resp.headers.get("Content-Disposition", ""), resp.headers
+              assert resp.headers.get("X-Export-Truncated") in ("true", "false"), resp.headers
+              assert resp.headers.get("X-Export-Records") is not None, resp.headers
+              export_body = resp.read().decode("utf-8")
+              assert export_body.strip(), "审计导出为空"
+              for line in export_body.splitlines():
+                  if line.strip():
+                      json.loads(line)  # 正文无注释污染（review 修复）
+          # v0.3.5 review：非有限时间窗与非布尔 keep_current 都必须 400
+          for bad_query in ("scope=web&since=nan", "scope=web&until=inf"):
+              try:
+                  call("/api/audit?" + bad_query)
+                  raise AssertionError(f"{bad_query} 应当 400")
+              except urllib.error.HTTPError as exc:
+                  assert exc.code == 400, (bad_query, exc.code)
+          try:
+              post("/api/actions/sessions-revoke", {"keep_current": "false"})
+              raise AssertionError("keep_current 非布尔应当 400")
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 400, exc.code
+          # v0.3.5：按用户聚合在实例未运行时同样是 502（与 traffic 同语义）
+          try:
+              call("/api/users")
+              raise AssertionError("实例未运行时 /api/users 应当 502")
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 502, exc.code
+          # v0.3.5：Web"命令"视图的数据源（命令面生成物）随 wheel 分发
+          commands_js = urllib.request.urlopen(
+              base + "/static/js/data/commands.js", timeout=10
+          ).read().decode("utf-8")
+          assert "export const COMMAND_SURFACE" in commands_js, "命令面生成物缺失"
+          assert commands_js.count('"path"') >= 60, "命令面生成物不完整"
+          print("web 冒烟通过：login / login-info / session / sessions / status / config / history / diff / doctor / audit / audit-export / users-502 / traffic-502 / commands.js / favicon / 静态页")
           EOF
           kill "$WEB_PID"
           wait "$WEB_PID" 2>/dev/null || true

@@ -67,6 +67,7 @@ jobs:
               "frpsctl/core/serve_guard.py",
               "frpsctl/core/web_audit.py",
               "frpsctl/web/tasks.py",
+              "frpsctl/cli/introspect.py",
               "frpsctl/report.py",
               "frpsctl/capabilities.py",
               "frpsctl/env.py",
@@ -109,6 +110,10 @@ jobs:
               "frpsctl/web/static/js/views/audit.js",
               "frpsctl/web/static/js/views/services.js",
               "frpsctl/web/static/js/views/versions.js",
+              "frpsctl/web/static/js/views/commands.js",
+              "frpsctl/web/static/js/views/sessions.js",
+              "frpsctl/web/static/js/lib/command-text.js",
+              "frpsctl/web/static/js/data/commands.js",
           }
           missing = required - names
           if missing:
