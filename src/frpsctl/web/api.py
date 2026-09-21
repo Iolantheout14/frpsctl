@@ -21,12 +21,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote
 
@@ -34,6 +36,8 @@ from .. import report as report_mod
 from ..core import auditlog
 from ..core import config as cfg
 from ..core import doctor as doc
+from ..core import serve_guard
+from ..core import serve_runtime
 from ..core.admin import (
     TRAFFIC_MAX_PROXIES,
     AdminClient,
@@ -45,7 +49,7 @@ from ..core.healthcheck import parse_dashboard
 from ..core.instance import Instance
 from ..core.lifecycle import HealthReport, Lifecycle, State
 from ..core.lock import instance_lock
-from ..core.logs import resolve_log_target, tail_lines
+from ..core.logs import resolve_log_target, tail_lines, tail_since
 from ..core.transaction import apply_sets, rollback_to, snapshot_diff
 from ..core import web_audit
 from ..errors import (
@@ -57,6 +61,7 @@ from ..errors import (
 )
 from .auth import AuthManager, LoginAuditLimiter
 from .cache import TTLCache
+from .tasks import TaskRegistry
 
 __all__ = ["WebContext", "dispatch", "http_status_for"]
 
@@ -149,6 +154,8 @@ class WebContext:
     #: 进程级复用的 Lifecycle：owner 探测有实例级 2s TTL，5 秒轮询不必
     #: 每轮 fork 两个 systemctl（见 `Lifecycle.resolve_owner`）。
     _lifecycle_instance: object | None = field(init=False, default=None)
+    #: 后台任务表（v0.3.4：版本安装；单飞行 + 有界 + clock 可注入）
+    tasks: TaskRegistry = field(default_factory=TaskRegistry)
 
     def __post_init__(self) -> None:
         self.cache = TTLCache(lambda: self.clock())
@@ -264,8 +271,21 @@ def _route(
             return 200, status_payload(ctx)
         if path == "/api/clients":
             return 200, clients_payload(ctx)
+        if path.startswith("/api/clients/"):
+            return 200, client_detail_payload(ctx, unquote(path[len("/api/clients/"):]))
         if path == "/api/proxies":
             return 200, proxies_payload(ctx)
+        if path.startswith("/api/proxies/"):
+            return 200, proxy_detail_payload(ctx, unquote(path[len("/api/proxies/"):]))
+        if path == "/api/services":
+            return 200, services_payload(ctx)
+        if path == "/api/versions":
+            return 200, versions_payload(ctx)
+        if path == "/api/tasks":
+            return 200, {"tasks": ctx.tasks.list_payloads()}
+        if path.startswith("/api/tasks/") and path != "/api/tasks/install":
+            # install 只接受 POST；GET 它应当是 404（而不是"任务不存在"）
+            return 200, task_payload(ctx, path[len("/api/tasks/"):])
         if path == "/api/traffic":
             return 200, traffic_payload(ctx)
         if path.startswith("/api/traffic/"):
@@ -273,7 +293,7 @@ def _route(
         if path == "/api/doctor":
             return 200, doctor_payload(ctx)
         if path == "/api/audit":
-            return 200, audit_payload(ctx, query.get("scope", "plugin"))
+            return 200, audit_payload(ctx, query.get("scope", "plugin"), query.get("since", ""))
         if path == "/api/config":
             return 200, config_payload(ctx)
         if path == "/api/config/history":
@@ -282,7 +302,7 @@ def _route(
             steps = path[len("/api/config/history/") : -len("/diff")]
             return 200, history_diff_payload(ctx, steps)
         if path == "/api/logs":
-            return 200, logs_payload(ctx, query.get("lines"))
+            return 200, logs_payload(ctx, query.get("lines"), query.get("since"))
         return 404, {"error": f"未知接口：GET {path}"}
 
     if method == "POST":
@@ -292,6 +312,8 @@ def _route(
             return 200, config_preview(ctx, body)
         if path == "/api/config/apply":
             return 200, config_apply(ctx, body, request_info=request_info)
+        if path == "/api/tasks/install":
+            return 200, task_install(ctx, body, request_info=request_info)
         return 404, {"error": f"未知接口：POST {path}"}
 
     return 405, {"error": f"不支持的请求方法：{method}"}
@@ -361,7 +383,12 @@ def clients_payload(ctx: WebContext) -> dict:
     admin = _admin(ctx)
     with admin:
         page = admin.page_clients()
-    payload = {"clients": page.items, "total": page.total, "truncated": page.truncated}
+    payload = {
+        "clients": page.items,
+        "total": page.total,
+        "truncated": page.truncated,
+        "total_known": page.total_known,
+    }
     ctx.cache.put("clients", payload)
     return payload
 
@@ -377,6 +404,7 @@ def proxies_payload(ctx: WebContext) -> dict:
         "proxies": [asdict(item) for item in page.items],
         "total": page.total,
         "truncated": page.truncated,
+        "total_known": page.total_known,
     }
     ctx.cache.put("proxies", payload)
     return payload
@@ -451,8 +479,8 @@ def doctor_payload(ctx: WebContext) -> dict:
     return report_mod.doctor_payload(doc.run_doctor(ctx.inst))
 
 
-def _web_audit_payload(ctx: WebContext) -> dict:
-    """Web 操作审计视图（0.3.0）：路径 + 统计 + 尾部记录。"""
+def _web_audit_payload(ctx: WebContext, window: float | None = None) -> dict:
+    """Web 操作审计视图（0.3.0；v0.3.4 支持 `since` 时间窗）。路径 + 统计 + 尾部记录。"""
     path = web_audit.resolve_path(ctx.inst)
     if not path.exists():
         return {
@@ -464,7 +492,7 @@ def _web_audit_payload(ctx: WebContext) -> dict:
             "tail": [],
             "bad_lines": 0,
         }
-    summary = web_audit.summarize(path)
+    summary = web_audit.summarize(path, since=window)
     tail = auditlog.read_tail(path, AUDIT_TAIL_LINES)
     return {
         "scope": "web",
@@ -488,15 +516,21 @@ def _web_audit_payload(ctx: WebContext) -> dict:
     }
 
 
-def audit_payload(ctx: WebContext, scope: str = "plugin") -> dict:
+def audit_payload(ctx: WebContext, scope: str = "plugin", since_raw: str = "") -> dict:
     """审计视图：`scope=plugin`（默认，兼容）或 `scope=web`（操作审计）。
+
+    `since`（v0.3.4）：`24h / 7d / 30m`、ISO 时间或 unix 时间戳——与 CLI
+    `--since` 同一解析器（`auditlog.parse_since`）；非法值 400（不猜测）。
 
     策略文件缺失/不合法时也返回 200（`available=false` + reason）——审计视图
     的职责是"展示现状"，不是替 `plugin check` 做严格校验；一条 400 只会让页面
     失去"为什么看不到审计"的解释。非法 scope 同样是 400（不猜测调用意图）。
     """
+    window: float | None = None
+    if since_raw:
+        window = auditlog.parse_since(since_raw)
     if scope == "web":
-        return _web_audit_payload(ctx)
+        return _web_audit_payload(ctx, window)
     if scope != "plugin":
         raise UsageError(f"未知的审计范围：{scope!r}", hint="可用：plugin / web")
     view = auditlog.load_view(ctx.inst)
@@ -512,7 +546,7 @@ def audit_payload(ctx: WebContext, scope: str = "plugin") -> dict:
         "bad_lines": 0,
     }
     if view.available and view.enabled and view.path is not None:
-        summary = auditlog.summarize(view.path)
+        summary = auditlog.summarize(view.path, since=window)
         tail = auditlog.read_tail(view.path, AUDIT_TAIL_LINES)
         payload["stats"] = report_mod.audit_summary_payload(summary)
         payload["tail"] = tail.records
@@ -592,20 +626,46 @@ def history_diff_payload(ctx: WebContext, steps_raw: str) -> dict:
     }
 
 
-def logs_payload(ctx: WebContext, lines_raw: str | None) -> dict:
+def logs_payload(ctx: WebContext, lines_raw: str | None, since_raw: str | None = None) -> dict:
+    """日志尾部（全量）或**增量**（`since` 为上次返回的字节 offset，v0.3.4）。
+
+    - 全量（since 缺省/非法）：保留 3 秒服务端缓存（轮询命中友好），
+      `reset=true` 且带当前 offset；
+    - 增量：**不缓存**（每次结果都不同），只返回新增的完整行——
+      长日志不再每 5 秒整段重传与重渲染。
+    """
     try:
         lines = int(lines_raw) if lines_raw else 200
     except ValueError:
         lines = 200
     lines = max(1, min(lines, MAX_LOG_LINES))
-    cache_key = f"logs:{lines}"
-    cached = ctx.cache.get(cache_key, CACHE_TTL_LOGS)
-    if cached is not None:
-        return cached
     target = resolve_log_target(ctx.inst)
-    payload = {"path": str(target), "lines": tail_lines(target, lines)}
-    ctx.cache.put(cache_key, payload)
-    return payload
+    since: int | None = None
+    if since_raw:
+        try:
+            since = max(0, int(since_raw))
+        except ValueError:
+            since = None
+    if since is None:
+        cache_key = f"logs:{lines}"
+        cached = ctx.cache.get(cache_key, CACHE_TTL_LOGS)
+        if cached is not None:
+            return cached
+        try:
+            offset = target.stat().st_size
+        except OSError:
+            # 拿不到大小 → 让前端下次也走全量（若给 0，增量会从文件头重复投递）
+            offset = None
+        payload = {
+            "path": str(target),
+            "lines": tail_lines(target, lines),
+            "offset": offset,
+            "reset": True,
+        }
+        ctx.cache.put(cache_key, payload)
+        return payload
+    new_lines, new_offset, reset = tail_since(target, since, max_lines=lines)
+    return {"path": str(target), "lines": new_lines, "offset": new_offset, "reset": reset}
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +714,8 @@ def _perform_action(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
     lc = ctx.lifecycle()
     health_timeout = _bounded_float(body.get("health_timeout"), 10.0)
 
+    if action in ("plugin-start", "plugin-stop", "plugin-restart"):
+        return _plugin_service_action(ctx, action)
     if action == "start":
         report = lc.start(health_timeout=health_timeout)
         return report_mod.start_payload(report)
@@ -859,3 +921,296 @@ def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 1
     if not (minimum <= parsed <= maximum):
         raise UsageError(f"整数越界（{minimum}..{maximum}）：{value!r}")
     return parsed
+
+
+# ---------------------------------------------------------------------------
+# v0.3.4 新增：详情 / 服务 / 版本 / 任务 / 诊断导出
+# ---------------------------------------------------------------------------
+
+
+def client_detail_payload(ctx: WebContext, key: str) -> dict:
+    """单客户端详情（v2 透传；前端抽屉展示）。"""
+    key = key.strip()
+    if not key:
+        raise UsageError("客户端 key 不能为空")
+    if len(key) > MAX_PROXY_NAME:
+        raise UsageError(f"客户端 key 过长（>{MAX_PROXY_NAME} 字符）")
+    admin = _admin(ctx)
+    with admin:
+        detail = admin.client_detail(key)
+    return {"key": key, "detail": detail}
+
+
+def proxy_detail_payload(ctx: WebContext, name: str) -> dict:
+    """单代理详情（v2 透传；离线/不存在返回空对象——与 traffic 的 404 语义一致）。"""
+    name = name.strip()
+    if not name:
+        raise UsageError("代理名不能为空")
+    if len(name) > MAX_PROXY_NAME:
+        raise UsageError(f"代理名过长（>{MAX_PROXY_NAME} 字符）")
+    admin = _admin(ctx)
+    with admin:
+        detail = admin.proxy_detail(name)
+    return {"name": name, "detail": detail}
+
+
+def services_payload(ctx: WebContext) -> dict:
+    """三个服务的托管状态（frps / Web 管理台 / 服务端插件，v0.3.4 F1）。
+
+    视图语义与 CLI `web status` 相同：systemd 优先、direct 次之；探测失败
+    如实降级（`detail` 带错误文本，不猜）。
+    """
+    from ..core.systemd import PluginService, WebService
+
+    inst = ctx.inst
+    report = ctx.lifecycle().status()
+    services: dict[str, dict[str, Any]] = {
+        "frps": {
+            "owner": report.owner.value,
+            "active": report.state in (State.RUNNING, State.SYSTEMD_ACTIVE),
+            "state": report.state.value,
+            "pid": report.pid,
+            "uptime_seconds": report.uptime_seconds,
+            "listen": None
+            if report.listen is None
+            else {"addr": report.listen.addr, "port": report.listen.port},
+            "systemd_unit": report.systemd_unit,
+            "detail": report.systemd_probe_error or "",
+        }
+    }
+    pairs = (
+        (serve_runtime.WEB_SPEC, WebService(inst)),
+        (serve_runtime.PLUGIN_SPEC, PluginService(inst)),
+    )
+    for spec, service in pairs:
+        systemd_active = False
+        probe_error = ""
+        if service.available:
+            try:
+                systemd_active = service.is_active()
+            except FrpsctlError as exc:
+                probe_error = exc.message
+        direct = serve_runtime.probe(inst, spec)
+        if systemd_active:
+            owner = "systemd"
+        elif direct.running:
+            owner = "direct"
+        elif direct.owner is serve_runtime.ServeOwner.CORRUPTED:
+            owner = "corrupted"
+        elif direct.owner is serve_runtime.ServeOwner.FOREIGN:
+            owner = "foreign"
+        else:
+            owner = "none"
+        pid: int | None = None
+        if systemd_active:
+            with contextlib.suppress(FrpsctlError):
+                pid = service.main_pid()
+        elif direct.running and direct.state is not None:
+            pid = direct.state.pid
+        services[spec.key] = {
+            "owner": owner,
+            "active": systemd_active or direct.running,
+            "state": "运行中" if (systemd_active or direct.running) else "未运行",
+            "pid": pid,
+            "uptime_seconds": direct.uptime_seconds if direct.running else None,
+            "bind": (direct.state.args.get("bind") if direct.state else None),
+            "log": (direct.state.log if direct.state else None),
+            "systemd_unit": service.unit_name,
+            "detail": direct.error or probe_error or "",
+        }
+    return {"instance": inst.name, "services": services}
+
+
+def _plugin_direct_start(ctx: WebContext, fallback_args: dict | None = None) -> dict:
+    """direct 模式启动插件（参数来源与 CLI `plugin start` 同一套规则）。"""
+    from ..core.auditlog import resolve_policy_path
+    from ..core.healthcheck import is_loopback, parse_bind
+
+    inst = ctx.inst
+    last, error = serve_runtime.read_state(inst, serve_runtime.PLUGIN_SPEC)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    old = dict(last.args) if last is not None else dict(fallback_args or {})
+    # 复用旧参数里的策略路径（restart 场景：CLI 也有同一条"旧参数优先"规则），
+    # 并用与 `plugin check/start` 同一套解析校验策略内容（v0.3.4 review 修复）
+    policy_raw = old.get("policy")
+    policy_file = Path(str(policy_raw)) if policy_raw else resolve_policy_path(inst)
+    # 绝对化：旧 state 可能记录相对路径（历史版本），按实例目录解析不可靠，
+    # 统一转绝对后再用于校验与 argv（与 CLI 启动时的写入规则一致）
+    policy_file = policy_file.resolve()
+    if not policy_file.exists():
+        raise ConfigError(
+            f"插件策略文件不存在：{policy_file}",
+            hint="先在 CLI 运行 `frpsctl plugin init` 生成策略",
+        )
+    from ..plugin.policy import PluginPolicy
+
+    try:
+        PluginPolicy.load(policy_file)
+    except FrpsctlError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 策略解析异常统一转契约错误
+        raise ConfigError(f"策略文件无法解析：{policy_file}（{exc}）") from None
+    bind = str(old.get("bind") or "127.0.0.1:8080")
+    handler_path = str(old.get("path") or "/handler")
+    access_log = bool(old.get("access_log", False))
+    host, port = parse_bind(bind, default_port=8080)
+    if not is_loopback(host):
+        # 插件协议没有任何认证：非回环直接拒绝（与 CLI 同一判据）
+        raise UsageError(
+            f"插件拒绝绑定非回环地址：{bind}",
+            hint="请在 CLI 用 `plugin start --bind 127.0.0.1:...` 修正启动参数",
+        )
+    argv = serve_runtime.build_serve_argv(
+        serve_runtime.frpsctl_executable(),
+        subcommand="plugin",
+        bind=bind,
+        policy=policy_file,
+        handler_path=handler_path,
+        access_log=access_log,
+    )
+    args = {"policy": str(policy_file), "bind": bind, "path": handler_path, "access_log": access_log}
+    state = serve_runtime.start_background(
+        inst, serve_runtime.PLUGIN_SPEC, argv=argv, args=args, host=host, port=port
+    )
+    return {"owner": "direct", "action": "start", "pid": state.pid, "bind": bind, "log": state.log}
+
+
+def _plugin_service_action(ctx: WebContext, action: str) -> dict:
+    """插件服务的 start/stop/restart（Web 与 CLI 同一套 core 语义，v0.3.4 F1）。
+
+    按当前托管模式分派：systemd unit 存在 → systemctl 委托；否则 direct。
+    两个方向都经 **core 守卫单点**（这是它从 CLI 下沉 core 的直接动机：
+    Web 的启停此前会绕过互斥，见 `core/serve_guard.py`）。
+    """
+    from ..core.systemd import PluginService
+
+    verb = action.split("-", 1)[1]
+    if verb not in ("start", "stop", "restart"):
+        raise UsageError(f"未知插件动作：{action!r}")
+    inst = ctx.inst
+    service = PluginService(inst)
+    spec = serve_runtime.PLUGIN_SPEC
+    if service.unit_exists():
+        serve_guard.guard_against_direct(inst, spec)
+        getattr(service, verb)()
+        return {"owner": "systemd", "action": verb, "unit": service.unit_name}
+    if verb == "start":
+        serve_guard.guard_against_systemd(inst, spec)
+        return _plugin_direct_start(ctx)
+    if verb == "stop":
+        state = serve_runtime.stop_background(inst, spec)
+        return {"owner": "direct", "action": "stop", "stopped": True, "pid": state.pid}
+    # restart：先读后停（与 CLI 的 review 修复同一条纪律）
+    serve_guard.guard_against_systemd(inst, spec)
+    last, error = serve_runtime.read_state(inst, spec)
+    if error is not None:
+        raise ConfigError(error, hint="删除状态文件后重试（会重建）")
+    with contextlib.suppress(FrpsctlError):
+        serve_runtime.stop_background(inst, spec)
+    return _plugin_direct_start(ctx, fallback_args=dict(last.args) if last is not None else None)
+
+
+def versions_payload(ctx: WebContext) -> dict:
+    """版本信息（frpsctl / 运行中 / 磁盘；版本管理页与安装表单预填，v0.3.4 F11）。"""
+    from .. import __version__
+    from ..core.version import MINIMUM_VERSION, RECKONED_VERSION
+
+    report = ctx.lifecycle().status()
+    running = report.binary_version
+    disk = report.disk_version
+    return {
+        "frpsctl": __version__,
+        "binary": {
+            "running": running,
+            "disk": disk,
+            "match": bool(running and disk and running == disk),
+        },
+        "minimum": ".".join(str(part) for part in MINIMUM_VERSION),
+        "reckoned": ".".join(str(part) for part in RECKONED_VERSION),
+        "hint": report.version_hint or "",
+    }
+
+
+def task_install(
+    ctx: WebContext, body: dict[str, Any], *, request_info: RequestInfo | None = None
+) -> dict:
+    """提交 frps 安装任务（后台线程执行；单飞行；v0.3.4 F11）。"""
+    version = str(body.get("version") or "")
+    only_download = bool(body.get("only_download", False))
+    try:
+        task = ctx.tasks.submit_install(
+            ctx.inst, version=version, only_download=only_download, mirrors=None
+        )
+    except Exception as exc:
+        _audit(
+            ctx,
+            request_info,
+            action="install",
+            target=version,
+            result=f"error:{type(exc).__name__}",
+        )
+        raise
+    _audit(ctx, request_info, action="install", target=task.version)
+    return {"task_id": task.id, "state": task.state, "version": task.version}
+
+
+def task_payload(ctx: WebContext, task_id: str) -> dict:
+    """查询任务状态（前端 1 秒轮询）。"""
+    task = ctx.tasks.get(task_id)
+    if task is None:
+        raise ConfigError(
+            f"任务不存在：{task_id}",
+            hint="任务表有界（最近 8 条），过旧的任务会被淘汰",
+        )
+    return task.payload()
+
+
+def diagnostics_text(ctx: WebContext) -> str:
+    """诊断报告（F9）：状态 + 体检 + 打码配置 + 日志尾部。
+
+    纯文本导出——配置值经 `config.mask_value` 打码；日志**不脱敏**（它由 frp
+    写入，可能包含客户端信息），页面与 README 都提示自行检查。
+    """
+    import time as _time
+
+    from .. import __version__
+
+    inst = ctx.inst
+    report = ctx.lifecycle().status()
+    lines: list[str] = [
+        "# frpsctl 诊断报告",
+        f"# 生成时间：{_time.strftime('%Y-%m-%dT%H:%M:%S')}",
+        f"# frpsctl：{__version__}",
+        f"# 实例：{inst.name}",
+        "",
+        "## 状态（JSON）",
+        json.dumps(
+            report_mod.status_payload(report, include_paths=True),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
+        "",
+        "## 体检（与 CLI doctor 同一实现）",
+    ]
+    doctor_report = doc.run_doctor(inst)
+    findings = doctor_report.sorted_findings()
+    if not findings:
+        lines.append("（无发现项）")
+    for finding in findings:
+        lines.append(f"[{finding.severity.value}] {finding.check}：{finding.message}")
+        if finding.hint:
+            lines.append(f"    ↳ {finding.hint}")
+    lines += ["", "## 配置（敏感值已打码；完整原文请用 CLI `config get --reveal`）"]
+    try:
+        for key, value in cfg.flatten_tree(cfg.load_config(inst.config)):
+            shown = cfg.mask_value(_plain(value)) if cfg.is_secret_key(key) else _plain(value)
+            lines.append(f"{key} = {shown}")
+    except FrpsctlError as exc:
+        lines.append(f"（配置读取失败：{exc.message}）")
+    lines += ["", "## 日志尾部（最多 200 行；请自行检查敏感内容）"]
+    target = resolve_log_target(inst)
+    lines.append(f"# 来源：{target}")
+    lines.extend(line.rstrip("\n") for line in tail_lines(target, 200))
+    return "\n".join(lines) + "\n"

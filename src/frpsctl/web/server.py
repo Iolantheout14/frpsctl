@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import signal
 import threading
@@ -30,7 +31,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..core.healthcheck import parse_bind
 from ..core.httpserver import BoundedThreadingHTTPServer
@@ -38,10 +39,43 @@ from ..core import web_audit
 from .api import RequestInfo, WebContext, dispatch
 from .auth import SESSION_COOKIE
 
-__all__ = ["WebServer", "WebSettings", "STATIC_INDEX"]
+__all__ = ["STATIC_DIR", "STATIC_INDEX", "WebServer", "WebSettings"]
 
-#: 单文件前端（package data，随 wheel 分发）。
-STATIC_INDEX = Path(__file__).parent / "static" / "index.html"
+#: 前端静态资源目录（package data，随 wheel 分发）。
+STATIC_DIR = Path(__file__).parent / "static"
+
+#: 单文件入口（shell：HTML 结构 + 主题内联脚本 + 模块引用）。
+STATIC_INDEX = STATIC_DIR / "index.html"
+
+#: 静态资源白名单（扩展名 → MIME）。**拒绝一切白名单外的类型**。
+_STATIC_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
+
+#: 单个静态资源的字节上限（前端模块都是几十 KB 级；防误放巨物）。
+MAX_STATIC_BYTES = 1 << 20  # 1 MiB
+
+
+def resolve_static(rel: str) -> Path | None:
+    """把 `/static/<rel>` 解析为磁盘文件；越界/类型不符/不存在一律 None。
+
+    防穿越：URL 解码后必须不含 `..` 路径段，且 `resolve()` 后仍位于
+    `STATIC_DIR` 之内（symlink 逃逸同样被这层拦住）——静态路由是新增的
+    攻击面，宁可多一道检查。
+    """
+    rel = unquote(rel)
+    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+        return None
+    candidate = (STATIC_DIR / rel).resolve()
+    base = STATIC_DIR.resolve()
+    if not str(candidate).startswith(str(base) + os.sep):
+        return None
+    if candidate.suffix not in _STATIC_TYPES or not candidate.is_file():
+        return None
+    return candidate
+
 
 #: 请求体上限：管理台的请求都很小，限制它防止有人拿它当上传口。
 MAX_BODY_BYTES = 1 << 20  # 1 MiB
@@ -110,6 +144,9 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             if parsed.path in ("/", "/index.html"):
                 self._send_index()
                 return
+            if parsed.path.startswith("/static/"):
+                self._send_static(parsed.path[len("/static/"):])
+                return
             if parsed.path == "/metrics":
                 self._handle_metrics()
                 return
@@ -133,6 +170,19 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                     200,
                     {"csrf": session.csrf, "ttl": ctx.auth.session_ttl},
                     cacheable=False,
+                )
+                return
+            if parsed.path == "/api/diagnostics":
+                # 诊断导出（v0.3.4 F9）：文本附件下载（配置已打码；日志需自行检查）
+                if session is None:
+                    self._send_json(401, {"error": "未登录"}, cacheable=False)
+                    return
+                from .api import diagnostics_text
+
+                self._send_attachment(
+                    200,
+                    diagnostics_text(ctx),
+                    f"frpsctl-diagnostics-{ctx.inst.name}.txt",
                 )
                 return
             status, payload = dispatch(
@@ -365,8 +415,55 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在响应写出前断开连接")
 
+        def _send_static(self, rel: str) -> None:
+            """下发静态资源（白名单扩展名 + 防穿越 + ETag 条件请求）。
+
+            `no-cache` + ETag：每次验证、命中 304 零 body。不设 immutable，
+            也不做版本查询串——回环场景没有传输成本，而"升级后浏览器混用
+            旧模块"是不可接受的故障面（v0.3.4 明确决策，记账于 §27）。
+            """
+            path = resolve_static(rel)
+            if path is None:
+                self._send_json(404, {"error": "not found"}, cacheable=False)
+                return
+            try:
+                body = path.read_bytes()
+            except OSError:
+                self._send_json(404, {"error": "not found"}, cacheable=False)
+                return
+            if len(body) > MAX_STATIC_BYTES:
+                self._send_json(500, {"error": "静态资源超出上限"}, cacheable=False)
+                return
+            self.close_connection = True
+            etag = f'"{hashlib.sha256(body).hexdigest()[:16]}"'
+            try:
+                if self.headers.get("If-None-Match", "").strip() == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "no-cache")
+                    for key, value in _SECURITY_HEADERS.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", _STATIC_TYPES[path.suffix])
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
+
         def _send_index(self) -> None:
-            """下发前端并注入**每请求 nonce**（CSP 无 unsafe-inline）。"""
+            """下发前端 shell 并注入**每请求 nonce**（CSP 无 unsafe-inline）。
+
+            shell 里的内联主题脚本与全部 `<link>`/`<script src>` 都带
+            `nonce="__CSP_NONCE__"` 占位，这里一次性替换为同一个随机值——
+            CSP 保持 nonce-only（不放宽到 `'self'`）。
+            """
             self.close_connection = True
             try:
                 template = static_index.read_text("utf-8")
@@ -387,6 +484,27 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                 self.wfile.write(html)
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在页面加载中断开连接")
+
+        def _send_attachment(self, status: int, text: str, filename: str) -> None:
+            """下载型文本响应（诊断导出）：带 Content-Disposition，绝不缓存。
+
+            文件名做头部注入消毒（实例名已受字符集校验，这里是纵深防御）。
+            """
+            self.close_connection = True
+            filename = filename.replace('"', "_").replace("\r", "").replace("\n", "")
+            body = text.encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                for key, value in _SECURITY_HEADERS.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self._note("客户端在响应写出前断开连接")
 
         def _send_text(self, status: int, text: str, *, content_type: str) -> None:
             self.close_connection = True
