@@ -55,6 +55,7 @@ __all__ = [
     "read_state",
     "write_state",
     "clear_state",
+    "build_serve_argv",
     "start_background",
     "stop_background",
     "probe",
@@ -106,6 +107,91 @@ PLUGIN_SPEC = ServeSpec(
     state_name="plugin-state.json",
     log_name="plugin.log",
 )
+
+
+def frpsctl_executable() -> Path:
+    """定位 `frpsctl` 可执行文件（后台子进程 argv[0]；v0.3.4 从 CLI 下沉）。
+
+    systemd 不读 PATH，必须是绝对路径。优先 `shutil.which`（全局安装时最可靠），
+    其次 `sys.argv[0]`（开发态直接跑 venv 脚本）。`python -m frpsctl` 时
+    argv[0] 是 `__main__.py`、不可直接执行——两种都拿不到就明确报错，
+    而不是把一个坏路径写进 unit（错误会在 systemctl start 时才炸）。
+    """
+    import shutil as _shutil
+    import sys as _sys
+
+    found = _shutil.which("frpsctl")
+    if found is not None:
+        return Path(found).resolve()
+    argv0 = Path(_sys.argv[0])
+    if argv0.exists() and os.access(argv0, os.X_OK) and "frpsctl" in argv0.name:
+        return argv0.resolve()
+    from ..errors import UsageError
+
+    raise UsageError(
+        "无法确定 frpsctl 可执行文件路径（unit 的 ExecStart 与后台子进程都需要绝对路径）",
+        hint="请用 PATH 里的 `frpsctl` 命令运行本命令（而不是 python -m frpsctl）",
+    )
+
+
+def build_serve_argv(
+    executable: str | Path,
+    *,
+    subcommand: str,
+    bind: str,
+    password_file: str | Path | None = None,
+    policy: str | Path | None = None,
+    handler_path: str | None = None,
+    allow_non_loopback: bool = False,
+    trusted_proxy: bool = False,
+    access_log: bool = False,
+    metrics: bool = False,
+) -> list[str]:
+    """拼装后台 serve 的命令行（CLI 与 Web 共用的单点，v0.3.4 下沉）。
+
+    与 systemd unit 的 `ExecStart` 保持同构（同一子命令、同一选项集）；
+    选项组合做**白名单校验**：web 走 `--password-file`，plugin 走
+    `--policy/--path`——误传会在派生进程之前以用法错误暴露，而不是启动后
+    才被 click 拒绝（那时错误现场已远离意图）。
+    """
+    from ..errors import UsageError
+
+    allowed = {
+        "web": {"password_file", "allow_non_loopback", "trusted_proxy", "access_log", "metrics"},
+        "plugin": {"policy", "handler_path", "access_log"},
+    }
+    if subcommand not in allowed:
+        raise UsageError(f"不支持的后台服务：{subcommand!r}", hint="可用：web / plugin")
+    provided: dict[str, object] = {
+        "password_file": password_file,
+        "policy": policy,
+        "handler_path": handler_path,
+        "allow_non_loopback": allow_non_loopback,
+        "trusted_proxy": trusted_proxy,
+        "access_log": access_log,
+        "metrics": metrics,
+    }
+    for name, value in provided.items():
+        if value is None or value is False:
+            continue
+        if name not in allowed[subcommand]:
+            raise UsageError(f"{subcommand} serve 不接受选项 {name}（实现错误，请上报）")
+    argv: list[str] = [str(executable), subcommand, "serve", "--bind", bind]
+    if password_file is not None:
+        argv += ["--password-file", str(password_file)]
+    if policy is not None:
+        argv += ["--policy", str(policy)]
+    if handler_path is not None:
+        argv += ["--path", handler_path]
+    if allow_non_loopback:
+        argv.append("--allow-non-loopback")
+    if trusted_proxy:
+        argv.append("--trusted-proxy")
+    if access_log:
+        argv.append("--access-log")
+    if metrics:
+        argv.append("--metrics")
+    return argv
 
 
 @dataclass(frozen=True)
