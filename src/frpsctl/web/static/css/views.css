@@ -1,0 +1,53 @@
+/* 视图层（赛博朋克）：配置编辑表单 / 审计 / 日志 / 服务与版本视图专用样式。 */
+
+/* ---------- 配置表单 ---------- */
+.field { display: grid; grid-template-columns: minmax(180px, 300px) 1fr auto; gap: 8px 14px; align-items: center; padding: 5px 0; }
+.field label { color: var(--muted); font-size: 13px; word-break: break-all; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.field.dirty label { color: var(--warn); }
+.field.dirty input { border-color: var(--warn); }
+.field.deleted label { text-decoration: line-through; }
+.field.deleted input { opacity: .45; }
+.group-title {
+  margin: 18px 0 6px; color: var(--accent2); font-size: 12.5px; font-weight: 650;
+  letter-spacing: .14em; text-transform: uppercase;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.diffbox { max-height: 320px; }
+.diffline { display: block; }
+.diffline.add { background: var(--diff-add-bg); color: var(--ok); }
+.diffline.del { background: var(--diff-del-bg); color: var(--err); }
+.diffline.hunk { color: var(--accent2); }
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.addrow { display: grid; grid-template-columns: minmax(180px, 300px) 1fr auto; gap: 8px; margin-top: 10px; }
+#cfg-count.clickable { cursor: pointer; text-decoration: underline dotted; }
+
+/* ---------- 端口区间结构化编辑器（F8） ---------- */
+.port-editor { display: flex; flex-direction: column; gap: 6px; }
+.port-editor.disabled { opacity: .45; pointer-events: none; }
+.port-row { display: flex; gap: 6px; align-items: center; }
+.port-input { width: 110px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.port-mode { width: 92px; }
+.port-actions { display: flex; gap: 6px; }
+
+/* ---------- 工具类：CSP nonce 化后不允许内联 style 属性（style-src 无 unsafe-inline） ---------- */
+.mt-0 { margin-top: 0; } .mt-10 { margin-top: 10px; } .mt-12 { margin-top: 12px; }
+.mt-16 { margin-top: 16px; } .mb-0 { margin-bottom: 0; } .mb-8 { margin-bottom: 8px; }
+.flex-1 { flex: 1; } .w-auto { width: auto; } .w-340 { max-width: 340px; }
+.span-all { grid-column: 1 / -1; }
+.small { font-size: 12.5px; } .sub-note { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.note-12 { font-size: 12px; margin-bottom: 0; }
+.row-end { justify-content: flex-end; }
+.right-cluster { float: right; display: flex; gap: 8px; align-items: center; }
+.pre-wrap { white-space: pre-wrap; }
+.small-row { font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+.row-inline { display: inline-flex; gap: 6px; align-items: center; }
+.banner-action { margin-left: 10px; }
+
+/* ---------- 审计时间窗 ---------- */
+#audit-since button { font-size: 12px; padding: 3px 8px; }
+
+@media (max-width: 900px) {
+  .two-col { grid-template-columns: 1fr; }
+  .field { grid-template-columns: 1fr; }
+  .addrow { grid-template-columns: 1fr; }
+}

@@ -1,0 +1,40 @@
+/* 图表层（赛博朋克）：霓虹网格 / 荧光折线 / 渐变柱与面积 / 环图。
+ * 颜色全部由 CSS 变量驱动（主题切换即时生效；JS 不写任何颜色）。 */
+
+/* ---------- 网格与坐标轴 ---------- */
+.grid-line { stroke: var(--border); stroke-width: 1; }
+.axis { fill: var(--muted); font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+
+/* ---------- 柱状（渐变填充：v0.3.3 的 fill 属性被同选择器 CSS 覆盖而静默失效，
+ * 这里改为 CSS 引用的渐变——真实修复，记账于 §27） ---------- */
+.bar-in { fill: url(#gradBarIn); }
+.bar-out { fill: url(#gradBarOut); }
+.grad-in-stop { stop-color: var(--accent); }
+.grad-out-stop { stop-color: var(--ok); }
+
+/* ---------- 折线（荧光双层：粗半透明光晕 + 细实线） ---------- */
+.line-in { stroke: var(--accent); filter: drop-shadow(0 0 3px var(--accent)); }
+.line-out { stroke: var(--ok); filter: drop-shadow(0 0 3px var(--ok)); }
+
+/* ---------- 交互（十字线 / 提示框 / 热区） ---------- */
+.crosshair { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; opacity: .75; }
+.tip-box { fill: var(--panel); stroke: var(--glass-border); }
+.tip-text { fill: var(--text); font-size: 10.5px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.bar-hit { fill: transparent; cursor: crosshair; }
+
+/* ---------- 环图（代理类型分布） ---------- */
+.donut-slice { transition: opacity .15s ease; }
+.donut-slice:hover { opacity: .82; }
+.donut-slice.ring { fill: none; stroke-width: 24; }
+.donut-total {
+  fill: var(--text); font-size: 15px; font-weight: 650;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.donut-c0 { fill: var(--accent); stroke: var(--accent); }
+.donut-c1 { fill: var(--ok); stroke: var(--ok); }
+.donut-c2 { fill: var(--warn); stroke: var(--warn); }
+.donut-c3 { fill: var(--err); stroke: var(--err); }
+.donut-c4 { fill: var(--accent2); stroke: var(--accent2); }
+.donut-c5 { fill: var(--violet); stroke: var(--violet); }
+.donut-c6 { fill: var(--cyan); stroke: var(--cyan); }
+.donut-c7 { fill: var(--magenta); stroke: var(--magenta); }

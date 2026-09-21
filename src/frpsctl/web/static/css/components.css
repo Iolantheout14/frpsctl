@@ -1,0 +1,265 @@
+/* 组件层（赛博朋克）：卡片 / 统计 / 表格 / 弹层 / toast / HUD 装饰 / 新组件。 */
+
+/* ---------- 卡片：玻璃 + 霓虹边 + HUD 角标 ---------- */
+.card {
+  position: relative;
+  background: var(--glass); border: 1px solid var(--glass-border); border-radius: var(--radius);
+  padding: 16px; backdrop-filter: blur(10px); box-shadow: var(--shadow-sm);
+  transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--accent-soft); }
+/* HUD 四角刻度（纯装饰；零内联 style、可被主题着色） */
+.card::after {
+  content: ""; position: absolute; inset: 5px; pointer-events: none; opacity: .3;
+  background:
+    linear-gradient(var(--accent), var(--accent)) left top / 14px 2px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) left top / 2px 14px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) right top / 14px 2px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) right top / 2px 14px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) left bottom / 14px 2px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) left bottom / 2px 14px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) right bottom / 14px 2px no-repeat,
+    linear-gradient(var(--accent), var(--accent)) right bottom / 2px 14px no-repeat;
+}
+.card h2 { margin: 0 0 12px; font-size: 13px; color: var(--muted); font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+.kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 13.5px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.kv div:nth-child(even) { font-family: ui-monospace, "SF Mono", Consolas, monospace; word-break: break-all; }
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.stat .num {
+  font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.stat .label { color: var(--muted); font-size: 12.5px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 14px; }
+
+/* ---------- Hero 指标条（切角 + 辉光 + 趋势箭头） ---------- */
+.hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.hero .metric {
+  position: relative; overflow: hidden; padding: 14px 16px;
+  background: var(--hero-grad); border: 1px solid var(--glass-border); border-radius: var(--radius);
+  clip-path: var(--clip-cut);
+}
+.hero .metric::after {
+  content: ""; position: absolute; right: -34px; bottom: -56px; width: 140px; height: 140px;
+  background: radial-gradient(circle, var(--accent-soft), transparent 70%);
+}
+.hero .metric .num {
+  font-size: 30px; font-weight: 720; letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  text-shadow: 0 0 18px rgba(0, 229, 255, .25);
+}
+.hero .metric .label { display: block; color: var(--muted); font-size: 11.5px; letter-spacing: .14em; text-transform: uppercase; margin-top: 2px; }
+.hero .metric .delta { font-size: 11.5px; color: var(--ok); margin-left: 6px; }
+/* HUD 分段刻度条（纯装饰）与数值扫描光标 */
+.hero .metric::before {
+  content: ""; position: absolute; left: 12px; right: 12px; bottom: 8px; height: 3px;
+  background: repeating-linear-gradient(90deg, var(--accent-soft) 0 5px, transparent 5px 9px);
+  opacity: .85;
+}
+.hero .metric .num::after {
+  content: "▊"; font-size: 11px; margin-left: 3px; vertical-align: 3px;
+  color: var(--accent); animation: terminal-blink 1.3s steps(1, end) infinite;
+}
+
+/* ---------- 骨架 / 空态 ---------- */
+.skeleton {
+  height: 14px; border-radius: 6px; margin: 6px 0;
+  background: linear-gradient(90deg, var(--panel2) 25%, var(--border) 37%, var(--panel2) 63%);
+  background-size: 400% 100%; animation: shimmer 1.3s ease infinite;
+}
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.empty { text-align: center; color: var(--muted); padding: 20px 8px; }
+.empty svg { display: block; margin: 0 auto 8px; opacity: .45; }
+
+/* ---------- 表格 ---------- */
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-family: ui-monospace, "SF Mono", Consolas, monospace; letter-spacing: .05em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+tr:hover td { background: var(--panel2); }
+tr.clickable { cursor: pointer; }
+tr.detail td { background: var(--panel2); }
+tr.detail pre { max-height: 260px; }
+.muted { color: var(--muted); }
+.tag { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.tag.online { color: var(--ok); border-color: var(--tag-online-border); }
+
+/* ---------- toast ---------- */
+#toast {
+  position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column;
+  gap: 8px; z-index: 60; max-width: 460px;
+}
+#toast .item {
+  background: var(--panel); border: 1px solid var(--glass-border); border-left: 3px solid var(--accent);
+  border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow-md);
+  display: flex; gap: 8px; align-items: flex-start;
+  clip-path: var(--clip-cut-sm);
+  animation: toast-in .22s ease both; position: relative; overflow: hidden;
+  backdrop-filter: blur(8px);
+}
+#toast .item::after {
+  content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+  background: var(--accent-grad); animation: toast-bar 4s linear forwards;
+}
+#toast .item.err::after { background: var(--err); animation: none; }
+/* 边框扫描光带（一次性扫过） */
+#toast .item::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(105deg, transparent 32%, var(--accent-soft) 50%, transparent 68%);
+  transform: translateX(-110%);
+  animation: toast-scan 2.6s ease .35s 1;
+}
+@keyframes toast-scan { to { transform: translateX(110%); } }
+#toast .item .msg { flex: 1; white-space: pre-wrap; word-break: break-word; }
+#toast .item .close {
+  border: none; background: transparent; color: var(--muted);
+  padding: 0 2px; font-size: 16px; line-height: 1; cursor: pointer; box-shadow: none;
+}
+#toast .item.err { border-left-color: var(--err); }
+#toast .item.ok { border-left-color: var(--ok); }
+#toast .item .ticon { font-weight: 700; color: var(--accent2); }
+#toast .item.ok .ticon { color: var(--ok); }
+#toast .item.err .ticon { color: var(--err); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes toast-bar { to { width: 0; } }
+
+/* ---------- 弹层（modal） ---------- */
+#modal-backdrop {
+  position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center;
+  background: rgba(2, 4, 8, .6); backdrop-filter: blur(3px);
+}
+#modal-backdrop.hidden { display: none; }
+.modal-card {
+  width: min(460px, 92vw); background: var(--panel); border: 1px solid var(--glass-border);
+  border-radius: 14px; box-shadow: var(--shadow-lg); padding: 18px 18px 14px;
+  animation: modal-in .18s ease both; backdrop-filter: blur(10px);
+}
+.modal-card h3 { margin: 0 0 8px; font-size: 15px; letter-spacing: .03em; }
+.modal-card .body { color: var(--muted); white-space: pre-wrap; font-size: 13.5px; }
+.modal-card .row { justify-content: flex-end; margin-top: 16px; }
+@keyframes modal-in { from { opacity: 0; transform: translateY(6px) scale(.98); } to { opacity: 1; transform: none; } }
+
+/* ---------- 登录页 ---------- */
+#login { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.login-logo {
+  width: 46px; height: 46px; border-radius: 13px; background: var(--accent-grad);
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-md), 0 0 30px -10px var(--accent); margin-bottom: 12px;
+}
+#login .card { width: 360px; }
+#login h1 { margin: 0 0 4px; font-size: 20px; }
+#login p { color: var(--muted); margin: 0 0 16px; }
+
+/* ---------- 工具条与徽标 ---------- */
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.toolbar input[type="search"] { max-width: 260px; }
+.kbd {
+  font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 11px;
+  border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px;
+  padding: 0 5px; color: var(--muted); background: var(--panel2);
+}
+.iconbtn { padding: 3px 8px; font-size: 12px; }
+.chart-wrap { overflow-x: auto; }
+.chart-note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+.logline { display: block; font-size: 12.5px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.logline::before { content: "› "; color: var(--muted); opacity: .75; }
+.logline .lv-error { color: var(--err); }
+.logline .lv-warn { color: var(--warn); }
+/* 终端扫描光标（日志面板底部；reduced-motion 下自动停） */
+#logs::after {
+  content: "▊"; color: var(--accent); margin-left: 2px;
+  animation: terminal-blink 1.1s steps(1, end) infinite;
+}
+@keyframes terminal-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+
+/* ---------- 抽屉（详情） ---------- */
+#drawer-backdrop { position: fixed; inset: 0; z-index: 45; background: rgba(2, 4, 8, .5); backdrop-filter: blur(2px); }
+#drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 92vw); z-index: 46;
+  background: var(--panel); border-left: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-lg); display: flex; flex-direction: column;
+  animation: drawer-in .2s ease both; backdrop-filter: blur(12px);
+}
+#drawer.hidden, #drawer-backdrop.hidden { display: none; }
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between; padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(90deg, var(--accent-soft), transparent 70%);
+}
+.drawer-head h3 { margin: 0; font-size: 15px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.drawer-body { padding: 14px 16px; overflow: auto; }
+@keyframes drawer-in { from { transform: translateX(12px); opacity: .6; } to { transform: none; opacity: 1; } }
+
+/* ---------- 命令面板 ---------- */
+#cmdk { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; }
+#cmdk.hidden { display: none; }
+.cmdk-backdrop { position: absolute; inset: 0; background: rgba(2, 4, 8, .6); backdrop-filter: blur(3px); }
+.cmdk-panel {
+  position: relative; width: min(560px, 92vw); background: var(--panel);
+  border: 1px solid var(--glass-border); border-radius: 12px;
+  box-shadow: var(--shadow-lg), 0 0 40px -16px var(--accent); overflow: hidden;
+  backdrop-filter: blur(12px);
+}
+.cmdk-panel input { border: none; border-radius: 0; border-bottom: 1px solid var(--border); padding: 12px 14px; background: transparent; }
+.cmdk-panel input:focus { border-color: var(--border); box-shadow: none; }
+#cmdk-list { list-style: none; margin: 0; padding: 6px; max-height: 320px; overflow: auto; }
+.cmdk-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.cmdk-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.cmdk-empty { padding: 12px; text-align: center; }
+
+/* ---------- 服务卡 ---------- */
+.service-card .service-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.service-card .service-head h2 { margin: 0; }
+.service-card .service-head svg { color: var(--accent2); }
+
+/* ---------- 进度条（版本安装任务） ---------- */
+.progress-bar { height: 8px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); overflow: hidden; }
+.progress-fill { height: 100%; width: 0; background: var(--accent-grad); transition: width .25s ease; }
+.progress-fill.indeterminate { width: 40%; animation: progress-slide 1.1s ease-in-out infinite alternate; }
+@keyframes progress-slide { from { margin-left: 0; } to { margin-left: 60%; } }
+.progress-fill.w-0 { width: 0; } .progress-fill.w-10 { width: 10%; }
+.progress-fill.w-20 { width: 20%; } .progress-fill.w-30 { width: 30%; }
+.progress-fill.w-40 { width: 40%; } .progress-fill.w-50 { width: 50%; }
+.progress-fill.w-60 { width: 60%; } .progress-fill.w-70 { width: 70%; }
+.progress-fill.w-80 { width: 80%; } .progress-fill.w-90 { width: 90%; }
+.progress-fill.w-100 { width: 100%; }
+
+/* ---------- 焦点 / 过渡 / 滚动条 / 触控 / 无障碍 ---------- */
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+:root.theme-anim, :root.theme-anim * {
+  transition: background-color .25s ease, color .25s ease, border-color .25s ease, fill .25s ease, stroke .25s ease, box-shadow .25s ease !important;
+}
+.dot.ok { box-shadow: 0 0 0 0 var(--ok-soft); animation: breathe 2.4s ease-in-out infinite; }
+.dot.fail { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(57, 255, 20, .38); }
+  50% { box-shadow: 0 0 0 6px rgba(57, 255, 20, 0); }
+}
+.view-anim { animation: view-in .22s ease both; }
+@keyframes view-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+main::-webkit-scrollbar, pre::-webkit-scrollbar, .tablewrap::-webkit-scrollbar { width: 10px; height: 10px; }
+main::-webkit-scrollbar-thumb, pre::-webkit-scrollbar-thumb, .tablewrap::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 6px;
+}
+main::-webkit-scrollbar-thumb:hover, pre::-webkit-scrollbar-thumb:hover, .tablewrap::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-soft);
+}
+@media (pointer: coarse) {
+  button, input, select { min-height: 40px; }
+  .iconbtn { min-height: 34px; }
+  nav button { min-height: 40px; }
+}
+@media (max-width: 760px) {
+  #menu-toggle { display: inline-block; }
+  header .actions { display: none; width: 100%; }
+  header .actions.open { display: flex; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}

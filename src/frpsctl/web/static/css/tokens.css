@@ -1,0 +1,111 @@
+/* 设计令牌（v0.3.4 赛博朋克设计系统）。
+ *
+ * 赛博暗为默认（.light 为"白昼 HUD"降饱和映射）；两套令牌必须**全量对齐**
+ * （守卫 test_light_theme_overrides_every_colour_variable 强制），几何量
+ * （--radius / --clip-cut*）是仅有的例外。
+ *
+ * 视觉语言：深黑蓝底 + 青/品红霓虹描边 + HUD 网格与扫描线 + 等宽数据 +
+ * 切角装饰；交互元素（按钮/输入）保持圆角与可见 focus ring（无障碍优先）。
+ */
+
+:root {
+  /* —— 面 —— */
+  --bg: #04060c;
+  --bg-grid: rgba(0, 229, 255, .05);
+  --panel: rgba(9, 15, 28, .74);
+  --panel2: #0c1728;
+  --border: #16304d;
+  --glass: rgba(9, 15, 28, .62);
+  --glass-border: rgba(0, 229, 255, .16);
+  /* —— 字 —— */
+  --text: #d9f6ff;
+  --muted: #6f8ba3;
+  /* —— 霓虹主色 —— */
+  --accent: #00e5ff;
+  --accent2: #22d3ee;
+  --ok: #39ff14;
+  --warn: #ffb020;
+  --err: #ff2e97;
+  --cyan: #00e5ff;
+  --magenta: #ff2e97;
+  --violet: #8a2be2;
+  /* —— 派生 —— */
+  --accent-soft: rgba(0, 229, 255, .12);
+  --accent-grad: linear-gradient(135deg, #00e5ff 0%, #8a2be2 100%);
+  --aurora-1: rgba(0, 229, 255, .16);
+  --aurora-2: rgba(255, 46, 151, .12);
+  --aurora-3: rgba(138, 43, 226, .10);
+  --ring: rgba(0, 229, 255, .6);
+  --glow: 0 0 0 1px rgba(0, 229, 255, .35), 0 0 24px -8px rgba(0, 229, 255, .7);
+  --ok-soft: rgba(57, 255, 20, .14);
+  /* —— 阴影 —— */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-md: 0 10px 30px rgba(0, 0, 0, .45);
+  --shadow-lg: 0 22px 60px rgba(0, 0, 0, .6);
+  /* —— 结构 —— */
+  --pre-bg: #03050a;
+  --header-bg: rgba(4, 6, 12, .82);
+  --danger-bg: #2a0d1e;
+  --danger-border: #7a1f4d;
+  --danger-text: #ffb4dd;
+  --danger-hover: #3a1128;
+  --tag-online-border: #1d5c46;
+  --diff-add-bg: rgba(57, 255, 20, .10);
+  --diff-del-bg: rgba(255, 46, 151, .12);
+  --banner-warn-bg: rgba(255, 176, 32, .10);
+  --banner-err-bg: rgba(255, 46, 151, .12);
+  --hero-grad: linear-gradient(135deg, rgba(0, 229, 255, .14), rgba(138, 43, 226, .10));
+  --scan-opacity: .5;
+  /* —— 几何（不参与主题化：守卫例外集） —— */
+  --radius: 10px;
+  --clip-cut: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  --clip-cut-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+}
+
+:root.light {
+  --bg: #eef3f8;
+  --bg-grid: rgba(2, 132, 199, .06);
+  --panel: rgba(255, 255, 255, .84);
+  --panel2: #e3ebf4;
+  --border: #c6d4e2;
+  --glass: rgba(255, 255, 255, .78);
+  --glass-border: rgba(2, 132, 199, .22);
+  --text: #0f2233;
+  --muted: #4b647c;   /* AA 对比度校准（v0.3.4 对账：原 #57718a 在浅卡片上仅 4.23） */
+  --accent: #0284c7;
+  --accent2: #0369a1;
+  --ok: #15803d;
+  --warn: #b45309;
+  --err: #be123c;
+  --cyan: #0891b2;
+  --magenta: #be185d;
+  --violet: #6d28d9;
+  --accent-soft: rgba(2, 132, 199, .10);
+  --accent-grad: linear-gradient(135deg, #0284c7 0%, #6d28d9 100%);
+  --aurora-1: rgba(2, 132, 199, .10);
+  --aurora-2: rgba(190, 24, 93, .07);
+  --aurora-3: rgba(109, 40, 217, .07);
+  --ring: rgba(2, 132, 199, .5);
+  --glow: 0 0 0 1px rgba(2, 132, 199, .3), 0 6px 18px -8px rgba(2, 132, 199, .45);
+  --ok-soft: rgba(21, 128, 61, .12);
+  --shadow-sm: 0 1px 2px rgba(15, 34, 51, .10);
+  --shadow-md: 0 8px 24px rgba(15, 34, 51, .14);
+  --shadow-lg: 0 18px 44px rgba(15, 34, 51, .18);
+  --pre-bg: #f6f9fc;
+  --header-bg: rgba(238, 243, 248, .85);
+  --danger-bg: #fde2ea;
+  --danger-border: #f5a3bf;
+  --danger-text: #9f1239;
+  --danger-hover: #fbd0dd;
+  --tag-online-border: #9ad9b6;
+  --diff-add-bg: rgba(21, 128, 61, .10);
+  --diff-del-bg: rgba(190, 24, 93, .10);
+  --banner-warn-bg: rgba(180, 83, 9, .10);
+  --banner-err-bg: rgba(190, 24, 93, .10);
+  --hero-grad: linear-gradient(135deg, rgba(2, 132, 199, .10), rgba(109, 40, 217, .07));
+  --scan-opacity: 0;
+  /* 几何（与暗色相同值——守卫例外集） */
+  --radius: 10px;
+  --clip-cut: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  --clip-cut-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+}
