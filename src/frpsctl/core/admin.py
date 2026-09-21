@@ -32,6 +32,7 @@ __all__ = [
     "PruneOutcome",
     "ProxyStat",
     "ServerInfo",
+    "UserStat",
     "V2Proxy",
     "aggregate_days",
     "fetch_histories",
@@ -171,6 +172,29 @@ class ProxyStat:
             cur_conns=int(item.get("curConns") or 0),
             last_start_time=str(item.get("lastStartTime") or ""),
         )
+
+
+@dataclass(frozen=True)
+class UserStat:
+    """`/api/v2/users` 的按用户聚合条目（v0.3.5 F3）。
+
+    字段名经真机 v0.71.0 核对（起真 frpc 建代理后抓取）：
+
+    ```json
+    {"user": "", "clientCount": 1, "proxyCount": 1}
+    ```
+    信封是 v2 分页形状 `{"total": 1, "page": 1, "pageSize": 50, "items": [...]}`。
+
+    ⚠️ 与 `proxyTypeCount` 同类的字段陷阱：名字是 `clientCount` / `proxyCount`
+    （**单数**），写成 `clientCounts`（复数，那是 system_info 的客户端总数）或
+    `proxyCounts` 会静默得到 0——契约层 C11 与单元测试共同钉住这一点。
+
+    `user` 为空字符串表示"客户端未声明 user"（frpc 的 `user` 是可选字段）。
+    """
+
+    user: str
+    client_count: int
+    proxy_count: int
 
 
 @dataclass(frozen=True)
@@ -444,6 +468,43 @@ class AdminClient:
         return PageResult(
             items=[V2Proxy.from_api(item) for item in raw.items],
             total=raw.total,
+        )
+
+    def users(self, *, page_size: int = 200) -> PageResult[UserStat]:
+        """按用户聚合（v2 `/api/v2/users`，v0.3.5 F3）。
+
+        返回 `PageResult`：**total 来自信封**（不是本页条数），`truncated` 因此
+        只在"真的还有更多用户"时为真——此前用 `len(items) >= page_size` 判断，
+        用户数恰好等于上限时会误报截断（v0.3.5 review 修正）。
+
+        字段类型一律经 `_as_int` 兜底：上游字段形状漂移时应给出 0 而不是让
+        `int("N/A")` 变成 400/500（同文件其他解析点都是这个纪律）。
+        """
+        resp = self._get("/api/v2/users", params={"page": 1, "page_size": page_size})
+        payload = self._unwrap(resp)
+        if not isinstance(payload, dict):
+            return PageResult(items=[], total=0)
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            raw_items = []
+        out: list[UserStat] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                UserStat(
+                    user=str(item.get("user") or ""),
+                    client_count=_as_int(item.get("clientCount")),
+                    proxy_count=_as_int(item.get("proxyCount")),
+                )
+            )
+        total_known = "total" in payload
+        total = _as_int(payload.get("total")) if total_known else len(out)
+        return PageResult(
+            items=out,
+            total=total,
+            truncated=total > len(out),
+            total_known=total_known,
         )
 
     def prune_offline_proxies(self) -> PruneOutcome:

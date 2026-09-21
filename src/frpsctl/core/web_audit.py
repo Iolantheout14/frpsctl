@@ -24,13 +24,17 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .instance import Instance
+
+if TYPE_CHECKING:
+    from .auditlog import AuditQuery
 
 __all__ = [
     "DEFAULT_WEB_AUDIT_FILE",
     "WebAuditSummary",
+    "query",
     "record",
     "resolve_path",
     "session_fingerprint",
@@ -156,8 +160,10 @@ class WebAuditSummary:
 MAX_SOURCES = 200
 
 
-def summarize(path: Path, *, since: float | None = None) -> WebAuditSummary:
-    """流式统计 Web 操作审计（`--since` 与插件审计同语义）。"""
+def summarize(
+    path: Path, *, since: float | None = None, until: float | None = None
+) -> WebAuditSummary:
+    """流式统计 Web 操作审计（`--since` / `--until` 与插件审计同语义）。"""
     total = ok = error = bad = 0
     first_at: float | None = None
     last_at: float | None = None
@@ -192,6 +198,8 @@ def summarize(path: Path, *, since: float | None = None) -> WebAuditSummary:
                     at = None
                 if since is not None and at is not None and at < since:
                     continue
+                if until is not None and at is not None and at > until:
+                    continue
                 if at is not None:
                     first_at = at if first_at is None else min(first_at, float(at))
                     last_at = at if last_at is None else max(last_at, float(at))
@@ -215,4 +223,33 @@ def summarize(path: Path, *, since: float | None = None) -> WebAuditSummary:
         last_at=last_at,
         by_action=by_action,
         by_source=by_source,
+    )
+
+
+def query(
+    inst: Instance,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    filters: dict[str, str] | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    max_limit: int | None = None,
+) -> "AuditQuery":
+    """Web 操作审计的过滤 + 分页查询（v0.3.5）。
+
+    直接复用 `auditlog.query`——两类审计是同一 JSONL 规格，过滤键由调用方
+    给出（Web 审计用 `action/result/source`），不需要第二套实现。
+    """
+    from .auditlog import MAX_QUERY_LIMIT
+    from .auditlog import query as _query
+
+    return _query(
+        resolve_path(inst),
+        since=since,
+        until=until,
+        filters=filters,
+        limit=limit,
+        offset=offset,
+        max_limit=MAX_QUERY_LIMIT if max_limit is None else max_limit,
     )

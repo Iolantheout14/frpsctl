@@ -18,9 +18,11 @@ CLI 与 Web 因此指向同一个文件（此前只有 CLI 知道这条规则）
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,17 +34,22 @@ __all__ = [
     "AUDIT_KEEP",
     "DEFAULT_AUDIT_FILE",
     "DEFAULT_POLICY_FILE",
+    "MAX_QUERY_LIMIT",
     "rotate_if_needed",
     "rotated_paths",
+    "AuditQuery",
     "AuditSummary",
     "AuditTail",
     "AuditView",
     "load_view",
     "parse_since",
+    "query",
     "read_tail",
     "resolve_audit_path",
     "resolve_policy_path",
     "summarize",
+    "to_csv",
+    "to_jsonl",
 ]
 
 #: 策略与审计的默认文件名（相对实例目录 / 策略文件目录）。
@@ -261,6 +268,204 @@ def read_tail(path: Path, lines: int) -> AuditTail:
     return AuditTail(path=path, records=records, bad_lines=bad)
 
 
+#: 单次查询返回的记录上限（分页参数 `limit` 会被收敛到这个值）。
+MAX_QUERY_LIMIT = 1000
+
+#: 一次查询最多保留的**匹配**记录数（内存护栏）：超出时丢弃最旧的匹配并置
+#: `truncated=True`——审计文件最大约 30MB（本体 + 2 份轮转），正常远达不到，
+#: 但"输入驱动的内存"必须有界（与 by_user / by_op 同一条纪律）。
+MAX_QUERY_MATCHES = 20000
+
+
+@dataclass(frozen=True)
+class AuditQuery:
+    """过滤 + 分页后的审计记录（v0.3.5，Web 审计视图的过滤/翻页数据源）。
+
+    口径：
+
+    - `records` 是本页记录，按**时间升序**（与 `read_tail` 一致）；
+    - `matched` 是扫描到的匹配总数（`truncated=True` 时是**下界**）；
+    - `has_more` 表示再往旧翻还有匹配（前端"加载更多"按钮的依据）；
+    - `bad_lines` 是扫描窗口内的坏行数（下界）。
+    """
+
+    records: list[dict] = field(default_factory=list)
+    matched: int = 0
+    bad_lines: int = 0
+    offset: int = 0
+    limit: int = 0
+    has_more: bool = False
+    truncated: bool = False
+
+
+def _audit_matches(
+    record: dict,
+    *,
+    since: float | None,
+    until: float | None,
+    filters: dict[str, str] | None,
+) -> bool:
+    """一条记录是否命中过滤（字段值**大小写不敏感子串**匹配）。"""
+    at = _as_unix(record.get("at_unix"))
+    if since is not None and at is not None and at < since:
+        return False
+    if until is not None and at is not None and at > until:
+        return False
+    for key, expected in (filters or {}).items():
+        if not expected:
+            continue
+        actual = record.get(key)
+        if isinstance(actual, (dict, list)):
+            actual = json.dumps(actual, ensure_ascii=False)
+        if expected.lower() not in str(actual if actual is not None else "").lower():
+            return False
+    return True
+
+
+def query(
+    path: Path,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    filters: dict[str, str] | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    max_limit: int = MAX_QUERY_LIMIT,
+) -> AuditQuery:
+    """跨轮转的**过滤 + 分页**查询（从新到旧偏移，返回页内时间升序）。
+
+    与 `read_tail` 的差别：`read_tail` 回答"最近 N 条"，本函数回答"**符合条件**
+    的第 offset..offset+limit 条"——审计视图的过滤与"加载更多"都依赖它。
+    过滤键由调用方给出（Web 审计用 `action/result/source`，插件审计用
+    `op/user/decision`），实现不做字段名假设。
+
+    `max_limit` 只约束**本次 `limit`（页大小）**：界面分页用默认的
+    `MAX_QUERY_LIMIT`，导出可显式放宽到 `MAX_EXPORT_ROWS`（此前导出被默认上限
+    静默钳到 1000，却对外声称 10000——v0.3.5 review 抓到的真实缺陷）。
+    内存保留窗口始终是 `MAX_QUERY_MATCHES`（与 `max_limit` 无关）。
+    """
+    hard_cap = max(1, int(max_limit))
+    limit = max(1, min(int(limit), hard_cap))
+    offset = max(0, int(offset))
+    # deque(maxlen=…)：超过上限时头部丢弃是 O(1)。此前用 list + `del [0]`，
+    # 每条超限记录都要搬移 2 万个指针（实测 60 万行查询 1.6 秒，且持 GIL
+    # 阻塞同进程其他请求）——v0.3.5 review 的性能修复。
+    matched: deque[dict] = deque(maxlen=MAX_QUERY_MATCHES)
+    bad = 0
+    truncated = False
+    for item in reversed(rotated_paths(path)):  # 旧 → 新（保持时间序）
+        try:
+            handle = open(item, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
+        except OSError:
+            continue
+        with handle:
+            for raw in handle:
+                text = raw.strip()
+                if not text:
+                    continue
+                try:
+                    record = json.loads(text)
+                except json.JSONDecodeError:
+                    bad += 1
+                    continue
+                if not isinstance(record, dict):
+                    bad += 1
+                    continue
+                if not _audit_matches(record, since=since, until=until, filters=filters):
+                    continue
+                if len(matched) == matched.maxlen:
+                    truncated = True
+                matched.append(record)
+    newest_first = list(reversed(matched))  # deque → list（已是时间升序）
+    page = newest_first[offset : offset + limit]
+    # `has_more` 只回答"本页之后还有（在扫描窗口内的）记录吗"——它决定前端是否
+    # 显示"加载更多"。**不能**把 `truncated` 并进来：那会让按钮永不消失、每次
+    # 点击都空转并触发一次全量扫描（v0.3.5 复审抓到的副作用）。"扫描窗口之外
+    # 可能还有更旧的记录"由 `truncated` 单独表达，前端用文字提示（缩小时间窗）。
+    has_more = len(newest_first) > offset + limit
+    return AuditQuery(
+        records=list(reversed(page)),
+        matched=len(matched),
+        bad_lines=bad,
+        offset=offset,
+        limit=limit,
+        has_more=has_more,
+        truncated=truncated,
+    )
+
+
+#: CSV 导出的列（插件审计与 Web 审计字段的**并集**；缺列留空）。
+_CSV_COLUMNS = (
+    "at",
+    "at_unix",
+    "op",
+    "decision",
+    "user",
+    "proxy_name",
+    "proxy_type",
+    "remote_port",
+    "source",
+    "elapsed_ms",
+    "quota_source",
+    "suppressed",
+    "action",
+    "target",
+    "result",
+    "params",
+    "session_id",
+)
+
+#: 纯数值形态（负数/小数不加前缀——它们的首字符是 `-`，但不可能被当公式）。
+_CSV_NUMERIC_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+#: 直接被 Excel/Sheets 当公式求值的首字符（含制表/换行/垂直制表/表单/空字符——
+#: 它们会被忽略后再看下一个字符，`"\t=1+1"` 同样危险）。
+_CSV_DANGEROUS_FIRST = "=+-@\t\r\n\v\f\x00"
+#: 前导空白之后仍会触发公式的字符。
+_CSV_DANGEROUS_AFTER_SPACE = "=+-@"
+
+
+def _csv_cell(value: object) -> str:
+    """单元格渲染（含公式注入防护与容器类型 JSON 化）。
+
+    规则：**危险首字符**（`=`/`+`/`-`/`@`/各类空白与控制符）或"前导空白之后
+    仍是危险字符"的单元格前置 `'`；纯数值（含负数、科学计数）放行，避免把
+    `-5` 变成文本；容器类型先 JSON 化（`{`/`[` 开头本身安全）。
+    """
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False)
+    elif value is None:
+        text = ""
+    else:
+        text = str(value)
+    if not text or _CSV_NUMERIC_RE.fullmatch(text):
+        return text
+    # ⚠️ lstrip 的集合**不能包含 `=+-@`**：否则 stripped 的首字符永远不可能是
+    # 危险字符，`_CSV_DANGEROUS_AFTER_SPACE` 分支就成了死代码（" =1+1" 会漏过）。
+    stripped = text.lstrip(" \t\r\n\v\f\x00")
+    if text[0] in _CSV_DANGEROUS_FIRST or stripped[:1] in _CSV_DANGEROUS_AFTER_SPACE:
+        text = "'" + text
+    return text
+
+
+def to_jsonl(records: list[dict]) -> str:
+    """JSONL 导出（逐行原始 JSON，与审计文件同格式，可被 jq/grep 直接消费）。"""
+    return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+
+
+def to_csv(records: list[dict]) -> str:
+    """CSV 导出（列 = 两类审计字段的并集；公式注入已防护）。"""
+    import csv
+    import io
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(_CSV_COLUMNS)
+    for record in records:
+        writer.writerow([_csv_cell(record.get(column)) for column in _CSV_COLUMNS])
+    return buffer.getvalue()
+
+
 @dataclass(frozen=True)
 class AuditSummary:
     """审计统计（流式扫描全文件的计数结果）。"""
@@ -281,14 +486,20 @@ class AuditSummary:
     elapsed_count: int = 0
 
 
-def summarize(path: Path, *, since: float | None = None) -> AuditSummary:
-    """跨轮转文件的全量统计（`path` + `.1` + `.2`）。"""
+def summarize(
+    path: Path, *, since: float | None = None, until: float | None = None
+) -> AuditSummary:
+    """跨轮转文件的全量统计（`path` + `.1` + `.2`）。
+
+    `since` / `until` 是闭开时间窗（v0.3.5 补 `until`：审计视图的"自定义起止"
+    要能同时限定两端，否则统计口径会与记录列表不一致）。
+    """
     accumulator = _SummaryAccumulator()
     files = rotated_paths(path)
     if not files:
         return AuditSummary()
     for item in files:
-        accumulator.consume_file(item, since=since)
+        accumulator.consume_file(item, since=since, until=until)
     return accumulator.build()
 
 
@@ -305,16 +516,18 @@ class _SummaryAccumulator:
         self.elapsed_max = 0.0
         self.elapsed_count = 0
 
-    def consume_file(self, path: Path, *, since: float | None) -> None:
+    def consume_file(
+        self, path: Path, *, since: float | None, until: float | None = None
+    ) -> None:
         try:
             handle = open(path, "r", encoding="utf-8", errors="replace")  # noqa: SIM115
         except OSError:
             return
         with handle:
             for line in handle:
-                self._consume_line(line, since=since)
+                self._consume_line(line, since=since, until=until)
 
-    def _consume_line(self, raw: str, *, since: float | None) -> None:
+    def _consume_line(self, raw: str, *, since: float | None, until: float | None = None) -> None:
         text = raw.strip()
         if not text:
             return
@@ -329,6 +542,8 @@ class _SummaryAccumulator:
 
         at = _as_unix(item.get("at_unix"))
         if since is not None and at is not None and at < since:
+            return
+        if until is not None and at is not None and at > until:
             return
         if at is not None:
             self.first_at = at if self.first_at is None else min(self.first_at, at)
@@ -406,9 +621,16 @@ def parse_since(spec: str, *, now: float | None = None) -> float:
         seconds = float(match.group(1)) * _UNIT_SECONDS[match.group(2)]
         return (now if now is not None else time.time()) - seconds
     try:
-        return float(text)
+        parsed = float(text)
     except ValueError:
         pass
+    else:
+        if not math.isfinite(parsed):
+            raise UsageError(
+                f"无法解析时间：{spec!r}",
+                hint="时间戳必须是有限数值（nan / inf 不是合法时间窗）",
+            )
+        return parsed
     from datetime import datetime
 
     try:
