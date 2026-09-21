@@ -104,6 +104,53 @@ class Client:
 # ---------------------------------------------------------------------------
 
 
+class TestLoginInfo:
+    """`GET /api/login-info`（v0.3.5）：免认证，但只暴露非敏感静态信息。
+
+    免认证面每扩大一点都要有代价审查：这个端点的**全部**内容都可以从
+    PyPI/仓库公开推知（版本号）或本来就显示在页面上（实例名），因此可以
+    公开；但一旦有人往 payload 里加字段（路径、状态、配置），这里的键集合
+    与敏感词断言会立刻失败。
+    """
+
+    _KEYS = {"instance", "frpsctl", "frps_minimum", "frps_reckoned", "non_loopback"}
+
+    def test_available_without_session(self, web: WebServer) -> None:
+        client = Client(web)
+        status, payload, headers = client.call("/api/login-info")
+        assert status == 200
+        assert set(payload) == self._KEYS, payload
+        assert payload["instance"] == web.ctx.inst.name
+        assert headers.get("Cache-Control") == "no-store"
+        # 免认证只读端点不写审计（否则未登录的探测会把审计文件刷满）
+        from frpsctl.core import web_audit
+
+        assert not web_audit.resolve_path(web.ctx.inst).exists()
+
+    def test_version_fields_match_capabilities(self, web: WebServer) -> None:
+        from frpsctl import __version__
+
+        _, payload, _ = Client(web).call("/api/login-info")
+        assert payload["frpsctl"] == __version__
+        assert payload["frps_minimum"] == "0.70.0"
+        assert payload["frps_reckoned"] == "0.71.0"
+
+    def test_never_exposes_secrets_or_paths(self, web: WebServer) -> None:
+        _, payload, _ = Client(web).call("/api/login-info")
+        blob = json.dumps(payload, ensure_ascii=False).lower()
+        for word in ("password", "token", "secret", "path", "/tmp", "pid"):
+            assert word not in blob, f"login-info 泄露了 {word!r}：{payload}"
+
+    def test_non_loopback_flag_reflects_bind(self, web_ctx) -> None:
+        server = WebServer(web_ctx, WebSettings(bind="0.0.0.0:0"))
+        server.start()
+        try:
+            _, payload, _ = Client(server).call("/api/login-info")
+            assert payload["non_loopback"] is True
+        finally:
+            server.stop()
+
+
 class TestAuthManager:
     def test_empty_password_is_refused_at_construction(self) -> None:
         with pytest.raises(ValueError, match="空口令"):
@@ -1993,6 +2040,350 @@ class TestAuditSince:
         assert status == 400
         status, payload, _ = client.call("/api/audit?scope=plugin&since=24h")
         assert status == 200  # 插件 scope 同样接受 since（策略缺失也只是 available=false）
+
+
+class TestWebRestartAction:
+    """Web 自重启（v0.3.5 F4）：仅 systemd，且"先应答后动作"。"""
+
+    def test_rejects_when_not_root(self, web, monkeypatch) -> None:
+        """非 root 时**必须前置拒绝**（v0.3.5 review 修复）。
+
+        `WebService.restart()` 内部会 `_require_root`；此前不前置检查，延迟线程
+        里的 `PermissionRequired` 被静默吞掉、接口返回成功、审计记成功而 unit
+        从未重启。现在非 root 直接 400 并给 CLI 指引。
+        """
+        import frpsctl.web.api as api_mod
+        from frpsctl.core.systemd import WebService
+
+        monkeypatch.setattr(api_mod.os, "geteuid", lambda: 1000)
+        # systemd 部署（unit 存在）才轮到 root 检查——direct 部署走 direct 提示
+        monkeypatch.setattr(WebService, "unit_exists", lambda _self: True)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/web-restart", method="POST", body={})
+        assert status == 400
+        assert "root" in payload["error"]
+        assert "web service restart" in payload["hint"]
+
+    def test_direct_hint_takes_priority_when_not_root(self, web, monkeypatch) -> None:
+        """非 root 且非 systemd（direct 部署最常见）应给出 direct 指引。
+
+        复审修正：此前 root 检查在 `unit_exists()` 之前，direct 用户会看到一句
+        与它无关的"不是 root，请用 sudo web service restart"。
+        """
+        import frpsctl.web.api as api_mod
+        from frpsctl.core.systemd import WebService
+
+        monkeypatch.setattr(api_mod.os, "geteuid", lambda: 1000)
+        monkeypatch.setattr(WebService, "unit_exists", lambda _self: False)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/web-restart", method="POST", body={})
+        assert status == 400
+        assert "systemd 托管" in payload["error"]
+        assert "web restart" in payload["hint"]
+
+    def test_scheduled_flag_resets_after_delayed_failure(self, web, monkeypatch) -> None:
+        """延迟重启失败后必须复位幂等标志（否则后续请求永远被"已排程"挡住）。"""
+        import frpsctl.web.api as api_mod
+        from frpsctl.core.systemd import WebService
+
+        def _boom(_self):
+            raise RuntimeError("systemctl 故障")
+
+        monkeypatch.setattr(WebService, "restart", _boom)
+        monkeypatch.setattr(api_mod, "_web_restart_scheduled", True)
+        api_mod._restart_web_service(web.ctx.inst)
+        assert api_mod._web_restart_scheduled is False
+
+    def test_rejects_when_not_systemd(self, web, monkeypatch) -> None:
+        import frpsctl.web.api as api_mod
+
+        monkeypatch.setattr(api_mod.os, "geteuid", lambda: 0)  # 假装 root，考 unit 判定
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/web-restart", method="POST", body={})
+        assert status == 400
+        assert "systemd" in payload["error"]
+        assert "web restart" in payload["hint"]
+
+    def test_schedules_when_unit_active(self, web, monkeypatch) -> None:
+        import frpsctl.web.api as api_mod
+        from frpsctl.core.systemd import WebService
+
+        monkeypatch.setattr(api_mod.os, "geteuid", lambda: 0)
+
+        def _unit_exists(_self) -> bool:
+            return True
+
+        def _is_active(_self) -> bool:
+            return True
+
+        monkeypatch.setattr(WebService, "unit_exists", _unit_exists)
+        monkeypatch.setattr(WebService, "is_active", _is_active)
+        monkeypatch.setattr(api_mod, "_web_restart_scheduled", False)
+        captured: dict = {}
+
+        class _Timer:
+            daemon = False
+
+            def __init__(self, delay, fn, args=()):
+                captured["delay"] = delay
+                captured["fn"] = fn
+                captured["args"] = args
+
+            def start(self):
+                captured["started"] = True
+
+        monkeypatch.setattr(api_mod.threading, "Timer", _Timer)
+
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/actions/web-restart", method="POST", body={})
+        assert status == 200
+        assert payload["scheduled"] is True
+        assert payload["delay_seconds"] > 0
+        assert captured["started"] is True
+        assert captured["args"][0] is web.ctx.inst
+        # 动作留痕（Web 审计）
+        _, audit, _ = client.call("/api/audit?scope=web")
+        assert any(record["action"] == "web-restart" for record in audit["tail"])
+
+
+class TestUsersApi:
+    """`/api/users`（v0.3.5 F3）。"""
+
+    def test_requires_session(self, web) -> None:
+        status, _, _ = Client(web).call("/api/users")
+        assert status == 401
+
+    def test_dashboard_disabled_is_502(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/users")
+        assert status == 502
+        assert "dashboard" in payload["error"]
+
+
+class TestSessionsApi:
+    """会话管理 API（v0.3.5 F2）。"""
+
+    def test_list_marks_current_and_hides_tokens(self, web) -> None:
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/sessions")
+        assert status == 200
+        assert payload["count"] == 1
+        item = payload["sessions"][0]
+        assert set(item) == {"id", "source", "created_at", "expires_in", "current"}
+        assert item["current"] is True
+        blob = json.dumps(payload)
+        assert client.cookie.split("=", 1)[1] not in blob  # token 绝不下发
+        assert "password" not in blob and "/tmp" not in blob
+
+    def test_requires_session(self, web) -> None:
+        status, _, _ = Client(web).call("/api/sessions")
+        assert status == 401
+
+    def test_revoke_requires_boolean_keep_current(self, web) -> None:
+        """`keep_current` 必须是布尔：字符串 "false" 是真值、数字 0 会把当前会话也踢掉。"""
+        client = Client(web)
+        client.login()
+        for bad in ("false", 0, 1, [], {}):
+            status, payload, _ = client.call(
+                "/api/actions/sessions-revoke", method="POST", body={"keep_current": bad}
+            )
+            assert status == 400, f"{bad!r} 竟然被接受：{payload}"
+            assert "布尔" in payload["error"]
+
+    def test_revoke_keeps_current(self, web) -> None:
+        first = Client(web)
+        second = Client(web)
+        first.login()
+        second.login()
+        assert first.call("/api/sessions")[0] == 200
+
+        status, payload, _ = second.call(
+            "/api/actions/sessions-revoke", method="POST", body={"keep_current": True}
+        )
+        assert status == 200
+        assert payload["revoked"] == 1
+        # 被登出的会话下一次请求 401；当前会话保留
+        assert first.call("/api/sessions")[0] == 401
+        assert second.call("/api/sessions")[0] == 200
+        # 动作留痕（Web 审计）
+        _, audit, _ = second.call("/api/audit?scope=web")
+        assert any(record["action"] == "sessions-revoke" for record in audit["tail"])
+
+
+class TestAuditQueryApi:
+    """`/api/audit` 的过滤 + 分页（v0.3.5 F1）。"""
+
+    @staticmethod
+    def _seed(inst) -> None:
+        import time as _time
+
+        from frpsctl.core import web_audit
+
+        with web_audit.resolve_path(inst).open("a", encoding="utf-8") as handle:
+            for index in range(5):
+                handle.write(
+                    json.dumps({
+                        "at": "2026-01-01T00:00:00",
+                        "at_unix": _time.time() + index,
+                        "action": "login" if index % 2 == 0 else "config-apply",
+                        "result": "ok" if index != 3 else "error:ConfigError",
+                        "source": f"10.0.0.{index}",
+                        "params": {},
+                        "session_id": "",
+                    }) + "\n"
+                )
+
+    @staticmethod
+    def _download(client: Client, path: str) -> tuple[int, str, dict]:
+        req = urllib.request.Request(  # noqa: S310 - 固定回环地址
+            client.base + path, headers={"Cookie": client.cookie or ""}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+                return resp.status, resp.read().decode("utf-8"), dict(resp.headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+
+    def test_filter_and_page_metadata(self, web) -> None:
+        self._seed(web.ctx.inst)
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit?scope=web&action=login")
+        assert status == 200
+        # 3 条种子 + 1 条本次真实登录（登录本身也写审计——正是要保留的行为）
+        assert payload["page"]["matched"] == 4
+        assert all(record["action"] == "login" for record in payload["tail"])
+        assert payload["page"]["filters"] == {"action": "login"}
+        # 统计是"时间窗内全量"，不随记录过滤变化（前端会提示这一点）
+        assert payload["stats"]["total"] == 6
+
+    def test_paging_and_has_more(self, web) -> None:
+        self._seed(web.ctx.inst)
+        client = Client(web)
+        client.login()
+        _, page1, _ = client.call("/api/audit?scope=web&limit=2")
+        assert len(page1["tail"]) == 2
+        assert page1["page"]["matched"] == 6  # 5 条种子 + 1 条真实登录
+        assert page1["page"]["has_more"] is True
+        _, page3, _ = client.call("/api/audit?scope=web&limit=2&offset=4")
+        assert len(page3["tail"]) == 2
+        assert page3["page"]["has_more"] is False
+
+    def test_until_window_filters_records(self, web) -> None:
+        """`until` 是"自定义起止"的上界（v0.3.5）：记录与统计同口径。"""
+        import time as _time
+
+        from frpsctl.core import web_audit
+
+        path = web_audit.resolve_path(web.ctx.inst)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "at": "2026-01-01T00:00:00",
+                "at_unix": _time.time() + 3600,
+                "action": "future",
+                "result": "ok",
+                "source": "s",
+                "params": {},
+                "session_id": "",
+            }) + "\n")
+        client = Client(web)
+        client.login()
+        status, payload, _ = client.call("/api/audit?scope=web&action=future")
+        assert status == 200 and payload["page"]["matched"] == 1
+        assert payload["stats"]["by_action"].get("future") == 1
+        # until = 现在 → 1 小时后的那条被排除：记录列表与**统计**都看不到它
+        # （stats 是"时间窗内全量、不随 filters 变化"，但必须随 since/until 变化）
+        status, payload, _ = client.call(f"/api/audit?scope=web&action=future&until={_time.time()}")
+        assert status == 200
+        assert payload["page"]["matched"] == 0
+        assert "future" not in (payload["stats"]["by_action"] or {})
+        # 非法 until → 400（与 since 同一条"不猜测"纪律）
+        status, _, _ = client.call("/api/audit?scope=web&until=bogus")
+        assert status == 400
+
+    def test_invalid_paging_and_scope_rejected(self, web) -> None:
+        client = Client(web)
+        client.login()
+        for query in ("limit=0", "limit=abc", "offset=-1", "scope=bogus"):
+            status, _, _ = client.call(f"/api/audit?{query}")
+            assert status == 400, query
+
+    def test_export_jsonl_and_csv(self, web) -> None:
+        self._seed(web.ctx.inst)
+        client = Client(web)
+        client.login()
+        status, body, headers = self._download(client, "/api/audit/export?scope=web&format=jsonl")
+        assert status == 200
+        assert "attachment" in headers.get("Content-Disposition", "")
+        assert headers["Content-Disposition"].endswith('.jsonl"')
+        assert json.loads(body.splitlines()[0])["action"] in ("login", "config-apply")
+
+        status, body, headers = self._download(client, "/api/audit/export?scope=web&format=csv")
+        assert status == 200
+        assert headers["Content-Disposition"].endswith('.csv"')
+        assert body.splitlines()[0].startswith("at,at_unix,op,decision")
+
+        status, body, _ = self._download(client, "/api/audit/export?scope=web&format=bogus")
+        assert status == 400
+
+    def test_export_respects_export_limit_and_headers(self, web, monkeypatch) -> None:
+        """导出上限是 `MAX_EXPORT_ROWS`（**独立于分页上限**），正文严格可解析。
+
+        v0.3.5 review 的真实缺陷：`auditlog.query` 把导出 limit 钳到
+        `MAX_QUERY_LIMIT=1000`，而文案声称 10000；截断注释还会污染 JSONL。
+        现在：上限可显式放宽、截断信息只在响应头、正文逐行都是合法 JSON。
+        """
+        import time as _time
+
+        import frpsctl.web.api as api_mod
+        from frpsctl.core import web_audit
+
+        path = web_audit.resolve_path(web.ctx.inst)
+        now = _time.time()
+        with path.open("w", encoding="utf-8") as handle:
+            for index in range(30):
+                handle.write(json.dumps({
+                    "at": "2026-01-01T00:00:00",
+                    "at_unix": now - index,
+                    "action": f"a{index}",
+                    "result": "ok",
+                    "source": "s",
+                    "params": {},
+                    "session_id": "",
+                }) + "\n")
+        monkeypatch.setattr(api_mod, "MAX_EXPORT_ROWS", 10)
+        client = Client(web)
+        client.login()
+
+        status, body, headers = self._download(client, "/api/audit/export?scope=web&format=jsonl")
+        assert status == 200
+        lines = [line for line in body.splitlines() if line.strip()]
+        assert len(lines) == 10, f"导出上限未生效：{len(lines)}"
+        assert headers["X-Export-Limit"] == "10"
+        assert headers["X-Export-Truncated"] == "true"  # 30 条 > 上限 10
+        assert headers["X-Export-Records"] == "10"
+        for line in lines:
+            json.loads(line)  # 正文严格可解析（没有被 `#` 注释污染）
+
+    def test_export_not_truncated_when_under_limit(self, web) -> None:
+        self._seed(web.ctx.inst)
+        client = Client(web)
+        client.login()
+        status, body, headers = self._download(client, "/api/audit/export?scope=web&format=csv")
+        assert status == 200
+        assert headers["Content-Type"].startswith("text/csv"), headers["Content-Type"]
+        assert headers["X-Export-Truncated"] == "false"
+        assert headers["X-Export-Records"] == str(len(body.strip().splitlines()) - 1)  # 去表头
+
+    def test_export_requires_session(self, web) -> None:
+        status, _, _ = self._download(Client(web), "/api/audit/export?scope=web")
+        assert status == 401
 
 
 class TestLogsSince:

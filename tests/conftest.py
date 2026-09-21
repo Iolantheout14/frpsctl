@@ -113,6 +113,21 @@ def _clean_proxy_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stabilize_shell_detection(monkeypatch):
+    """固定 shell 检测结果，让 `--show-completion` 的断言不依赖宿主。
+
+    全量回归实测过 flake：Typer 的 `--show-completion` 通过 `shellingham`
+    检测当前 shell，而它会**顺着父进程链/psutil** 找交互式 shell——测试进程的
+    父进程是 pytest，检测结果随运行方式而变，于是同一断言有时得到
+    `Shell  not supported.`（退出码 1）而有时通过。这与 `_stabilize_systemctl`
+    是同一条纪律：**把环境事实固定成确定值**，而不是让测试"尽力而为"。
+    """
+    monkeypatch.setattr(
+        "typer.completion._get_shell_name", lambda: "bash", raising=False
+    )
+
+
+@pytest.fixture(autouse=True)
 def _stabilize_systemctl(monkeypatch):
     """把所有 `systemctl` 探测确定性化（v0.3.1 review 收口为**无条件**）。
 

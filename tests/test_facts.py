@@ -13,6 +13,7 @@
 | C6 | ✔ | `frps verify` 是权威判定（退出码 + 成功措辞） |
 | C7 | ✔ | 版本门槛与标志可用性（§3.6） |
 | C8 | ✔ | 鉴权开关是"**任一非空**"，且**空口令是合法口令**（§3.3） |
+| C11 | ✔ | `/api/v2/users` 是 v2 分页信封，条目字段为 `user` / `clientCount` / `proxyCount`（单数） |
 
 缺二进制时整组 skip，但断言本身始终留在仓库里——CI 有二进制时它们就是门禁。
 """
@@ -121,6 +122,87 @@ level = "info"
         proc.wait(timeout=5)
 
 
+@pytest.fixture
+def real_server_with_client(tmp_path):
+    """起真 frps + 真 frpc（一个 tcp 代理），返回 (base_url, user, password)。
+
+    为什么需要它：C11 要断言 `/api/v2/users` 的**条目字段名**，而"没有客户端"
+    时 `items` 是空列表——断言会**空转**（v0.3.5 review 抓到的测试有效性缺口）。
+    缺 frpc 时 skip（不是 fail）：字段名的正确性另有单元测试兜底。
+    """
+    frpc = os.environ.get("FRPSCTL_TEST_FRPC") or shutil.which("frpc")
+    if not frpc or not Path(frpc).exists():
+        pytest.skip("缺少 frpc（设置 FRPSCTL_TEST_FRPC 指向 frpc 二进制）")
+    assert REAL_FRPS is not None
+    port, dash_port, remote_port, local_port = free_ports(4)
+    config = tmp_path / "frps.toml"
+    config.write_text(
+        f"""\
+bindAddr = "127.0.0.1"
+bindPort = {port}
+
+[webServer]
+addr = "127.0.0.1"
+port = {dash_port}
+user = "admin"
+password = "contract-test"
+
+[log]
+to = "{tmp_path / "frps.log"}"
+level = "info"
+""",
+        "utf-8",
+    )
+    frps = subprocess.Popen(
+        [str(REAL_FRPS), "-c", str(config)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    frpc_proc: subprocess.Popen | None = None
+    try:
+        if not _wait_port("127.0.0.1", dash_port, timeout=10):
+            pytest.fail("真 frps 未在 10s 内起来")
+        frpc_config = tmp_path / "frpc.toml"
+        frpc_config.write_text(
+            f"""\
+serverAddr = "127.0.0.1"
+serverPort = {port}
+
+[[proxies]]
+name = "c11-tcp"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = {local_port}
+remotePort = {remote_port}
+""",
+            "utf-8",
+        )
+        frpc_proc = subprocess.Popen(
+            [str(frpc), "-c", str(frpc_config)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        base = f"http://127.0.0.1:{dash_port}"
+        import httpx
+
+        import contextlib
+
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            with contextlib.suppress(Exception):  # 注册期间的连接抖动
+                resp = httpx.get(f"{base}/api/v2/users", auth=("admin", "contract-test"), timeout=3)
+                if resp.status_code == 200 and resp.json()["data"]["items"]:
+                    break
+            time.sleep(0.5)
+        yield base, "admin", "contract-test"
+    finally:
+        if frpc_proc is not None:
+            frpc_proc.kill()
+            frpc_proc.wait(timeout=5)
+        frps.kill()
+        frps.wait(timeout=5)
+
+
 def _wait_port(host: str, port: int, *, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -227,8 +309,18 @@ class TestC2V2Only:
         code = "\n".join(code_lines)
         for field in ("clientCounts", "proxyTypeCount", "curConns", "totalTrafficIn", "tlsForce"):
             assert f'"{field}"' in code, f"admin.py 未解析 v2 字段 {field}（§3.2）"
-        # 反向：写错的字段名不得出现在解析代码里
-        assert '"proxyCount"' not in code, "解析了不存在的字段名 proxyCount"
+        # 反向：`system_info` 的解析里不得出现写错的字段名。
+        #
+        # ⚠️ v0.3.5 收窄（此前的全局断言不再成立）：`proxyCount` 在
+        # `/api/v2/users` 里是**真实字段**（契约 C11 实测确认），因此不能全局
+        # 禁止它。误写的风险只存在于 `server_info` 那一段——那里应该是
+        # `proxyTypeCount`。只查那一个方法的源码。
+        import inspect
+
+        server_info_src = inspect.getsource(admin_module.AdminClient.server_info)
+        assert '"proxyCount"' not in server_info_src, (
+            "system_info 解析了不存在的字段名 proxyCount（应为 proxyTypeCount）"
+        )
 
     def test_no_v1_fallback_remnants(self) -> None:
         """`/api/serverinfo` 与 `proxyTypeCount`（v1 字段名）不得出现在实现里。"""
@@ -656,3 +748,78 @@ port = {dash_port}
         finally:
             proc.kill()
             proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# C11 —— `/api/v2/users` 的聚合形状（v0.3.5 F3）
+# ---------------------------------------------------------------------------
+
+
+@requires_binary
+class TestC11UserAggregation:
+    """守"按用户聚合"端点的事实基线。
+
+    Web 的"按用户"卡片完全建立在这两个字段名上：`clientCount` / `proxyCount`
+    ——**单数**。字段名写错不会让任何东西报错，只会让界面永远显示 0（与
+    `proxyTypeCount` 是同一种静默失败）。因此这里同时钉住信封（v2 分页：
+    `total` / `page` / `pageSize` / `items`）与条目键集合。
+    """
+
+    def test_users_envelope_and_item_keys(self, real_server) -> None:
+        import httpx
+
+        base, user, password, _config = real_server
+        resp = httpx.get(f"{base}/api/v2/users", auth=(user, password), timeout=5)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) >= {"code", "msg", "data"}, body
+        data = body["data"]
+        assert set(data) >= {"total", "page", "pageSize", "items"}, data
+        for item in data["items"]:
+            assert set(item) == {"user", "clientCount", "proxyCount"}, item
+
+    def test_users_endpoint_requires_auth(self, real_server) -> None:
+        import httpx
+
+        base, _user, _password, _config = real_server
+        assert httpx.get(f"{base}/api/v2/users", timeout=5).status_code == 401
+
+    def test_item_keys_with_real_client(self, real_server_with_client) -> None:
+        """**非空 items** 的字段名断言（否则前面那条会空转——v0.3.5 review）。
+
+        v2 的字段是单数 `clientCount` / `proxyCount`；写错成复数不会报错，
+        只会让界面永远显示 0。
+        """
+        import httpx
+
+        base, user, password = real_server_with_client
+        resp = httpx.get(f"{base}/api/v2/users", auth=(user, password), timeout=5)
+        assert resp.status_code == 200
+        items = resp.json()["data"]["items"]
+        assert items, "frpc 已连接，users 不应为空（否则本测试空转）"
+        for item in items:
+            assert set(item) == {"user", "clientCount", "proxyCount"}, item
+        assert sum(item["clientCount"] for item in items) >= 1
+        assert sum(item["proxyCount"] for item in items) >= 1
+
+    def test_admin_client_users_with_real_client(self, real_server_with_client) -> None:
+        base, user, password = real_server_with_client
+        client = AdminClient(base, user, password)
+        try:
+            page = client.users()
+        finally:
+            client.close()
+        assert page.items, "frpc 已连接，PageResult.items 不应为空"
+        assert page.items[0].client_count >= 1
+        assert page.items[0].proxy_count >= 1
+        assert page.total >= 1
+
+    def test_admin_client_users_matches_raw_shape(self, real_server) -> None:
+        base, user, password, _config = real_server
+        client = AdminClient(base, user, password)
+        try:
+            page = client.users()
+            assert isinstance(page.items, list)
+            assert page.total == 0 and page.truncated is False
+        finally:
+            client.close()

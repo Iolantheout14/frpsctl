@@ -27,9 +27,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from typer.main import get_command
-
 from frpsctl.cli import app
+from frpsctl.cli.introspect import build_snapshot
 
 SNAPSHOT_PATH = Path(__file__).parent / "snapshots" / "cli_commands.json"
 
@@ -97,62 +96,9 @@ REQUIRED_PATHS = {
 PLANNED_IN_030: set[str] = set()  # 0.3.0 计划项已全部落地
 
 
-def _default_desc(value: object) -> object:
-    """默认值的稳定描述（不存 repr，避免内存地址之类的不稳定输出）。"""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return f"<{type(value).__name__}>:{value}"
-
-
-def _describe(cmd) -> list[dict]:
-    out: list[dict] = []
-    for param in cmd.params:
-        if hasattr(param, "opts"):
-            entry = {
-                "kind": "opt",
-                "name": param.name,
-                "opts": sorted(param.opts),
-                "secondary": sorted(getattr(param, "secondary_opts", [])),
-                "is_flag": bool(getattr(param, "is_flag", False)),
-                "multiple": bool(getattr(param, "multiple", False)),
-                "required": bool(getattr(param, "required", False)),
-                "default": _default_desc(param.default),
-            }
-            ptype = getattr(param, "type", None)
-            if hasattr(ptype, "min") or hasattr(ptype, "max"):
-                entry["min"] = getattr(ptype, "min", None)
-                entry["max"] = getattr(ptype, "max", None)
-            out.append(entry)
-        else:
-            out.append(
-                {
-                    "kind": "arg",
-                    "name": param.name,
-                    "required": bool(getattr(param, "required", False)),
-                    "nargs": int(getattr(param, "nargs", 1)),
-                }
-            )
-    return sorted(out, key=lambda item: (item["kind"], item["name"]))
-
-
-def _walk(group, prefix: str = ""):
-    for name in sorted(group.commands):
-        sub = group.commands[name]
-        path = f"{prefix} {name}".strip()
-        if hasattr(sub, "commands"):
-            yield from _walk(sub, path)
-        else:
-            yield path, sub
-
-
-def build_snapshot() -> dict:
-    command = get_command(app)
-    snapshot: dict[str, dict] = {
-        "(root)": {"params": _describe(command)},
-    }
-    for path, cmd in sorted(_walk(command)):
-        snapshot[path] = {"params": _describe(cmd)}
-    return snapshot
+#: 快照生成器已提炼到生产代码（v0.3.5 R1）：`frpsctl/cli/introspect.py` 同时服务
+#: 本快照、Web"命令"视图的静态数据（生成物无 diff 守卫）与元数据覆盖守卫。
+#: `build_snapshot()` 的输出形状与提炼前逐字节一致——基线文件未变动。
 
 
 def test_command_surface_matches_snapshot() -> None:

@@ -40,6 +40,7 @@ _FORBIDDEN_JS = (
 )
 
 #: v0.3.4 新增组件类（拆分后逐项点名，防"样式漏写 = 静默失效"）。
+#: v0.3.5 追加命令参考视图（cmd-*、tag-*）的类。
 _COMPONENT_CLASSES = (
     "hero", "metric", "skeleton", "empty", "modal-card", "toolbar",
     "kbd", "grid-line", "crosshair", "tip-box", "tip-text", "bar-hit",
@@ -47,6 +48,12 @@ _COMPONENT_CLASSES = (
     "drawer", "drawer-head", "drawer-body", "cmdk-panel", "cmdk-item",
     "service-card", "service-head", "progress-bar", "progress-fill",
     "port-editor", "port-row", "donut-slice", "donut-total", "banner-action",
+    "cmd-group", "cmd-item", "cmd-item-head", "cmd-item-body", "cmd-code",
+    "cmd-badges", "cmd-buttons", "tag-ro", "tag-mut", "tag-root", "tag-sys",
+    "login-head", "login-title", "login-scan", "login-label", "login-field",
+    "pw-toggle", "login-caps", "login-meta", "login-shake",
+    "overlay-card", "overlay-title", "overlay-scan",
+    "cmdk-label", "cmdk-hint", "cmdk-empty", "group-title", "login-card",
 )
 
 #: 静态资源目录里的合法文件扩展名。
@@ -191,6 +198,49 @@ class TestFrontendDiscipline:
         assert "alert(" not in js, "仍有原生 alert 调用"
         assert "confirmAsync(" in js
 
+    def test_no_boolean_attr_shorthand_in_el(self) -> None:
+        """布尔属性不得走 `el()` 的 attrs 简写（v0.3.4 的真实缺陷）。
+
+        `el("button", {disabled: false})` → `setAttribute("disabled", "false")`，
+        而 HTML 的布尔属性**只要存在就生效**——按钮会永远禁用、面板永远隐藏。
+        正确写法是属性赋值（`btn.disabled = true`）。插件启停按钮曾因此完全
+        不可用（2026-09-21 发现并修复于 views/services.js）。
+        """
+        js = _js_text()
+        # 用正则而不是子串：`disabled : false`（冒号前有空格）此前能绕过；
+        # 也不能误伤 `"aria-hidden": "true"`（布尔属性守卫不该管 ARIA 属性）。
+        pattern = re.compile(
+            r"(?<![\w-])(disabled|checked|hidden|readonly|required|selected)\s*[:,]"
+        )
+        hits = pattern.findall(js)
+        assert not hits, (
+            f"发现布尔属性简写 {sorted(set(hits))}——它在 el() 里会变成字符串属性而静默生效，"
+            "请改用属性赋值（node.disabled = true）"
+        )
+
+    def test_dollar_helper_only_used_with_literal_ids_or_tables(self) -> None:
+        """`$(...)` 的非字面量实参只允许出现在登记的数据表文件里。
+
+        `$("id")` 才是能被 id 双向守卫核对（并能被正则抓到 typo）的形态；
+        `$(someVariable)` 让正向检查完全失效。两处例外是"字面量数据表驱动"
+        的用法（表本身仍被反向精确核对覆盖）：
+        `router.js` 的 `VIEW_IDS` 与 `busy.js` 的按钮 id 数组。
+        """
+        allowed = {"router.js", "busy.js"}
+        bad: list[str] = []
+        for path in _js_files():
+            if path.name in allowed:
+                continue
+            for match in re.finditer(r"\$\(([^)]*)\)", path.read_text("utf-8")):
+                arg = match.group(1).strip()
+                if not arg:
+                    continue
+                # 模板串带插值（`` `id-${x}` ``）同样是动态实参，必须拒绝
+                dynamic = arg[0] not in "\"'`" or (arg[0] == "`" and "${" in arg)
+                if dynamic:
+                    bad.append(f"{path.name}: $({arg})")
+        assert not bad, f"$() 只允许字面量实参：{bad}"
+
     def test_html_skeleton(self) -> None:
         html = _index_html()
         assert '<html lang="zh-CN">' in html
@@ -284,8 +334,15 @@ class TestIdCrossCheck:
         referenced = set(re.findall(r'\$\("([^"]+)"\)', js))
         defined = set(re.findall(r'\bid="([^"]+)"', html))
         assert not (referenced - defined), f"JS 引用了未定义的 id：{sorted(referenced - defined)}"
-        unused = {name for name in defined if name not in js}
-        assert not unused, f"HTML 里有从未被 JS 提及的 id：{sorted(unused)}"
+        # 反向必须是**精确形态**（字符串/选择器里的完整 id），不能用"子串包含"：
+        # 子串会让 `nav-dashh`（typo）里的 `nav-dash` 也算命中，从而漏掉一处白屏级
+        # typo（v0.3.5 review）。规则：id 前面是引号或 `#`，后面不是 id 字符。
+        unused = [
+            name
+            for name in sorted(defined)
+            if not re.search(rf'["\'`#]{re.escape(name)}(?![A-Za-z0-9_-])', js)
+        ]
+        assert not unused, f"HTML 里有从未被 JS 精确引用的 id：{unused}"
 
 
 # ---------------------------------------------------------------------------

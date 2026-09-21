@@ -21,6 +21,8 @@ const MODULES = [
   "lib/audit-format.js",
   "lib/chart-math.js",
   "lib/port-ranges.js",
+  "lib/command-text.js",
+  "data/commands.js",
   "ui/dom.js",
   "ui/toast.js",
   "ui/modal.js",
@@ -36,6 +38,8 @@ const MODULES = [
   "views/audit.js",
   "views/services.js",
   "views/versions.js",
+  "views/commands.js",
+  "views/sessions.js",
 ];
 
 test("全部非入口模块可加载（无顶层 DOM 访问 / 循环依赖异常）", async () => {

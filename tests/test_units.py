@@ -5560,3 +5560,364 @@ class TestAdminDetail404:
 
         client._get = lambda path, params=None: _Resp()  # type: ignore[method-assign]  # noqa: ARG005
         assert client.client_detail("gone") == {}
+
+
+class TestAdminUsers:
+    """`/api/v2/users` 解析（v0.3.5 F3）：字段是 `clientCount` / `proxyCount`（单数）。
+
+    这是与 `proxyTypeCount` 同类的字段陷阱：写错名字不会报错，只会永远显示 0。
+    """
+
+    @staticmethod
+    def _client(payload):
+        from frpsctl.core.admin import AdminClient
+
+        client = AdminClient("http://127.0.0.1:1", "u", "p")
+        seen: dict = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return payload
+
+        def _get(path, params=None):
+            seen["path"] = path
+            seen["params"] = params
+            return _Resp()
+
+        client._get = _get  # type: ignore[method-assign]
+        return client, seen
+
+    def test_parses_real_payload_shape(self) -> None:
+        client, seen = self._client({
+            "code": 200,
+            "msg": "success",
+            "data": {
+                "total": 2,
+                "page": 1,
+                "pageSize": 50,
+                "items": [
+                    {"user": "", "clientCount": 1, "proxyCount": 1},
+                    {"user": "alice", "clientCount": 2, "proxyCount": 3},
+                ],
+            },
+        })
+        page = client.users()
+        assert [item.user for item in page.items] == ["", "alice"]
+        assert page.items[1].client_count == 2
+        assert page.items[1].proxy_count == 3
+        assert page.total == 2
+        assert page.truncated is False  # total == len(items)，没有更多
+        assert page.total_known is True
+        assert seen["path"] == "/api/v2/users"
+        assert seen["params"] == {"page": 1, "page_size": 200}
+
+    def test_wrong_field_names_yield_zero(self) -> None:
+        """字段名写成复数（clientCounts / proxyCounts）→ 静默 0（陷阱的守卫）。"""
+        client, _seen = self._client({
+            "code": 200,
+            "data": {"items": [{"user": "a", "clientCounts": 5, "proxyCounts": 7}]},
+        })
+        page = client.users()
+        assert page.items[0].client_count == 0
+        assert page.items[0].proxy_count == 0
+
+    def test_malformed_items_skipped_and_empty_envelope(self) -> None:
+        client, _seen = self._client({"code": 200, "data": {"items": ["nope", 42]}})
+        assert client.users().items == []
+        client2, _seen2 = self._client({"code": 200, "data": {}})
+        page = client2.users()
+        assert page.items == [] and page.total == 0 and page.total_known is False
+
+    def test_bad_field_types_degrade_to_zero(self) -> None:
+        """上游字段类型漂移时给 0，而不是让 int("N/A") 冒成 400/500（v0.3.5 review）。"""
+        client, _seen = self._client({
+            "code": 200,
+            "data": {"total": 3, "items": [
+                {"user": "a", "clientCount": "N/A", "proxyCount": {"x": 1}},
+                {"user": "b", "clientCount": None, "proxyCount": [1]},
+            ]},
+        })
+        page = client.users()
+        assert [item.client_count for item in page.items] == [0, 0]
+        assert [item.proxy_count for item in page.items] == [0, 0]
+        assert page.total == 3
+        assert page.truncated is True  # total(3) > len(items)(2)
+
+    def test_non_dict_payload_returns_empty_page(self) -> None:
+        """`data` 不是对象（上游形状漂移）→ 空结果，而不是 AttributeError → 500。"""
+        client, _seen = self._client({"code": 200, "data": [1, 2]})
+        page = client.users()
+        assert page.items == [] and page.total == 0
+
+    def test_total_equal_to_limit_is_not_truncated(self) -> None:
+        """恰好等于单页上限时不得误报截断（v0.3.5 review：旧实现用 len>=limit）。"""
+        items = [{"user": f"u{i}", "clientCount": 1, "proxyCount": 1} for i in range(200)]
+        client, _seen = self._client({"code": 200, "data": {"total": 200, "items": items}})
+        page = client.users(page_size=200)
+        assert len(page.items) == 200
+        assert page.truncated is False
+
+
+class TestSessionManagement:
+    """会话管理（v0.3.5 F2）：脱敏快照 + 登出其他所有会话。"""
+
+    def test_snapshot_is_sanitized_and_ordered(self) -> None:
+        from frpsctl.core.web_audit import session_fingerprint
+        from frpsctl.web import AuthManager
+
+        now = {"t": 1000.0}
+        wall = {"t": 1_700_000_000.0}
+        # TTL 用单调时钟、created_at 用墙钟（v0.3.5 review：单调值不可作为
+        # Unix 时间戳展示，字段语义必须是墙钟）——两个时钟都可注入，便于断言。
+        auth = AuthManager("pw", clock=lambda: now["t"], wall_clock=lambda: wall["t"])
+        first = auth.login("pw", source="10.0.0.1")
+        now["t"] = 1010.0
+        wall["t"] = 1_700_000_100.0
+        second = auth.login("pw", source="10.0.0.2")
+        assert first is not None and second is not None
+
+        items = auth.snapshot()
+        assert [item.source for item in items] == ["10.0.0.1", "10.0.0.2"]
+        assert items[0].created_at == 1_700_000_000.0  # 墙钟时间戳
+        assert items[1].created_at == 1_700_000_100.0
+        assert items[0].expires_in > 0
+        # 指纹存在但不是 token（token 绝不出现在快照里），且与审计口径一致
+        assert items[0].fingerprint == session_fingerprint(first.token)
+        assert items[0].fingerprint != first.token
+        assert first.token not in {item.fingerprint for item in items}
+
+    def test_revoke_all_keeps_current(self) -> None:
+        from frpsctl.core.web_audit import session_fingerprint
+        from frpsctl.web import AuthManager
+
+        auth = AuthManager("pw")
+        first = auth.login("pw", source="a")
+        second = auth.login("pw", source="b")
+        third = auth.login("pw", source="c")
+        assert first and second and third
+
+        removed = auth.revoke_all(keep_fingerprint=session_fingerprint(second.token))
+        assert removed == 2
+        assert auth.check_session(second.token) is not None
+        assert auth.check_session(first.token) is None
+        assert auth.check_session(third.token) is None
+
+    def test_revoke_all_without_keep_removes_everything(self) -> None:
+        from frpsctl.web import AuthManager
+
+        auth = AuthManager("pw")
+        session = auth.login("pw", source="a")
+        assert session is not None
+        assert auth.revoke_all() == 1
+        assert auth.check_session(session.token) is None
+
+    def test_snapshot_prunes_expired(self) -> None:
+        from frpsctl.web import AuthManager
+
+        now = {"t": 1000.0}
+        auth = AuthManager("pw", session_ttl=10.0, clock=lambda: now["t"])
+        auth.login("pw", source="a")
+        now["t"] = 1020.0
+        assert auth.snapshot() == []
+
+
+class TestAuditQuery:
+    """审计的过滤 + 分页查询（v0.3.5 R4）。
+
+    与 `read_tail`（"最近 N 条"）的差别是"**符合条件**的第 offset..offset+limit
+    条"——Web 审计视图的过滤与"加载更多"都建立在它上面。
+    """
+
+    @staticmethod
+    def _write(path, records) -> None:
+        import json as _json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for index, record in enumerate(records):
+                record.setdefault("at_unix", 1000.0 + index)
+                record.setdefault("at", "2026-01-01T00:00:00")
+                handle.write(_json.dumps(record, ensure_ascii=False) + "\n")
+
+    def test_filter_by_action_and_source(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(path, [
+            {"action": "login", "result": "ok", "source": "10.0.0.1"},
+            {"action": "config-apply", "result": "ok", "source": "10.0.0.2"},
+            {"action": "login", "result": "error:Auth", "source": "10.0.0.1"},
+        ])
+        result = auditlog.query(path, filters={"action": "login"})
+        assert result.matched == 2
+        assert [item["action"] for item in result.records] == ["login", "login"]
+
+    def test_filter_is_case_insensitive_substring(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(path, [{"action": "Config-Apply", "result": "ok", "source": "x"}])
+        assert auditlog.query(path, filters={"action": "config"}).matched == 1
+        assert auditlog.query(path, filters={"result": "OK"}).matched == 1
+        assert auditlog.query(path, filters={"action": "nope"}).matched == 0
+
+    def test_paging_newest_first_with_has_more(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(path, [{"action": f"a{i}", "result": "ok"} for i in range(5)])
+        first = auditlog.query(path, limit=2, offset=0)
+        assert [item["action"] for item in first.records] == ["a3", "a4"]
+        assert first.has_more is True
+        second = auditlog.query(path, limit=2, offset=2)
+        assert [item["action"] for item in second.records] == ["a1", "a2"]
+        third = auditlog.query(path, limit=2, offset=4)
+        assert [item["action"] for item in third.records] == ["a0"]
+        assert third.has_more is False
+
+    def test_since_and_until_window(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(path, [{"at_unix": 100.0, "action": "old"}, {"at_unix": 200.0, "action": "new"}])
+        assert [item["action"] for item in auditlog.query(path, since=150.0).records] == ["new"]
+        assert [item["action"] for item in auditlog.query(path, until=150.0).records] == ["old"]
+
+    def test_summarize_respects_since_and_until(self, tmp_path) -> None:
+        """统计与记录列表同口径：`until` 也约束统计（v0.3.5 补）。"""
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(path, [
+            {"at_unix": 100.0, "decision": "allow"},
+            {"at_unix": 200.0, "decision": "deny"},
+        ])
+        assert auditlog.summarize(path, since=150.0).total == 1
+        assert auditlog.summarize(path, until=150.0).total == 1
+        assert auditlog.summarize(path, since=150.0, until=150.0).total == 0
+        assert auditlog.summarize(path).total == 2
+
+    def test_truncated_window_semantics(self, tmp_path, monkeypatch) -> None:
+        """`truncated`（扫描窗口已满）与 `has_more`（本页之后还有）是两件事。
+
+        复审修正后的语义：
+        - `has_more` 只看本页之后是否还有**窗口内**的记录——它决定"加载更多"
+          是否显示，绝不能因 `truncated` 而恒真（否则按钮永不消失、每次点击都
+          空转并触发一次全量扫描）；
+        - `truncated` 表示"可能还有更旧的记录在窗口之外"，由前端用文字提示。
+        """
+        from frpsctl.core import auditlog
+
+        monkeypatch.setattr(auditlog, "MAX_QUERY_MATCHES", 5)
+        path = tmp_path / "a.jsonl"
+        self._write(path, [{"action": f"a{index}"} for index in range(20)])
+
+        first = auditlog.query(path, limit=5, offset=0)
+        assert first.truncated is True       # 20 条匹配 > 窗口 5
+        assert first.has_more is False       # 窗口内已无更旧的可翻
+        assert len(first.records) == 5
+
+        beyond = auditlog.query(path, limit=5, offset=5)
+        assert beyond.truncated is True
+        assert beyond.has_more is False
+        assert beyond.records == []          # 超出窗口：空页（前端不应再翻）
+
+    def test_has_more_only_within_window(self, tmp_path, monkeypatch) -> None:
+        """未触发截断时，`has_more` 如实反映本页之后是否还有记录。"""
+        from frpsctl.core import auditlog
+
+        monkeypatch.setattr(auditlog, "MAX_QUERY_MATCHES", 100)
+        path = tmp_path / "a.jsonl"
+        self._write(path, [{"action": f"a{index}"} for index in range(5)])
+        assert auditlog.query(path, limit=2, offset=0).has_more is True
+        assert auditlog.query(path, limit=2, offset=4).has_more is False
+        assert auditlog.query(path, limit=2, offset=0).truncated is False
+
+    def test_non_finite_window_is_rejected(self) -> None:
+        """`since`/`until` 拒绝 nan/inf：它们会静默关闭时间窗（与"非法值 400"矛盾）。"""
+        import pytest
+
+        from frpsctl.core.auditlog import parse_since
+        from frpsctl.errors import UsageError
+
+        for bad in ("nan", "inf", "-inf", "1e400"):
+            with pytest.raises(UsageError):
+                parse_since(bad)
+
+    def test_csv_cell_prefix_rules(self) -> None:
+        """CSV 防线的边界：控制字符加前缀，纯数值（含负数）不加。"""
+        import csv as _csv
+        import io as _io
+
+        from frpsctl.core import auditlog
+
+        text = auditlog.to_csv([{
+            "action": "\n=1+1",       # 换行后接公式：加前缀（黑名单会漏）
+            "target": "\x00=cmd",     # 控制字符：加前缀
+            "user": " =1+1",          # **前导空格后接公式**：必须加前缀（v0.3.5 复审：
+                                      # lstrip 曾把 `=+-@` 一起 strip 掉，使这条防线失效）
+            "proxy_name": "  =cmd|'/c calc'!A1",
+            "source": "-5",           # 纯数值：不加（否则下游把它当文本）
+            "result": "1e-3",         # 科学计数：不加
+            "op": None,               # None → 空
+        }])
+        rows = list(_csv.reader(_io.StringIO(text)))
+        header, row = rows[0], rows[1]
+        assert row[header.index("action")] == "'\n=1+1"
+        assert row[header.index("target")].startswith("'")
+        assert row[header.index("user")] == "' =1+1"
+        assert row[header.index("proxy_name")].startswith("'  =cmd")
+        assert row[header.index("source")] == "-5"
+        assert row[header.index("result")] == "1e-3"
+        assert row[header.index("op")] == ""
+
+    def test_bad_lines_counted_not_fatal(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        path.write_text('{"action":"a"}\nnot-json\n{"action":"b"}\n', "utf-8")
+        result = auditlog.query(path)
+        assert result.matched == 2
+        assert result.bad_lines == 1
+
+    def test_cross_rotation_merged_in_time_order(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        path = tmp_path / "a.jsonl"
+        self._write(Path(f"{path}.1"), [{"action": "older"}])
+        self._write(path, [{"action": "newer"}])
+        assert [item["action"] for item in auditlog.query(path).records] == ["older", "newer"]
+
+    def test_missing_file_is_empty_not_error(self, tmp_path) -> None:
+        from frpsctl.core import auditlog
+
+        result = auditlog.query(tmp_path / "nope.jsonl")
+        assert result.records == [] and result.matched == 0
+
+    def test_csv_guards_formula_injection(self) -> None:
+        """CSV 公式注入防护 + 容器类型 JSON 化（按解析后的单元格值断言）。"""
+        import csv as _csv
+        import io as _io
+
+        from frpsctl.core import auditlog
+
+        text = auditlog.to_csv([
+            {"action": "=cmd|'/c calc'!A1", "source": "+1", "params": {"k": "v"}}
+        ])
+        rows = list(_csv.reader(_io.StringIO(text)))
+        header = rows[0]
+        assert header[0] == "at" and "params" in header
+        row = rows[1]
+        assert row[header.index("action")] == "'=cmd|'/c calc'!A1"
+        assert row[header.index("source")] == "'+1"
+        assert row[header.index("params")] == '{"k": "v"}'
+
+    def test_jsonl_roundtrip(self) -> None:
+        import json as _json
+
+        from frpsctl.core import auditlog
+
+        text = auditlog.to_jsonl([{"action": "a"}, {"action": "b"}])
+        assert [_json.loads(line)["action"] for line in text.splitlines()] == ["a", "b"]
