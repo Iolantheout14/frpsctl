@@ -33,10 +33,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from ..core.healthcheck import parse_bind
+from ..core.healthcheck import is_loopback, parse_bind
 from ..core.httpserver import BoundedThreadingHTTPServer
 from ..core import web_audit
-from .api import RequestInfo, WebContext, dispatch
+from ..errors import FrpsctlError
+from .api import RequestInfo, WebContext, dispatch, http_status_for
 from .auth import SESSION_COOKIE
 
 __all__ = ["STATIC_DIR", "STATIC_INDEX", "WebServer", "WebSettings"]
@@ -147,6 +148,17 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             if parsed.path.startswith("/static/"):
                 self._send_static(parsed.path[len("/static/"):])
                 return
+            if parsed.path == "/api/login-info":
+                # 登录页展示用的非敏感静态信息（v0.3.5）：**免认证**（登录前就要显示），
+                # 但只含实例名 / 版本 / 门槛 / 是否非回环——边界见 api.login_info_payload。
+                from .api import login_info_payload
+
+                self._send_json(
+                    200,
+                    login_info_payload(ctx, non_loopback=not is_loopback(settings.host)),
+                    cacheable=False,
+                )
+                return
             if parsed.path == "/metrics":
                 self._handle_metrics()
                 return
@@ -172,10 +184,71 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
                     cacheable=False,
                 )
                 return
+            if parsed.path == "/api/sessions":
+                # 会话列表（v0.3.5 F2）：需要**当前会话**的指纹来标记"当前"，
+                # 而指纹只能由 server 层从会话对象算出（token 不出认证层）。
+                if session is None:
+                    self._send_json(401, {"error": "未登录", "hint": "请先登录"}, cacheable=False)
+                    return
+                from .api import sessions_payload
+
+                self._send_json(
+                    200,
+                    sessions_payload(ctx, web_audit.session_fingerprint(session.token)),
+                    cacheable=False,
+                )
+                return
+            if parsed.path == "/api/audit/export":
+                # 审计导出（v0.3.5）：文本附件（JSONL / CSV，打码不适用——审计
+                # 本就是操作留痕；模式见 api.audit_export）。
+                if session is None:
+                    self._send_json(401, {"error": "未登录", "hint": "请先登录"}, cacheable=False)
+                    return
+                from .api import audit_export
+
+                query_params = {
+                    key: values[-1] for key, values in parse_qs(parsed.query).items()
+                }
+                try:
+                    text, filename, extra = audit_export(ctx, query_params)
+                except FrpsctlError as exc:
+                    self._send_json(
+                        http_status_for(exc),
+                        {"error": exc.message, "hint": exc.hint or ""},
+                        cacheable=False,
+                    )
+                    return
+                except (ValueError, TypeError) as exc:  # 与 dispatch 同形的兜底
+                    self._send_json(
+                        400, {"error": f"请求格式错误：{exc}", "hint": ""}, cacheable=False
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001 - 不外泄细节，只报类型
+                    self._send_json(
+                        500,
+                        {"error": f"服务内部错误：{type(exc).__name__}", "hint": "查看 web 服务日志"},
+                        cacheable=False,
+                    )
+                    return
+                # CSV 用 text/csv（Excel/表格工具按其分列），JSONL 用 x-ndjson。
+                # 两者都不加 BOM：正文保持字节级可解析（README 已注明 Excel 取舍）。
+                is_csv = (query_params.get("format") or "jsonl").lower() == "csv"
+                self._send_attachment(
+                    200,
+                    text,
+                    filename,
+                    extra_headers=extra,
+                    content_type=(
+                        "text/csv; charset=utf-8"
+                        if is_csv
+                        else "application/x-ndjson; charset=utf-8"
+                    ),
+                )
+                return
             if parsed.path == "/api/diagnostics":
                 # 诊断导出（v0.3.4 F9）：文本附件下载（配置已打码；日志需自行检查）
                 if session is None:
-                    self._send_json(401, {"error": "未登录"}, cacheable=False)
+                    self._send_json(401, {"error": "未登录", "hint": "请先登录"}, cacheable=False)
                     return
                 from .api import diagnostics_text
 
@@ -485,21 +558,33 @@ def _make_handler(ctx: WebContext, settings: WebSettings, static_index: Path):
             except (BrokenPipeError, ConnectionResetError):
                 self._note("客户端在页面加载中断开连接")
 
-        def _send_attachment(self, status: int, text: str, filename: str) -> None:
-            """下载型文本响应（诊断导出）：带 Content-Disposition，绝不缓存。
+        def _send_attachment(
+            self,
+            status: int,
+            text: str,
+            filename: str,
+            *,
+            extra_headers: dict[str, str] | None = None,
+            content_type: str = "text/plain; charset=utf-8",
+        ) -> None:
+            """下载型文本响应（诊断/审计导出）：带 Content-Disposition，绝不缓存。
 
             文件名做头部注入消毒（实例名已受字符集校验，这里是纵深防御）。
+            `extra_headers` 用于把"是否截断"这类元信息放进响应头——审计导出
+            的正文必须是严格可解析的 JSONL/CSV，不能塞注释行（v0.3.5 review）。
             """
             self.close_connection = True
             filename = filename.replace('"', "_").replace("\r", "").replace("\n", "")
             body = text.encode("utf-8")
             try:
                 self.send_response(status)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Cache-Control", "no-store")
-                for key, value in _SECURITY_HEADERS.items():
+                # 安全头**最后**写入（优先级最高）：extra 只放业务头（X-Export-*），
+                # 但顺序上不给未来调用点留下覆盖 nosniff 之类安全头的机会。
+                for key, value in {**(extra_headers or {}), **_SECURITY_HEADERS}.items():
                     self.send_header(key, value)
                 self.end_headers()
                 self.wfile.write(body)

@@ -30,6 +30,7 @@ __all__ = [
     "AuthManager",
     "LoginAuditLimiter",
     "Session",
+    "SessionInfo",
     "generate_password",
     "SESSION_COOKIE",
 ]
@@ -136,14 +137,41 @@ def generate_password() -> str:
 
 @dataclass(frozen=True)
 class Session:
-    """一次登录的会话。`csrf` 通过登录响应下发给前端（只存内存变量）。"""
+    """一次登录的会话。`csrf` 通过登录响应下发给前端（只存内存变量）。
+
+    v0.3.5 起记录 `source`（来源 IP / XFF 最后一跳）与 `created_at`——会话管理
+    视图要回答"谁在哪儿登录了"，而这两个字段此前在 `login()` 里用完就丢。
+    """
 
     token: str
     csrf: str
     expires_at: float
+    source: str = ""
+    created_at: float = 0.0
 
     def expired(self, now: float) -> bool:
         return now >= self.expires_at
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    """一个活跃会话的**脱敏**视图（token 本身绝不出现在这里）。
+
+    `fingerprint` 与 `core.web_audit.session_fingerprint` 是同一算法：
+    审计记录里的 `session_id` 就是这个值，因此"哪个动作来自哪个会话"能对上。
+    """
+
+    fingerprint: str
+    source: str
+    created_at: float
+    expires_in: float
+
+
+def _fingerprint(token: str) -> str:
+    """会话指纹（复用审计侧实现，保证两处口径一致）。"""
+    from ..core.web_audit import session_fingerprint
+
+    return session_fingerprint(token)
 
 
 class AuthManager:
@@ -155,12 +183,16 @@ class AuthManager:
         *,
         session_ttl: float = DEFAULT_SESSION_TTL,
         clock=time.monotonic,
+        wall_clock=time.time,
     ) -> None:
         if not password:
             raise ValueError("Web 管理台不允许空口令")
         self._password = password
         self.session_ttl = session_ttl
         self._clock = clock
+        #: 会话创建时间用**墙钟**（TTL 仍用单调时钟）：`created_at` 要能作为
+        #: Unix 时间戳展示，而单调时钟的值跨进程/跨机器不可比（v0.3.5 review 修正）。
+        self._wall_clock = wall_clock
         self._sessions: dict[str, Session] = {}
         self._failures: dict[str, list[float]] = {}
         self._lock = threading.Lock()
@@ -191,6 +223,8 @@ class AuthManager:
                 token=secrets.token_urlsafe(32),
                 csrf=secrets.token_urlsafe(32),
                 expires_at=now + self.session_ttl,
+                source=source,
+                created_at=self._wall_clock(),
             )
             self._sessions[session.token] = session
             self._cap_sessions()
@@ -199,6 +233,39 @@ class AuthManager:
     def logout(self, token: str) -> None:
         with self._lock:
             self._sessions.pop(token, None)
+
+    def snapshot(self) -> list[SessionInfo]:
+        """活跃会话的脱敏快照（按创建时间升序；token 不外泄）。"""
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            items = [
+                SessionInfo(
+                    fingerprint=_fingerprint(token),
+                    source=session.source,
+                    created_at=session.created_at,
+                    expires_in=max(0.0, session.expires_at - now),
+                )
+                for token, session in self._sessions.items()
+            ]
+        return sorted(items, key=lambda item: item.created_at)
+
+    def revoke_all(self, *, keep_fingerprint: str | None = None) -> int:
+        """登出除 `keep_fingerprint` 外的全部会话，返回被登出的数量。
+
+        参数刻意是**指纹而不是 token**：调用方（Web 的动作 handler）只持有
+        指纹（`RequestInfo.session_id`），token 永远只在认证层内部流动——
+        少一条"token 出现在别处"的路径，就少一个泄露面。
+        """
+        with self._lock:
+            targets = [
+                token
+                for token, session in self._sessions.items()
+                if keep_fingerprint is None or _fingerprint(token) != keep_fingerprint
+            ]
+            for token in targets:
+                self._sessions.pop(token, None)
+            return len(targets)
 
     # --- 校验 -----------------------------------------------------------
 

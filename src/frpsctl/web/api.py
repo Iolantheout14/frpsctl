@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import os
 import secrets
 import threading
 import time
@@ -63,7 +64,18 @@ from .auth import AuthManager, LoginAuditLimiter
 from .cache import TTLCache
 from .tasks import TaskRegistry
 
-__all__ = ["WebContext", "dispatch", "http_status_for"]
+__all__ = [
+    "WebContext",
+    "audit_export",
+    "dispatch",
+    "http_status_for",
+    "login_info_payload",
+    "sessions_payload",
+    "users_payload",
+]
+
+#: 自重启的延迟（秒）：先让当前响应写回浏览器，再动 systemd（v0.3.5 F4）。
+WEB_RESTART_DELAY = 1.0
 
 #: 配置预览的存活时间：超过后必须重新预览（防"看着旧 diff 点应用"）。
 PREVIEW_TTL = 600.0
@@ -277,6 +289,8 @@ def _route(
             return 200, proxies_payload(ctx)
         if path.startswith("/api/proxies/"):
             return 200, proxy_detail_payload(ctx, unquote(path[len("/api/proxies/"):]))
+        if path == "/api/users":
+            return 200, users_payload(ctx)
         if path == "/api/services":
             return 200, services_payload(ctx)
         if path == "/api/versions":
@@ -293,7 +307,7 @@ def _route(
         if path == "/api/doctor":
             return 200, doctor_payload(ctx)
         if path == "/api/audit":
-            return 200, audit_payload(ctx, query.get("scope", "plugin"), query.get("since", ""))
+            return 200, audit_payload(ctx, query)
         if path == "/api/config":
             return 200, config_payload(ctx)
         if path == "/api/config/history":
@@ -322,6 +336,36 @@ def _route(
 # ---------------------------------------------------------------------------
 # 只读
 # ---------------------------------------------------------------------------
+
+
+def login_info_payload(ctx: WebContext, *, non_loopback: bool = False) -> dict:
+    """登录页展示用的**非敏感**静态信息（v0.3.5，**免认证**）。
+
+    ⚠️ 这是全站唯一新增的免认证读端点（`POST /api/login` 与登录页之外），
+    因此边界写死：
+
+    - 只暴露实例名、frpsctl 版本、frps 版本门槛、管理台是否绑非回环；
+    - **绝不**含路径、配置、状态、pid、口令、token、审计（响应键集合由
+      `tests/test_web.py` 锁死，并断言不含敏感词）；
+    - 不写审计、不参与登录限速（它不含凭据，也不产生可爆破的判定）；
+      `Cache-Control: no-store`。
+
+    版本号本身不构成新泄露（可从 PyPI 与仓库公开推知）；它的价值是让登录页
+    在多实例/反代部署里说清"你在登录哪一台、对面是什么版本"。
+    """
+    from .. import __version__
+    from ..core.version import MINIMUM_VERSION, RECKONED_VERSION
+
+    def _render(version: tuple[int, int, int]) -> str:
+        return ".".join(str(part) for part in version)
+
+    return {
+        "instance": ctx.inst.name,
+        "frpsctl": __version__,
+        "frps_minimum": _render(MINIMUM_VERSION),
+        "frps_reckoned": _render(RECKONED_VERSION),
+        "non_loopback": bool(non_loopback),
+    }
 
 
 def _admin(ctx: WebContext) -> AdminClient:
@@ -479,9 +523,73 @@ def doctor_payload(ctx: WebContext) -> dict:
     return report_mod.doctor_payload(doc.run_doctor(ctx.inst))
 
 
-def _web_audit_payload(ctx: WebContext, window: float | None = None) -> dict:
-    """Web 操作审计视图（0.3.0；v0.3.4 支持 `since` 时间窗）。路径 + 统计 + 尾部记录。"""
+#: 导出一次最多包含的记录数（独立于分页上限；截断通过响应头声明，见 audit_export）。
+MAX_EXPORT_ROWS = 10000
+
+#: 各 scope 允许的过滤字段（只接受真实存在的字段，防无聊参数悄悄不生效）。
+_AUDIT_FILTER_KEYS = {
+    "web": ("action", "result", "source"),
+    "plugin": ("op", "decision", "user", "source"),
+}
+
+
+def _audit_scope(params: dict[str, str]) -> str:
+    scope = params.get("scope", "plugin")
+    if scope not in _AUDIT_FILTER_KEYS:
+        raise UsageError(f"未知的审计范围：{scope!r}", hint="可用：plugin / web")
+    return scope
+
+
+def _audit_filters(scope: str, params: dict[str, str]) -> dict[str, str]:
+    """按 scope 收集过滤条件（空值忽略；未知字段直接忽略而不是报错）。"""
+    return {key: params[key] for key in _AUDIT_FILTER_KEYS[scope] if params.get(key)}
+
+
+def _parse_window(params: dict[str, str]) -> tuple[float | None, float | None]:
+    """解析 `since` / `until`（与 CLI `--since` 同一解析器 `auditlog.parse_since`）。
+
+    `until` 建议给 ISO 时间或 unix 时间戳；相对写法（`24h`）的含义是
+    "现在往前 24 小时"，用作上界时等价于"只看到 24 小时前"。非法值 400（不猜测）。
+    """
+    since_raw = params.get("since", "")
+    until_raw = params.get("until", "")
+    since = auditlog.parse_since(since_raw) if since_raw else None
+    until = auditlog.parse_since(until_raw) if until_raw else None
+    return since, until
+
+
+def _audit_paging(params: dict[str, str]) -> tuple[int, int]:
+    """分页参数（缺失用默认；给出但越界/非整数 → 400，不静默回退）。"""
+    limit_raw = params.get("limit")
+    offset_raw = params.get("offset")
+    limit = (
+        _bounded_int(limit_raw, AUDIT_TAIL_LINES, minimum=1, maximum=auditlog.MAX_QUERY_LIMIT)
+        if limit_raw
+        else AUDIT_TAIL_LINES
+    )
+    offset = _bounded_int(offset_raw, 0, minimum=0, maximum=10_000_000) if offset_raw else 0
+    return limit, offset
+
+
+def _web_audit_payload(
+    ctx: WebContext,
+    since: float | None = None,
+    until: float | None = None,
+    *,
+    filters: dict[str, str] | None = None,
+    limit: int = AUDIT_TAIL_LINES,
+    offset: int = 0,
+) -> dict:
+    """Web 操作审计视图（0.3.0；v0.3.4 时间窗；v0.3.5 过滤 + 分页）。"""
     path = web_audit.resolve_path(ctx.inst)
+    page = {
+        "matched": 0,
+        "has_more": False,
+        "offset": offset,
+        "limit": limit,
+        "truncated": False,
+        "filters": dict(filters or {}),
+    }
     if not path.exists():
         return {
             "scope": "web",
@@ -491,9 +599,15 @@ def _web_audit_payload(ctx: WebContext, window: float | None = None) -> dict:
             "stats": None,
             "tail": [],
             "bad_lines": 0,
+            "page": page,
         }
-    summary = web_audit.summarize(path, since=window)
-    tail = auditlog.read_tail(path, AUDIT_TAIL_LINES)
+    summary = web_audit.summarize(path, since=since, until=until)
+    result = web_audit.query(
+        ctx.inst, since=since, until=until, filters=filters, limit=limit, offset=offset
+    )
+    page.update(
+        {"matched": result.matched, "has_more": result.has_more, "truncated": result.truncated}
+    )
     return {
         "scope": "web",
         "path": str(path),
@@ -504,35 +618,45 @@ def _web_audit_payload(ctx: WebContext, window: float | None = None) -> dict:
             "ok": summary.ok,
             "error": summary.error,
             # 全量扫描的坏行（与 CLI `web audit stats` 同口径；顶层 bad_lines
-            # 是尾部 50 行的口径，v0.3.0 review 消除两个同名不同义的字段）
+            # 是扫描窗口的口径，v0.3.0 review 消除两个同名不同义的字段）
             "bad_lines": summary.bad_lines,
             "first_at": summary.first_at,
             "last_at": summary.last_at,
             "by_action": summary.by_action,
             "by_source": summary.by_source,
         },
-        "tail": tail.records,
-        "bad_lines": tail.bad_lines,
+        "tail": result.records,
+        "bad_lines": result.bad_lines,
+        "page": page,
     }
 
 
-def audit_payload(ctx: WebContext, scope: str = "plugin", since_raw: str = "") -> dict:
-    """审计视图：`scope=plugin`（默认，兼容）或 `scope=web`（操作审计）。
+def audit_payload(ctx: WebContext, params: dict[str, str] | None = None) -> dict:
+    """审计视图：`scope=plugin`（默认）或 `scope=web`。
 
-    `since`（v0.3.4）：`24h / 7d / 30m`、ISO 时间或 unix 时间戳——与 CLI
-    `--since` 同一解析器（`auditlog.parse_since`）；非法值 400（不猜测）。
+    支持（v0.3.5）：
+
+    - `since` / `until`：`24h / 7d / 30m`、ISO 或 unix（与 CLI 同一解析器；
+      非法 400）。`until` 为"自定义起止"的上界，统计与记录列表同口径；
+    - 过滤：web 用 `action/result/source`，plugin 用 `op/decision/user/source`
+      （大小写不敏感子串匹配）；`stats` 仍按时间窗全量统计，**不随过滤变化**，
+      响应里的 `page.filters` 如实回显生效条件；
+    - 分页：`limit`（≤1000）+ `offset`（从新往旧偏移），响应在 `page` 里给出
+      `matched / has_more / truncated`。
 
     策略文件缺失/不合法时也返回 200（`available=false` + reason）——审计视图
-    的职责是"展示现状"，不是替 `plugin check` 做严格校验；一条 400 只会让页面
-    失去"为什么看不到审计"的解释。非法 scope 同样是 400（不猜测调用意图）。
+    的职责是"展示现状"，不是替 `plugin check` 做严格校验；非法 scope 400。
     """
-    window: float | None = None
-    if since_raw:
-        window = auditlog.parse_since(since_raw)
+    params = params or {}
+    scope = _audit_scope(params)
+    since, until = _parse_window(params)
+    filters = _audit_filters(scope, params)
+    limit, offset = _audit_paging(params)
     if scope == "web":
-        return _web_audit_payload(ctx, window)
-    if scope != "plugin":
-        raise UsageError(f"未知的审计范围：{scope!r}", hint="可用：plugin / web")
+        return _web_audit_payload(
+            ctx, since, until, filters=filters, limit=limit, offset=offset
+        )
+
     view = auditlog.load_view(ctx.inst)
     payload: dict[str, Any] = {
         "scope": "plugin",
@@ -544,14 +668,87 @@ def audit_payload(ctx: WebContext, scope: str = "plugin", since_raw: str = "") -
         "stats": None,
         "tail": [],
         "bad_lines": 0,
+        "page": {
+            "matched": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit,
+            "truncated": False,
+            "filters": dict(filters),
+        },
     }
     if view.available and view.enabled and view.path is not None:
-        summary = auditlog.summarize(view.path, since=window)
-        tail = auditlog.read_tail(view.path, AUDIT_TAIL_LINES)
+        summary = auditlog.summarize(view.path, since=since, until=until)
+        result = auditlog.query(
+            view.path, since=since, until=until, filters=filters, limit=limit, offset=offset
+        )
         payload["stats"] = report_mod.audit_summary_payload(summary)
-        payload["tail"] = tail.records
-        payload["bad_lines"] = tail.bad_lines
+        payload["tail"] = result.records
+        payload["bad_lines"] = result.bad_lines
+        payload["page"].update(
+            {"matched": result.matched, "has_more": result.has_more, "truncated": result.truncated}
+        )
     return payload
+
+
+def audit_export(
+    ctx: WebContext, params: dict[str, str] | None = None
+) -> tuple[str, str, dict[str, str]]:
+    """审计导出（v0.3.5）：返回 `(文本, 建议文件名, 附加响应头)`。
+
+    - `format`：`jsonl`（默认）或 `csv`（非法 400——不猜）；
+    - 过滤/时间窗与视图同一套参数（`scope`/`since`/`until`/`action`…）；
+    - 上限 `MAX_EXPORT_ROWS`（**独立于分页上限**：`query(max_limit=…)`）。此前
+      导出被 `MAX_QUERY_LIMIT=1000` 静默钳死却对外声称 10000——v0.3.5 review
+      抓到的真实缺陷；
+    - 截断**不写进正文**（那会破坏 JSONL/CSV 的严格可解析性），改由响应头
+      `X-Export-Truncated` / `X-Export-Records` / `X-Export-Limit` 声明；
+    - 插件审计不可用时**报错**（而不是导出一个空文件让人困惑）。
+    """
+    params = params or {}
+    scope = _audit_scope(params)
+    fmt = (params.get("format") or "jsonl").lower()
+    if fmt not in ("jsonl", "csv"):
+        raise UsageError(f"未知的导出格式：{fmt!r}", hint="可用：jsonl / csv")
+    since, until = _parse_window(params)
+    filters = _audit_filters(scope, params)
+
+    if scope == "web":
+        path = web_audit.resolve_path(ctx.inst)
+        result = web_audit.query(
+            ctx.inst,
+            since=since,
+            until=until,
+            filters=filters,
+            limit=MAX_EXPORT_ROWS,
+            max_limit=MAX_EXPORT_ROWS,
+        )
+    else:
+        view = auditlog.load_view(ctx.inst)
+        if not (view.available and view.enabled and view.path is not None):
+            raise ConfigError(
+                f"插件审计不可用：{view.reason}",
+                hint="先运行 `frpsctl plugin init` 生成策略并启用审计",
+            )
+        path = view.path
+        result = auditlog.query(
+            path,
+            since=since,
+            until=until,
+            filters=filters,
+            limit=MAX_EXPORT_ROWS,
+            max_limit=MAX_EXPORT_ROWS,
+        )
+
+    records = result.records
+    text = auditlog.to_csv(records) if fmt == "csv" else auditlog.to_jsonl(records)
+    headers = {
+        "X-Export-Records": str(len(records)),
+        "X-Export-Limit": str(MAX_EXPORT_ROWS),
+        "X-Export-Truncated": "true" if (result.has_more or result.truncated) else "false",
+    }
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return text, f"frpsctl-audit-{scope}-{stamp}.{fmt}", headers
 
 
 def _plain(value: Any) -> Any:
@@ -685,7 +882,7 @@ def action_payload(
     # 立刻看到新状态，而不是等 TTL 过期。
     ctx.cache.invalidate()
     try:
-        payload = _perform_action(ctx, action, body)
+        payload = _perform_action(ctx, action, body, request_info=request_info)
     except Exception as exc:
         _audit(
             ctx,
@@ -710,20 +907,42 @@ def _audit_params(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _perform_action(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
+def _perform_action(
+    ctx: WebContext,
+    action: str,
+    body: dict[str, Any],
+    *,
+    request_info: RequestInfo | None = None,
+) -> dict:
     lc = ctx.lifecycle()
-    health_timeout = _bounded_float(body.get("health_timeout"), 10.0)
 
     if action in ("plugin-start", "plugin-stop", "plugin-restart"):
         return _plugin_service_action(ctx, action)
+    if action == "web-restart":
+        return _web_restart_action(ctx)
+    if action == "sessions-revoke":
+        # 会话管理（v0.3.5 F2）：默认保留**当前**会话（否则点完按钮自己也被踢）。
+        # 回显指纹由 server 层从会话对象算出（token 不出认证层）。
+        # `keep_current` 严格校验布尔：字符串 "false" 是真值、数字 0 会把当前会话
+        # 也踢掉——破坏性动作不接受"看起来像布尔"的值（与 `_bounded_*` 同纪律）。
+        raw_keep = body.get("keep_current", True)
+        if not isinstance(raw_keep, bool):
+            raise UsageError(
+                f"keep_current 必须是布尔值：{raw_keep!r}",
+                hint='例如 {"keep_current": true}（默认保留当前会话）',
+            )
+        keep = request_info.session_id or None if (raw_keep and request_info is not None) else None
+        return {"revoked": ctx.auth.revoke_all(keep_fingerprint=keep), "kept_current": bool(keep)}
+    # `health_timeout` 只在真正使用它的动作里解析：无关动作不该因为带了它而被 400
+    # （v0.3.5 review：此前一律在入口解析，`sessions-revoke` 带 {"health_timeout": true} 也会失败）。
     if action == "start":
-        report = lc.start(health_timeout=health_timeout)
+        report = lc.start(health_timeout=_bounded_float(body.get("health_timeout"), 10.0))
         return report_mod.start_payload(report)
     if action == "stop":
         lc.stop(timeout=_bounded_float(body.get("timeout"), 10.0))
         return {"stopped": True}
     if action == "restart":
-        report = lc.restart(health_timeout=health_timeout)
+        report = lc.restart(health_timeout=_bounded_float(body.get("health_timeout"), 10.0))
         return report_mod.start_payload(report)
     if action == "prune":
         # frp 没有强制下线在线代理的 API（DELETE /api/proxies 实为清理离线
@@ -739,7 +958,7 @@ def _perform_action(ctx: WebContext, action: str, body: dict[str, Any]) -> dict:
             steps=_bounded_int(body.get("steps"), 1),
             lifecycle=lc,
             restart=True,
-            health_timeout=health_timeout,
+            health_timeout=_bounded_float(body.get("health_timeout"), 10.0),
         )
         return {
             "target": str(outcome.after),
@@ -1021,6 +1240,102 @@ def services_payload(ctx: WebContext) -> dict:
     return {"instance": inst.name, "services": services}
 
 
+#: 自重启的**进程级幂等**标记：连点不会排程多个延迟线程。
+_web_restart_lock = threading.Lock()
+_web_restart_scheduled = False
+
+
+def _web_restart_action(ctx: WebContext) -> dict:
+    """重启 Web 管理台自身（v0.3.5 F4，**仅 systemd 托管**）。
+
+    为什么"先应答后动作"：systemd 模式下本进程就是 unit 的 `MainPID`，同步
+    `systemctl restart` 会在响应写回之前把自己杀掉——浏览器只看到连接断开，
+    无从知道操作是否生效。因此把动作交给**延迟的守护线程**并立即返回
+    `scheduled`；前端据此进入"等待恢复"轮询。
+
+    direct 后台模式明确拒绝：没有任何机制能在进程自杀后重新拉起自己
+    （那正是 systemd 的职责），给出 CLI 指引而不是制造一个"点了没反应"的按钮。
+    """
+    from ..core.systemd import WebService
+
+    inst = ctx.inst
+    service = WebService(inst)
+    # 先判"是否 systemd 托管"（不需要 root）：direct 部署（非 root，最常见）应当
+    # 得到 direct 专用指引，而不是被 root 检查抢先报一句与它无关的话。
+    if not service.unit_exists():
+        raise UsageError(
+            "Web 管理台不是 systemd 托管，无法在页面内自重启",
+            hint="direct 后台请用 CLI：`frpsctl web restart`；systemd 部署先 `frpsctl web service install`",
+        )
+    # 再确认"本进程**有能力**执行 systemctl restart"：`WebService.restart()`
+    # 内部第一句就是 `_require_root`，而 Web unit 以非特权用户运行（模板写死
+    # `User={user}`）。不提前检查的话，延迟线程里的 `PermissionRequired` 会被
+    # 静默吞掉——接口返回成功、审计记成功、unit 从未重启（v0.3.5 review 的真实
+    # 缺陷）。非 root 一律拒绝并给 CLI 指引。
+    if os.geteuid() != 0:
+        raise UsageError(
+            "当前 Web 进程不是 root，无法重启 systemd unit",
+            hint=f"请用 CLI：`sudo frpsctl web service restart`（unit {service.unit_name}）",
+        )
+    try:
+        active = service.is_active()
+    except FrpsctlError as exc:
+        raise UsageError(
+            f"无法确认 systemd 状态：{exc.message}",
+            hint=f"在服务器上执行 `frpsctl web service status`（unit {service.unit_name}）",
+        ) from None
+    if not active:
+        raise UsageError(
+            "Web 管理台的 systemd unit 存在但未 active——请在 CLI 处理",
+            hint=f"`frpsctl web service status` 查看 {service.unit_name}",
+        )
+    global _web_restart_scheduled
+    with _web_restart_lock:
+        if _web_restart_scheduled:
+            raise UsageError(
+                "重启已排程（重复请求被忽略）",
+                hint="管理台正在重启，请等待页面自动恢复",
+            )
+        _web_restart_scheduled = True
+    timer = threading.Timer(WEB_RESTART_DELAY, _restart_web_service, args=(inst,))
+    timer.daemon = True
+    timer.start()
+    return {"scheduled": True, "unit": service.unit_name, "delay_seconds": WEB_RESTART_DELAY}
+
+
+def _restart_web_service(inst) -> None:  # noqa: ANN001 - Instance（避免顶层 import 循环）
+    """延迟线程里的实际重启。
+
+    ⚠️ 失败**必须可见**：进程还活着说明重启没发生，此时把失败写进审计与 stderr
+    （成功时进程会被重启带走，那正是期望结果）。此前 `suppress(Exception)` 把
+    非 root 的 `PermissionRequired` 完全吞掉、审计还记着成功——v0.3.5 review
+    的真实缺陷；现在前置检查（`os.geteuid()`）已挡住主要来源，这里是第二道。
+    """
+    import sys
+
+    from ..core.systemd import WebService
+
+    global _web_restart_scheduled
+    try:
+        WebService(inst).restart()
+    except Exception as exc:  # noqa: BLE001 - 记录而非吞掉
+        # 失败必须**复位幂等标志**：否则之后每次 web-restart 都被"已排程"挡住，
+        # 而进程还活着（重启没发生），用户只能上服务器用 CLI（v0.3.5 复审发现的
+        # 修复副作用）。成功路径不需要复位——进程会被 systemd 带走。
+        with _web_restart_lock:
+            _web_restart_scheduled = False
+        with contextlib.suppress(Exception):
+            web_audit.record(
+                inst,
+                action="web-restart",
+                result=f"error:{type(exc).__name__}",
+                params={"stage": "delayed"},
+            )
+        with contextlib.suppress(OSError):
+            sys.stderr.write(f"[web] ⚠ 延迟重启失败（{type(exc).__name__}）：{exc}\n")
+            sys.stderr.flush()
+
+
 def _plugin_direct_start(ctx: WebContext, fallback_args: dict | None = None) -> dict:
     """direct 模式启动插件（参数来源与 CLI `plugin start` 同一套规则）。"""
     from ..core.auditlog import resolve_policy_path
@@ -1109,6 +1424,49 @@ def _plugin_service_action(ctx: WebContext, action: str) -> dict:
     with contextlib.suppress(FrpsctlError):
         serve_runtime.stop_background(inst, spec)
     return _plugin_direct_start(ctx, fallback_args=dict(last.args) if last is not None else None)
+
+
+def users_payload(ctx: WebContext) -> dict:
+    """按用户聚合（v0.3.5 F3）：客户端数 / 代理数。
+
+    数据源 `GET /api/v2/users`（真机字段 `user` / `clientCount` / `proxyCount`，
+    契约层 C11 锁定）。单页拉取（200）；达到上限时 `truncated=True` 如实汇报，
+    不假装取全。
+    """
+    limit = 200
+    admin = _admin(ctx)
+    with admin:
+        page = admin.users(page_size=limit)
+    return {
+        "users": [asdict(item) for item in page.items],
+        "total": page.total,
+        "limit": limit,
+        "truncated": page.truncated,
+        "total_known": page.total_known,
+    }
+
+
+def sessions_payload(ctx: WebContext, current_fingerprint: str = "") -> dict:
+    """活跃会话列表（v0.3.5 F2）：**脱敏**——只有指纹/来源/创建/到期，绝无 token。
+
+    `current` 标记当前请求所属的会话（前端据此区分"当前"与"其他"），判定用
+    指纹比较（与审计里的 `session_id` 同一算法）。
+    """
+    items = ctx.auth.snapshot()
+    return {
+        "ttl": ctx.auth.session_ttl,
+        "count": len(items),
+        "sessions": [
+            {
+                "id": item.fingerprint,
+                "source": item.source,
+                "created_at": item.created_at,
+                "expires_in": item.expires_in,
+                "current": bool(current_fingerprint) and item.fingerprint == current_fingerprint,
+            }
+            for item in items
+        ],
+    }
 
 
 def versions_payload(ctx: WebContext) -> dict:
