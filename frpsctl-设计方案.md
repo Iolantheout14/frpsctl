@@ -3846,6 +3846,16 @@ doctor/serve_runtime/serve_guard）、Web 层（server/api/tasks）、CLI 层
 **最后一轮最终验收：全量 940 passed / 0 skipped（非契约 910），覆盖率 85.89%；
 `node --test` 26/26。**
 
+**发布后补充修复（main CI 前端步骤，2026-09-21）**：发布后 CI 红——新增的
+前端模块步骤踩两处 Node 语义：① `find … | xargs … node --input-type=module
+--check <文件>` 报 `ERR_INPUT_TYPE_NOT_ALLOWED`（`--input-type` 只能配
+stdin/eval；本地验证用的是 stdin 形式，CI 写成 xargs 形式未本地复刻——流程
+教训）；② Node 20 对纯 `.js` 按 CJS 解析，`node --test` 里
+`import … from ".../lib/format.js"` 在缺 `package.json` 时失败。修复：CI 改
+逐文件 stdin 形式 + 补 `web/static/js/package.json {"type":"module"}` +
+setup-node 升到 22；守卫新增"js 目录必须声明 ESM"断言。已发布产物不受影响
+（静态路由拒绝 `.json`，浏览器不请求它）。
+
 ### 27.6 未做与边界（明确记账）
 
 | 项 | 结论 |

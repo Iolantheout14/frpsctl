@@ -112,6 +112,15 @@ policy 路径的跨 CWD 解析、结构化编辑器草稿清除基准），并�
 （干净 venv 安装 wheel：26/26 前端模块与全部新 API 可用）。最终全量
 940 passed / 覆盖率 85.89% / `node --test` 26。
 
+- **发布后 CI 修复（前端模块步骤，2026-09-21）**：新增的
+  `find … | xargs node --input-type=module --check` 在 Node 20 下报
+  `ERR_INPUT_TYPE_NOT_ALLOWED`（`--input-type` 只能配 stdin/eval，不能带文件
+  参数）——改为逐文件 stdin 形式（与守卫实现一致）；并补
+  `web/static/js/package.json`（`{"type":"module"}`，让 Node 把该目录 `.js`
+  按 ESM 解析——`node --test` 的 import 依赖它），CI 的 setup-node 升到 22。
+  守卫新增"js 目录必须声明 ESM"断言防回退。**不影响已发布产物**：浏览器
+  不请求该 json，静态路由也拒绝 `.json`（白名单外）。
+
 ### 测试
 
 - Python 新增 71 条（全量 869 → 940；非契约 839 → 910）：增量日志 8、锁三态 2、
