@@ -1524,6 +1524,7 @@ WantedBy=multi-user.target
 | C8 | 在 `user = "admin"` + 口令为空时，无凭据请求得 **401**，而 `admin:`+空口令得 **200**；只设 `password` 时须用 `:secret` 才能进 | §3.3 的实测边界。它守的是 `check_dangerous_combination()` **只拒绝两者全空**这个判据分工：若哪天 frp 改成"口令非空才启用鉴权"，"有 user + 空口令"会**静默退化成完全不鉴权**，而校验仍会放行——安全缺口就此产生 |
 | C9 | `DELETE /api/proxies` 只接受 `?status=offline`（无参数返回 400），语义是 `ClearOfflineProxies()`——frp **没有**强制下线在线代理的 API | §18.6 的实现期发现。它守住"`prune` 不做 kick"这条纠正：旧 `kick` 命令基于对该端点的误读，从未工作过 |
 | C10 | `GET /api/v2/proxies/{name}/traffic` 对离线/不存在的代理返回 **404（无数据）**，而非错误 | §18.9 新增。CLI `traffic` 与 Web 趋势图都依赖"一个离线代理不拖垮整体" |
+| C11 | `GET /api/v2/users` 是 v2 分页信封（`total/page/pageSize/items`），条目字段为 `user` / `clientCount` / `proxyCount`（**单数**） | v0.3.5 新增。Web「按用户」卡片完全建立在这两个字段名上——写错不会报错，只会永远显示 0（与 `proxyTypeCount` 同一种静默失败） |
 
 C7 是"问题 2 的长期解药"：版本矩阵一旦被 frp 改动，CI 先于用户发现，而不是等某个用户拿着 0.60 报告"启动失败但配置明明合法"。
 
@@ -2511,8 +2512,9 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/login` `/api/logout` | 口令登录（下发会话 Cookie + CSRF）/ 登出；**login 是唯一免认证入口** |
+| POST | `/api/login` `/api/logout` | 口令登录（下发会话 Cookie + CSRF）/ 登出；**免认证入口只有 `POST /api/login` 与 `GET /api/login-info`**（后者只读非敏感静态信息，v0.3.5） |
 | GET | `/api/session` | 会话状态：归还 CSRF（刷新页面后内存丢失 → 用它恢复，否则所有变更都 403） |
+| GET | `/api/login-info` | 登录页展示用的**非敏感静态信息**：实例名 / frpsctl 版本 / frps 门槛 / 是否非回环绑定；**免认证**（登录前就要显示）、`no-store`、不写审计、不参与限速；**绝不**含路径/配置/状态/pid/口令/token——响应键集合由测试锁死（v0.3.5） |
 | GET | `/api/status` | 进程状态 + 三层健康（含 L3 告警文本）+ dashboard 统计（统计不可得为 null） |
 | GET | `/api/clients` `/api/proxies` | v2 数据（自动翻页；响应带 `total`，列表被翻页上限截断时 `truncated` 如实汇报） |
 | GET | `/api/traffic` | 全部代理的**逐日汇总**（服务端聚合 + 并发查询 + 30s 缓存；超 50 个代理时带 `truncated` / `total`） |
@@ -2525,10 +2527,14 @@ frpsctl web serve（独立进程，默认只绑 127.0.0.1）
 | GET | `/api/logs?lines=` | 日志尾部（≤2000 行，路径解析复用 `core/logs`）；**`since`（v0.3.4）**：增量模式——只返回 offset 之后的新增完整行（不缓存；轮转/截断返回 `reset=true` 要求整段替换） |
 | GET | `/favicon.ico` | 204（页面内嵌 data URI 图标；这条是给旧工具收尾的） |
 | GET | `/metrics` | Prometheus 文本（v0.3.0；`--metrics` 开启后才存在）：实例状态 / 三层健康 / dashboard 统计；Basic auth（口令 = 管理台口令），5 秒服务端缓存 |
-| GET | `/api/audit?scope=web` | Web 操作审计（v0.3.0）：登录与变更动作的来源 / 会话指纹 / 结果；`scope` 缺省为 `plugin`（兼容），非法值 400；**`since`（v0.3.4）**：`24h/7d/30m`/ISO/unix 时间窗（与 CLI 同一解析器），两个 scope 都支持 |
+| GET | `/api/audit?scope=web` | Web 操作审计（v0.3.0）：登录与变更动作的来源 / 会话指纹 / 结果；`scope` 缺省为 `plugin`（兼容），非法值 400；**`since`（v0.3.4）**：`24h/7d/30m`/ISO/unix 时间窗（与 CLI 同一解析器），两个 scope 都支持；**过滤 + 分页（v0.3.5）**：web 用 `action/result/source`、plugin 用 `op/decision/user/source`（大小写不敏感子串），`limit`（≤1000）+ `offset` 从新往旧翻页，`since`/`until` 支持自定义起止（与 CLI 同一解析器），响应 `page` 给出 `matched/has_more/truncated/filters`（`stats` 是时间窗内全量，不随**过滤**变化，但随 `since`/`until` 变化） |
+| GET | `/api/users` | 按用户聚合（v0.3.5 F3）：`user` / `clientCount` / `proxyCount`（真机字段名，契约层 C11 锁定；达单页上限时 `truncated` 如实汇报） |
+| GET | `/api/sessions` | 活跃会话列表（v0.3.5 F2）：**脱敏**——指纹 / 来源 / 创建时间 / 剩余有效期，**绝不含 token**；`current` 标记当前会话 |
+| GET | `/api/audit/export` | 审计导出（v0.3.5）：文本附件，`format=jsonl`（默认）/`csv`（非法 400），过滤与 `since`/`until` 与视图同一套参数；上限 `MAX_EXPORT_ROWS`（**独立于分页上限**，`query(max_limit=…)`）；截断由响应头 `X-Export-Truncated` / `X-Export-Records` / `X-Export-Limit` 声明，**正文保持严格可解析**（JSONL 可整文件喂 jq）；插件审计不可用时 400 而不是导出空文件 |
 | POST | `/api/config/preview` | 多键变更（`changes`）+ 删除键（`unsets`）→ 锁内取快照 + 打码 diff，登记 `preview_id`（TTL 10 分钟） |
 | POST | `/api/config/apply` | 按 `preview_id` 应用（含删除）；**CAS**：预览后文件被改 → 400 拒绝而不是覆盖 |
 | POST | `/api/actions/{start,stop,restart,rollback,prune}` | 与 CLI 同一套 core 入口（数值参数做范围校验，越界/布尔一律 400） |
+| POST | `/api/actions/{web-restart,sessions-revoke}` | Web 管理台自重启（v0.3.5 F4：**仅 systemd**，先应答后延迟 1s 执行；direct 拒绝并给 CLI 指引）与会话登出（v0.3.5 F2：`keep_current` 默认 true，登出除当前外全部会话） |
 | POST | `/api/actions/{plugin-start,plugin-stop,plugin-restart}` | 插件服务启停（v0.3.4）：systemd unit 存在走 systemctl、否则 direct；两方向都经 `core.serve_guard` 互斥守卫 |
 | GET | `/api/services` | 三个服务的托管状态（frps / Web 管理台 / 服务端插件；systemd 优先、direct 次之，探测失败如实降级）（v0.3.4） |
 | GET | `/api/versions` | 版本信息：frpsctl / 运行中 / 磁盘版本与一致性、最低与建议版本、升级提示（v0.3.4） |
@@ -2556,6 +2562,7 @@ frp 的教训（user/password 双空 = 完全不鉴权，§3.3）是本项目全
 | CSRF | 一切变更请求要求 `X-CSRF-Token`（登录下发，仅存浏览器内存） |
 | 口令爆破 | 来源级失败限速（60s/5 次）；冷却与错口令**响应完全一致** |
 | 反代部署下的爆破误伤 | `--trusted-proxy`（默认**关**）：开启后按 `X-Forwarded-For` **最后一跳**限速；不开启时该头完全不被读取——伪造它既不能绕开限速、也不能制造新来源 |
+| 免认证面扩大 | 免认证入口只有 `POST /api/login` 与 `GET /api/login-info`（v0.3.5）。后者只返回实例名、frpsctl 版本、frps 门槛与"是否非回环"——版本号可从 PyPI/仓库公开推知，不构成新泄露；**响应键集合由测试锁死并断言不含敏感词**（`path`/`password`/`token`/`secret`） |
 | 时序侧信道 | `hmac.compare_digest` |
 | 内存放大（失败来源 / 会话表） | 两张输入驱动的表都**有上限**：失败来源 1024（驱逐最早失败者）、会话 32（驱逐最早到期者） |
 | 配置泄露 | 界面/API 只出打码值；欲看明文用 CLI `--reveal` |
@@ -3867,3 +3874,170 @@ setup-node 升到 22；守卫新增"js 目录必须声明 ESM"断言。已发布
 | 截图/视觉回归测试 | 不变：不引浏览器测试框架；DOM 分支人工点验（结构与纪律守卫做厚） |
 | 前端 DOM 级测试框架 | 不变（边界不变，纯逻辑已由 node --test 覆盖） |
 | 浏览器双主题/键盘/抽屉的人工点验 | 记账：结构、纪律、纯逻辑全部自动化；视觉与交互手感仍人工 |
+
+---
+
+## 28. 第十五轮：Web 管理台体验补齐与命令面单一来源（v0.3.5）
+
+### 28.1 核心决策一：命令面必须有单一来源（R1–R3、M2）
+
+**背景**：命令面此前只以**测试**的形态存在（`tests/snapshots/cli_commands.json` 由
+Typer 反射生成）。Web 无法展示 CLI 命令，而界面与提示文案里的命令引用是**硬编码
+字面量**（`index.html` 的 `doctor`、`api.py` 的 `frpsctl plugin init`）——CLI 改名或
+删除后，界面会给出**不存在的命令**，而所有测试都是绿的。
+
+**决策**：
+
+| 项 | 落地 |
+|----|------|
+| 反射提炼为生产代码 | `cli/introspect.py`：`build_snapshot()`（快照用，**输出形状逐字节不变**，基线文件未动）与 `command_surface()`（界面用，带 help/默认值文本/位置参数标记） |
+| 分类元数据 + 双向覆盖 | `COMMAND_META`（只读 / 变更 / 需 root / 需 systemd / Web 对应视图）；漏一条或多一条都抛 `CommandMetaMissing`（有测试反向验证"漏一条即失败"真的生效） |
+| 生成物 | `web/static/js/data/commands.js`（ESM 数据模块）。**Web 不 import cli**——分层约束不破，浏览器零请求直读，`node --check`/import 图/孤儿守卫自动覆盖 |
+| 无漂移守卫 | 本地测试 + CI 步骤 `python -m frpsctl.cli.introspect --check`（重新生成后必须无 diff） |
+| 界面 | 「命令」视图（63 条、搜索、参数表、徽章、一键复制、跳转）、`Ctrl+K` 纳入 CLI 命令、`g k` 快捷键 |
+| 文案守卫 | 扫描 `src/**/*.py` 与前端资源的 `frpsctl <cmd>` 引用并对照命令面（前边界排除 `/opt/frpsctl`、`frpsctl-web@` 这类非命令出现） |
+| 补全对齐 | `--install-completion` 由 Typer 从**同一个 app** 反射，天然覆盖全部命令；新增断言"补全数据源与命令面集合一致"锁定这一点 |
+
+**顺带修掉的两处"文案冒充命令"**：unit 的 `Description` 里曾写着 `server plugin` /
+`web console`（像命令却不是任何真实命令）——已改为真实命令名
+（`frpsctl plugin serve (%i)` / `frpsctl web serve (%i)`）；
+补全示例里的 `frpsctl conf<TAB>` 改为 `frpsctl config<TAB>`。
+
+### 28.2 核心决策二：登录页 2.0（M1）
+
+- **视觉**：切角头部横幅（`clip-path: var(--clip-cut)` + `--hero-grad`）+ 渐变文字标题
+  （`background-clip: text`）+ 复用主界面品牌区同一条 `brand-glitch` 动画 + HUD 扫描线
+  + 双主题同款令牌 + 失败抖动（`prefers-reduced-motion` 停）+ 窄屏 `min(380px, 100%)`。
+- **功能**：`role="alert"`、口令可见性切换（`aria-pressed`）、CapsLock 提示、
+  会话过期原因提示（**首次启动完成前不误报**）。
+- **修真实缺陷**：`doLogin` 此前没有提交互斥——连点/狂按回车会并发提交，而失败
+  限速是 **5 次/60 秒**，等于**用户消耗自己的失败配额把自己锁死**。现在按钮在
+  提交期间禁用。
+- **免认证 `GET /api/login-info`**：只含实例名 / frpsctl 版本 / frps 门槛 /
+  是否非回环。边界写死：键集合由测试锁死、断言不含敏感词、不写审计、不参与限速、
+  `no-store`。这是全站第二个免认证入口（第一个是 `POST /api/login`），已在 §18.3 记账。
+
+### 28.3 核心决策三：审计可查询（R4、F1）
+
+- **core**：`auditlog.query()` —— 跨轮转、时间窗（`since`/`until`）、字段过滤
+  （调用方给键，web 用 `action/result/source`、plugin 用 `op/decision/user/source`）、
+  `offset`/`limit` 分页（从新往旧偏移、页内时间升序）、坏行计数、匹配数上限
+  `MAX_QUERY_MATCHES=20000`（超出标 `truncated`）。另有 `to_jsonl()` / `to_csv()`
+  （CSV 带**公式注入防护**：`=`/`+`/`-`/`@` 开头的单元格前置 `'`）。
+- **review 修复**：导出上限此前被 `MAX_QUERY_LIMIT=1000` 静默钳死却声称 10000（且 `#` 注释污染 JSONL）——改为 `query(max_limit=…)` 独立上限 + 响应头声明；`del matched[0]` 的O(n×上限) 复杂度改 `deque(maxlen=…)`；截断时 `has_more` 不再误报 False；`since`/`until` 拒绝 nan/inf。
+- **API**：`/api/audit` 增过滤与分页（响应 `page.{matched,has_more,truncated,filters}`）与
+  `since`/`until` 自定义起止（`until` 从 core 一路打通到接口与界面：统计与记录列表同口径）；
+  `/api/audit/export` 为附件（jsonl/csv，上限 `MAX_EXPORT_ROWS`，超出由响应头
+  `X-Export-Truncated` / `X-Export-Records` 声明、**正文保持严格可解析**；
+  截断；插件审计不可用时 400 而不是导出空文件）。
+- **语义边界**：`stats` 是所选时间窗内的**全量**统计，不随记录过滤变化——界面用
+  一行文字说明（避免"统计与列表不一致"的困惑）。
+- **前端**：字段选择 + 值（回车生效）+ 清除 + 加载更多 + 格式选择 + 导出；
+  时间窗预设（1h/24h/7d/全部）与**自定义起止输入**互斥（点预设即清空自定义，反之亦然）；
+  **两套过滤**并存（服务端缩小查询范围、`audit-filter` 只筛当前已加载的行）。
+
+### 28.4 核心决策四：会话管理（R5、F2）
+
+- `Session` 增 `source` / `created_at`（此前 `login()` 用完就丢）。
+- `AuthManager.snapshot()`：脱敏快照（指纹 / 来源 / 创建 / 剩余有效期）。
+- `AuthManager.revoke_all(keep_fingerprint=...)`：**参数是指纹而不是 token**——
+  handler 只持有指纹（`RequestInfo.session_id`），token 永远不出认证层。
+  指纹算法与 `core.web_audit.session_fingerprint` **同一实现**（审计里的
+  `session_id` 与会话列表因此能对上）。
+- API：`GET /api/sessions`（server 层注入当前会话指纹）、
+  `POST /api/actions/sessions-revoke`（`keep_current` 默认 true）+ 审计留痕。
+- 前端：头部「会话」按钮 → 抽屉（列表 + 「登出其他所有会话」）。
+- **价值**：口令疑似泄露时的止血动作。此前唯一手段是重启管理台（会断掉所有人，
+  包括自己）。
+
+### 28.5 核心决策五：用户维度（R6、F3）
+
+- **先探明事实再写代码**：起真 frps + 真 frpc 实测 `GET /api/v2/users` →
+  信封 `{total,page,pageSize,items}`，条目 `{"user":"","clientCount":1,"proxyCount":1}`。
+  两个字段都是**单数**（复数 `clientCounts` 是 system_info 的客户端总数）——
+  写错只会静默得 0。
+- `admin.users()` / `GET /api/users` / 仪表盘「按用户」卡片（达单页上限 `truncated`）。
+  ⚠️ 该端点**没有流量字段**（只有 `clientCount` / `proxyCount`），因此卡片展示的是客户端数与代理数，不含流量——这是实测事实，不是遗漏。
+- 契约层 **C11** 锁定形状；单元测试额外断言"复数名 → 0"这条陷阱。
+- 顺带收窄契约 **C2**：其"反向断言"原本全局禁止 `"proxyCount"` 出现；现在它是
+  users 的真实字段，因此改为只检查 `server_info` 的解析语句。
+
+### 28.6 核心决策六：Web 自管重启（F4）
+
+- `POST /api/actions/web-restart`：**仅 systemd 托管**。
+- **先应答后动作**：systemd 模式下本进程就是 unit 的 `MainPID`，同步
+  `systemctl restart` 会在响应写回之前把自己杀掉——浏览器只看到连接断开，无从
+  知道操作是否生效。因此立即返回 `{scheduled:true}`，由**延迟 1 秒的守护线程**
+  执行重启。
+- direct 后台模式明确拒绝（没有任何机制能在自杀后重新拉起自己），给 CLI 指引；
+  unit 存在但未 active 同样拒绝。
+- 前端：确认 → 显示**"管理台正在重启"覆盖层**（全屏玻璃遮罩 + 切角卡片 + 扫描线，
+  文案每秒更新"已等待 N 秒"）→ 轮询**免认证**端点（1 秒 × 30）→ 恢复后 `location.reload()`
+  （会回到登录页，因为内存会话已随重启失效——这是正确行为）；超时则收起覆盖层并提示手动刷新。
+
+### 28.7 修复的真实缺陷（V 系列）
+
+| # | 项 | 问题 | 修复 |
+|---|----|------|------|
+| V-1 | **`el()` 布尔属性简写（真实缺陷·前端）** | `el("button", {disabled: false})` → `setAttribute("disabled","false")`，而 HTML 布尔属性**存在即生效**：v0.3.4 的**插件启停按钮完全不可用**（DOM 分支没有自动化测试，故未暴露；本轮写会话抽屉时自查发现同类写法） | 改用属性赋值（`node.disabled = true`）；新增守卫 `test_no_boolean_attr_shorthand_in_el` 扫描 `disabled,`/`disabled:`/`hidden:` 等 token 防回退 |
+| V-2 | **补全断言 flaky（真实·测试）** | 全量回归里 `--show-completion` 偶发输出 `Shell  not supported.`（退出码 1）：Typer 经 `shellingham` **按父进程链**检测 shell，而测试进程的父进程是 pytest，结果随运行方式变化 | conftest 固定 `typer.completion._get_shell_name` 为 bash（与 `_stabilize_systemctl` 同一条"测试与宿主解耦"纪律） |
+| V-3 | unit Description 冒充命令 | `Description` 里写着 `server plugin` / `web console`——像命令却不是任何真实命令，且与新的文案守卫冲突 | 改为真实命令名（`frpsctl plugin serve (%i)` / `frpsctl web serve (%i)`） |
+| V-5 | **审计导出上限被静默钳死（真实·review 发现）** | `auditlog.query` 用 `MAX_QUERY_LIMIT=1000` clamp 一切 limit，导出传 10000 实际只得 1000，而截断文案写死 10000；且末尾 `#` 注释让 JSONL 不再可整文件解析 | `query(max_limit=…)` 独立上限；截断只走响应头；正文不再追加注释 |
+| V-6 | **自重启在非 root 服务用户下必然静默失败（真实·review 发现）** | Web unit 以非 root 运行，`WebService.restart()` 的 `_require_root` 抛错被 `suppress(Exception)` 吞掉，接口返回成功、审计记成功、unit 从未重启；前端轮询免认证端点在 1 秒内就误判「已恢复」 | 应答前检查 `os.geteuid()==0`（非 root 400 + CLI 指引）；延迟线程失败写审计与 stderr；前端**先观察到一次失败**再接受成功 |
+| V-7 | 审计查询复杂度与判定（真实·review 发现） | `del matched[0]` 每条超限搬移 2 万指针（实测 60 万行 1.6s，持 GIL）；截断时 `has_more` 误报 False 使更旧记录永远取不到 | `deque(maxlen=…)`；`has_more` **只看本页之内**，"窗口之外可能还有更旧记录"由 `truncated` 单独表达（复审修正：`truncated or …` 会让"加载更多"恒显示并反复全量扫描） |
+| V-8 | 前端三处真实缺陷（review 发现） | ① `showLogin` 不复位口令可见性（下一个使用者默认明文）② 审计视图无 in-flight 序号（append/切 scope 竞态 → 重复行、高亮与表格不一致）③ 自重启覆盖层首个成功探测即 reload | 抽 `resetPasswordVisibility`；请求序号 + offset 回退；「先失败后成功」判定 |
+| V-9 | 输入校验与字段语义（review 发现） | `keep_current` 未做布尔校验（字符串 false / 数字 0 语义反转）；`parse_since` 接受 nan/inf；`users()` 用 `len(items)>=limit` 判截断（恰好 200 误报）且 `total` 是本页条数；`Session.created_at` 是单调时钟而非墙钟 | 布尔严格校验；`math.isfinite`；`PageResult` 用信封 total；`wall_clock` 记录 created_at |
+| V-10 | 守卫与测试有效性缺口（review 发现） | 布尔属性守卫可被 `disabled : false` 绕过；id 反向核对是子串包含（`nav-dashh` 里的 `nav-dash` 也算命中）；契约 C11 因 fixture 不起 frpc 而**空转**；`cmdk-label`/`cmdk-hint` 根本无样式却不在类清单里 | 正则覆盖空白变体；反向改精确形态；C11 加 frpc 分支（非空断言）；补 CSS 与类清单 |
+| V-11 | **复审修复本身（第二轮 review 发现）** | ① `_csv_cell` 的 `lstrip(_CSV_DANGEROUS_FIRST + " ")` 把 `=+-@` 一起 strip 掉，"前导空格 + 公式"（`" =1+1"`）防线成**死代码**；② `_web_restart_scheduled` 失败后无复位路径，之后永远被"已排程"挡住；③ `has_more = truncated or …` 恒真使"加载更多"永不消失且反复全量扫描；④ 截断只在响应头但前端无消费方、两处文档仍写"末尾注明"；⑤ CSV 用 `text/plain`（Excel 中文乱码）+ 无 BOM 未记账；⑥ root 检查早于 `unit_exists`（direct 用户看到误导提示）；⑦ 安全头与 `extra_headers` 的合并顺序、`$()` 模板串可绕过守卫、`created_at` 未展示、from/to 行为不对称 | ① `lstrip` 只去空白/控制符（不集合 `=+-@`）+ 空格变体回归测试；② 失败路径持锁复位标志；③ `has_more` 只看本页 + `truncated` 独立提示；④ `apiDownload` 返回 headers，导出按 `X-Export-Truncated` 提示；⑤ CSV → `text/csv`（不加 BOM，README 注明取舍）；⑥ 先判 `unit_exists` 再判 root；⑦ 安全头最后合并、模板串视为动态、会话抽屉加"创建时间"列、from/to 失焦都查询 |
+| V-4 | **文档测试数字漂移** | README 停在 922/892，而 CHANGELOG 与 §27.5 已到 940/910 | 三处统一为 v0.3.5 实测值（1008 / 973 / 契约 35） |
+
+### 28.8 API 增量（v0.3.5）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/login-info` | 登录页非敏感静态信息（**免认证**，第二个免认证入口） |
+| GET | `/api/sessions` | 活跃会话（脱敏：指纹/来源/创建/剩余有效期；**绝不含 token**） |
+| GET | `/api/users` | 按用户聚合（`user` / `clientCount` / `proxyCount`；`truncated` 如实汇报） |
+| GET | `/api/audit/export` | 审计导出（JSONL / CSV，附件；上限 10000 行） |
+| GET | `/api/audit` | 增过滤（各 scope 白名单字段）与分页（`limit` ≤1000 + `offset`），`page` 元信息 |
+| POST | `/api/actions/web-restart` | Web 自重启（仅 systemd；先应答后动作） |
+| POST | `/api/actions/sessions-revoke` | 登出除当前外全部会话（`keep_current` 默认 true） |
+
+### 28.9 测试与验收
+
+- **Python 新增 68 条**（非契约 910 → **973**；全量 940 → **1008**，含契约 35；其中回归 review 与复审阶段共补 16 条）。
+  主要分布：命令面/元数据/生成物 8、文案守卫 2、登录页免认证端点 4、审计查询 9 +
+  API 6、会话 7、users 5、自重启 2、契约 C11 3。
+- **前端 `node --test` 34 条**（新增 `lib/command-text.js` 的 8 条：参数标签、
+  默认值、命令骨架、检索文本、徽章、分类与现实一致）。
+- **覆盖率 86%**（CI 门禁 80%）；`ruff` 全绿。
+- 新增守卫：生成物无 drift、`COMMAND_META` 双向覆盖、文案命令引用、`/api/login-info`
+  键集与敏感词、审计分页/导出边界、会话脱敏（token 不下发）、**布尔属性简写**、
+  契约 C11。
+- CI：新增 `introspect --check` 步骤；Web 冒烟覆盖 login-info / sessions /
+  audit-export / users-502 / `commands.js`。
+- **发布前全量回归 review（4 路独立审查 + 反向注入验证）**：异常路径/边界、安全与机密、前端纪律与交互、文档与测试有效性各一路；发现 10 项并全部修复（2 项 HIGH：导出上限被静默钳死、自重启在非 root 服务用户下必然静默失败），另对 5 条守卫做过注入验证（均有效，其中布尔属性守卫的空格变体是抓到的盲区，已收紧）。详见 §28.7 的 V-5~V-10。
+- 真实端到端冒烟（真 frps + 真 Web 服务，**29 项**）覆盖：登录/会话脱敏/按用户/命令面生成物/审计过滤分页自定义起止/导出响应头/正文可解析/自重启拒绝路径/会话登出。
+- 人工点验清单（视觉与交互，自动化不覆盖）：登录页双主题/窄屏/CapsLock/连点不锁、命令视图搜索与复制、审计过滤与自定义起止/导出、会话抽屉、Web 自重启的等待恢复覆盖层。
+- **交付前逐项对账**：按方案逐条核对时发现并补齐三处打折项（登录页的切角头部/渐变标题/
+  品牌 glitch、审计的 `until`、自重启覆盖层），另有一处方案原文与真机事实不符（`/api/v2/users`
+  没有流量字段，故「按用户」卡片只展示客户端数与代理数）——已如实记入 §28.5。
+
+### 28.10 未做与边界（本轮记账）
+
+| 项 | 结论 |
+|----|------|
+| **插件策略可视化编辑** | **顺延 v0.3.6**：需要先把策略写入（校验 + 原子写 + 审计）从 `cli/` 下沉 core，Web 侧目前 8 条 `plugin user/config` 命令仍只有 CLI |
+| 踢**单个**指定会话 | 不做：本轮只做"登出除当前外全部"；`revoke_all(keep_fingerprint)` 的参数形态已为将来单踢留好接口 |
+| 会话数上限 | 不变（`MAX_SESSIONS=32`，驱逐最早到期） |
+| 任务取消 / 版本列表拉取 / immutable 静态资源 / HTML 片段化 / 截图回归 / DOM 级测试框架 | 不变（原因见 §27.6） |
+| 登录页展示"最近登录来源" | 不做：需要持久化登录历史（新机密文件面），收益不抵成本 |
+| 命令面数据随首屏加载（101KB） | **未做懒加载**：视图与面板都静态 import `data/commands.js`。改动态 `import()` 需同步扩守卫（`_IMPORT_RE` 只认静态 import，否则误报孤儿），而回环/内网场景传输收益有限——记账为可选优化（review 发现） |
+| 审计视图的全量扫描 | `/api/audit` 每次都跑 `summarize` + `query` 两遍全量扫描；受轮转约束（web 10MB / plugin 约 30MB），复杂度已由 `deque` 收敛。**未做**"无过滤时走 `read_tail` 快路径"与结果缓存（review 发现的可选优化） |
+| 审计文件不可读时的降级可见性 | `OSError` 被跳过 → 页面看到 `available: true, tail: []`，无法区分"没有记录"与"读不了"。**未做**（需扩展 payload 形状）；与"降级必须可见"纪律有落差，记账待后续（review 发现） |
+| 守卫的 AST 化与全语法覆盖 | 前端守卫仍是正则/子串形态（`innerHTML` 拼接、单引号 `setAttribute('style')`、`export … from`、`import()`、JS/CSS 里的外部 URL 等尚未覆盖）。彻底解决需要 AST（引入依赖与"零外部域"的取舍）——记账（review 发现） |
+| CI 的 Typer 版本耦合 | `data/commands.js` 由当前 Typer 反射生成，而 CI 非锁定安装（`typer>=0.12`）：上游行为变化会让 `introspect --check` 无代码改动地变红。**未做**（可改 `uv.lock --frozen` 或把生成物校验降级为告警）（review 发现） |
+| CSV 的 Excel 兼容取向 | 选择**不加 BOM**以保持正文字节级可解析（JSONL 可整文件喂 `jq`）；Windows Excel 打开含中文的 CSV 需用导入向导。这是一个明确取舍，已记入 README（复审发现） |
+| CSV 公式防护的区域性变体 | 全角 `＝＋－＠` 与 NBSP 未覆盖（OWASP 提及的低频变体）——记账（复审发现） |
+| `pypi` job 的 permissions | 仅有 `id-token: write`（`contents` 缺省为 none）：`download-artifact` 用运行时 token 通常可行，保守可加 `contents: read`——记账（复审发现，非阻塞） |
+| 契约 C11 的 frpc 依赖 | "非空 items"分支缺 frpc 时 skip（不再是空转，但缺依赖时不覆盖）——契约层既有约定（同类 skip 见 test_plugin），记账（review 发现） |
