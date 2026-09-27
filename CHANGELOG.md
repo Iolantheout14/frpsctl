@@ -3,6 +3,131 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.5] - 2026-09-21
+
+**Web 管理台体验补齐与命令面单一来源。** 登录页重做（含一处真实缺陷修复）；
+新增「命令」参考视图——把 CLI 全部 63 条命令与参数搬进界面，数据由 Typer 反射
+生成，**与 `--install-completion` 的补全同源**；审计可过滤/翻页/导出；可查看与
+登出其他会话；仪表盘新增按用户聚合；systemd 部署可在页面自重启管理台。
+新增 68 条 Python 测试（全量 940 → 1008；非契约 910 → 973）与 8 条前端单测
+（26 → 34），覆盖率 86%；修 4 处真实缺陷。
+
+### 新增
+
+- **命令视图**（快捷键 `g k`）：CLI 全部命令与参数（flag/默认值/范围/必填）、
+  只读/变更/需 root/需 systemd 徽章、一键复制命令骨架、跳转到界面中的对应能力；
+  `Ctrl+K` 命令面板纳入 CLI 命令（Enter = 复制用法）。
+- **命令面单一来源**：`cli/introspect.py`（Typer 反射 + `COMMAND_META` 分类元数据
+  + **双向覆盖守卫**：漏一条、多一条都失败）→ 生成
+  `web/static/js/data/commands.js`（静态 ESM 数据，Web 不 import cli，分层不破）；
+  CI 跑 `introspect --check` 断言重新生成无 diff。
+- **登录页 2.0**：赛博视觉（HUD 扫描线 + 双主题 + 失败抖动，reduced-motion 停）、
+  **提交互斥**、口令可见性切换、CapsLock 提示、`role="alert"`、会话过期原因提示、
+  窄屏适配（`min(380px, 100%)`）。
+- **免认证 `GET /api/login-info`**：只含实例名 / frpsctl 版本 / frps 门槛 /
+  是否非回环；键集合由测试锁死并断言不含敏感词；不写审计、不参与限速、`no-store`。
+- **审计增强**：服务端过滤（web：`action/result/source`；plugin：
+  `op/decision/user/source`，大小写不敏感子串）、按 offset「加载更多」、
+  **导出**（`GET /api/audit/export`，JSONL / CSV，上限 10000 行且超出时可见地注明截断；
+  CSV 带公式注入防护）。
+- **会话管理**：`GET /api/sessions`（脱敏：指纹/来源/创建/剩余有效期，**绝不含 token**）
+  + `POST /api/actions/sessions-revoke`（`keep_current` 默认 true）+ 头部「会话」抽屉。
+- **用户维度**：`admin.users()` + `GET /api/users` + 仪表盘「按用户」卡片
+  （客户端数 / 代理数；达上限 `truncated`）。
+- **Web 自管重启**（仅 systemd 托管）：`POST /api/actions/web-restart` —— 先应答、
+  延迟 1 秒由后台线程执行 `systemctl restart`（同步执行会在响应写回前杀掉自己）；
+  前端轮询免认证端点等待恢复；direct 模式明确拒绝并给 CLI 指引。
+- 契约层 **C11**：`/api/v2/users` 的 v2 分页信封与条目字段
+  （`user` / `clientCount` / `proxyCount`，**单数**——与 `proxyTypeCount` 同类的陷阱）。
+
+### 变更
+
+- 审计查询能力下沉 core：`auditlog.query()`（跨轮转、时间窗、字段过滤、分页、
+  坏行计数、匹配数有界）+ `to_jsonl()` / `to_csv()`；`web_audit.query()` 复用。
+- `AuthManager`：`Session` 记录 `source` / `created_at`；新增脱敏 `snapshot()` 与
+  `revoke_all(keep_fingerprint)`（**参数是指纹不是 token**——token 不出认证层）。
+- 测试与宿主解耦：conftest 固定 `typer.completion._get_shell_name` 为 bash
+  （补全检测经 `shellingham` 按父进程链判断，结果随运行方式变化）。
+- systemd unit 的 `Description` 改用真实命令名：`frpsctl plugin serve (%i)` /
+  `frpsctl web serve (%i)`（此前写的是 `server plugin` / `web console`——像命令
+  却不是任何真实命令）。
+- 契约 C2 的反向断言收窄到 `server_info` 的解析（`proxyCount` 现在是 `/api/v2/users`
+  的真实字段，全局禁止已不成立）。
+- CI：新增 `python -m frpsctl.cli.introspect --check` 步骤；Web 冒烟覆盖
+  login-info / sessions / audit-export / users-502 / commands.js。
+
+### 修复
+
+- **`el()` 布尔属性简写（真实缺陷）**：`el("button", {disabled: false})` →
+  `setAttribute("disabled", "false")`，而 HTML 布尔属性**存在即生效** —— v0.3.4 的
+  **插件启停按钮因此完全不可用**（DOM 分支没有自动化测试，故一直未暴露；本轮在
+  会话抽屉里自查发现同类写法）。改为属性赋值（`node.disabled = true`），并新增守卫
+  `test_no_boolean_attr_shorthand_in_el` 扫描 `disabled,` / `disabled:` 等 token 防回退。
+- **补全断言 flaky（真实）**：全量回归里 `--show-completion` 偶发输出
+  `Shell  not supported.`（退出码 1）——Typer 经 `shellingham` 按父进程链检测 shell，
+  结果随运行方式而变。测试固定检测结果，不再依赖宿主。
+- **文档测试数字漂移**：README 停在 922/892，而 CHANGELOG 与设计文档 §27.5 已到
+  940/910（README 未跟上中间态）——本轮统一为实测值（1008 / 973 / 契约 35）。
+- 界面与提示文案里的命令引用（如 `doctor`、`frpsctl plugin init`）此前无守卫，
+  现在由新守卫对账命令面（含前边界，排除 `/opt/frpsctl`、`frpsctl-web@` 等非命令出现）。
+- 交付前逐项对账方案时补齐三处打折项：登录页的**切角头部 / 渐变标题 / 品牌 glitch**、
+  审计的**自定义起止**（`until`，从 core 打通到 API 与界面，统计与记录同口径）、
+  Web 自重启的**「管理台正在重启」覆盖层**（此前只有 toast + 自动重载）。
+
+### 发布前全量回归 review（v0.3.5，10 项修复，7 项真实缺陷）
+
+四路独立审查（异常路径 / 安全 / 前端纪律 / 文档与测试有效性）+ 反向注入验证，发现并修复：
+
+- **审计导出上限被静默钳死**：`auditlog.query` 用 `MAX_QUERY_LIMIT=1000` clamp 一切
+  limit，导出传 10000 实际只得 1000（截断文案还写死 10000），且末尾 `#` 注释让 JSONL
+  不再可整文件解析。改为 `query(max_limit=…)` 独立上限 + 截断只走响应头。
+- **自重启在非 root 服务用户下必然静默失败**：`_require_root` 抛错被 `suppress(Exception)`
+  吞掉，接口返回成功、审计记成功而 unit 从未重启，前端还在 1 秒内误判「已恢复」。
+  改为应答前 `os.geteuid()` 检查（非 root 400 + CLI 指引）、失败写审计与 stderr、
+  前端「先观察到一次失败再接受成功」。
+- **审计查询复杂度**：`del matched[0]` 每条超限搬移 2 万指针（实测 60 万行 1.6 秒，
+  持 GIL 阻塞同进程请求）→ `deque(maxlen=…)`；截断时 `has_more` 不再误报 False。
+- **前端三处真实缺陷**：`showLogin` 不复位口令可见性（下一个使用者默认明文）；
+  审计视图竞态（append/切 scope 乱序 → 重复行、高亮与表格不一致）；自重启覆盖层
+  首个成功探测即 reload。
+- **输入校验与字段语义**：`keep_current` 布尔严格校验（字符串 false / 数字 0 语义反转）；
+  `since`/`until` 拒绝 nan/inf；`users()` 改用信封 `total` 判截断并做类型防御；
+  `Session.created_at` 改墙钟（可展示的 Unix 时间戳）。
+- **守卫与测试有效性**：布尔属性守卫覆盖 `disabled : false` 空白变体；id 反向核对改
+  **精确形态**（`nav-dashh` 里的 `nav-dash` 不再算命中）；契约 C11 补真 frpc 分支
+  （此前 items 为空、字段名断言空转）；补 `cmdk-label`/`cmdk-hint` 样式与类清单。
+- 另修：`/api/audit/export` 非契约异常兜底（不再断连）、直连路由 401 形状统一、
+  无关动作不再因 `health_timeout` 被 400、自重启进程级幂等、CSV 公式防护覆盖
+  控制字符且不再误伤负数。
+
+### 复审修复本身（第二轮 review，发布前最后一轮）
+
+对上一轮的 21 项修复做独立复审（含反向注入），抓出 **5 项"修复引入/不彻底"**并全部修掉：
+
+- **CSV 公式防线失效（真实）**：`_csv_cell` 的 `lstrip(_CSV_DANGEROUS_FIRST + " ")` 把 `=+-@`
+  也一起 strip 掉，导致"前导空格 + 公式"（`" =1+1"`）分支成为**死代码**——插件审计的 `user`
+  可由客户端自定，管理员导出 CSV 用 Excel 打开即可命中。改为只 strip 空白/控制符，并补空格变体
+  回归测试。
+- **自重启幂等标志无复位路径**：延迟线程失败（systemctl 瞬时故障）后进程仍存活，而
+  `_web_restart_scheduled` 永远为真 → 之后每次请求都被"已排程"挡住。失败路径持锁复位。
+- **`has_more` 语义**：`truncated or …` 会让"加载更多"在截断后**恒显示**、每次点击空转并触发
+  一次全量扫描。改回"只看本页"，"窗口之外可能还有更旧记录"由 `truncated` 用文字提示。
+- **截断提示无人消费**：响应头有了但前端不读、两处文档仍写"末尾可见注明"。`apiDownload` 现返回
+  `headers`，导出按 `X-Export-Truncated` 提示；文档同步为响应头声明。
+- **CSV 用 `text/plain`**：改为 `text/csv; charset=utf-8`（JSONL 用 `application/x-ndjson`）；
+  不加 BOM 以保持正文字节级可解析，取舍写入 README。
+- 另修：root 检查改到 `unit_exists()` 之后（direct 部署得到 direct 指引而非"不是 root"）、
+  安全头最后合并、`$()` 模板串（含插值）视为动态实参（守卫）、会话抽屉加"创建时间"列
+  （让墙钟字段有可见效果）、审计起止输入行为对称。
+
+### 测试
+
+- Python 新增 68 条（非契约 910 → 973；全量 940 → 1008，含契约 35；其中回归 review 与复审阶段共补 16 条）。
+- 前端 `node --test` 34 条（新增命令面展示纯逻辑 8 条：`lib/command-text.js`）。
+- 覆盖率 **86%**（CI 门禁 80%）；`ruff` 全绿。
+- 守卫新增：生成物无 drift、元数据双向覆盖、界面文案命令引用、`/api/login-info`
+  键集与敏感词、审计分页/导出边界、会话脱敏、布尔属性简写、契约 C11。
+
 ## [0.3.4] - 2026-09-21
 
 **Web 管理台结构性重构：单文件 → ESM 同源多模块 + 赛博朋克设计系统 + 八项新功能**。
